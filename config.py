@@ -62,6 +62,24 @@ class AttentionConfig(BaseModel):
     rope_dim: int = 64
     sparsity: Optional[float] = None  # fraction of tokens KEPT, e.g. 0.25
 
+    # Phase 2. Qwen2.5-1.5B-Instruct's KV head count is fixed by its
+    # weights (12 query heads / 2 KV heads), so "vary GQA configuration"
+    # has to mean varying what the *cache* stores, not retraining:
+    #   native  — 2 KV heads, the real model
+    #   mha_sim — 12 KV heads (one per query head); identical math and
+    #             identical logits, 6x the KV memory and traffic, so any
+    #             latency delta is a pure memory-system effect
+    #   mqa_sim — 1 mean-pooled KV head; changes the numerics, so it is a
+    #             bandwidth probe only, never a quality claim
+    # See cache/kv_cache.py.
+    kv_heads_mode: Literal["native", "mha_sim", "mqa_sim"] = "native"
+
+    # Phase 2 reference/kernel-development path. "math" materialises the
+    # full score matrix and is the numerical reference Phase 11's Triton
+    # and CUDA kernels get checked against; "sdpa" is the baseline used
+    # for every benchmark.
+    impl: Literal["sdpa", "math"] = "sdpa"
+
     @model_validator(mode="after")
     def _validate_by_type(self) -> "AttentionConfig":
         if self.type in ("mla", "mla_sparse") and self.latent_dim is None:
@@ -74,6 +92,11 @@ class AttentionConfig(BaseModel):
 class RuntimeConfig(BaseModel):
     batch_size: int = 8
     block_size: int = 16  # paged-cache block size, tokens/block
+    # Phase 2: split prefill into blocks of this many tokens. Attention
+    # cost is unchanged (each block still attends over the whole prefix);
+    # peak activation memory drops from O(context) to O(chunk), which is
+    # what makes long prompts reachable on a 16 GB T4. None = one block.
+    prefill_chunk_size: Optional[int] = None
     scheduler: Literal["fifo", "length_aware", "fair", "slo_aware"] = "fifo"
     continuous_batching: bool = False
     prefix_caching: bool = False

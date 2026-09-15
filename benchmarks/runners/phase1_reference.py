@@ -80,8 +80,24 @@ def run_sweep(
         input_ids = ref.synthesize_input_ids(ctx_len, seed=cfg.generation.seed)
 
         trials = []
+        oom = None
         for trial in range(warmup + repeats):
-            result = ref.generate_with_timing(input_ids=input_ids, max_new_tokens=output_tokens)
+            try:
+                result = ref.generate_with_timing(
+                    input_ids=input_ids, max_new_tokens=output_tokens
+                )
+            except torch.cuda.OutOfMemoryError as e:  # noqa: PERF203
+                # Where the HF reference stops fitting on a 16 GB T4 is a
+                # finding about the baseline, and one Phase 2 is expected
+                # to move (HF materialises logits for every prefill
+                # position: [1, S, 151936] is 2.4 GB at S=8192 in fp16,
+                # against a 227 MB KV cache). Record it instead of leaving
+                # a silent gap in the sweep that a later reader has to
+                # guess at.
+                oom = str(e).split("\n")[0]
+                torch.cuda.empty_cache()
+                print(f"  ctx={ctx_len:>6} trial={trial} [OOM] {oom}")
+                break
             if trial >= warmup:
                 trials.append(result)
             tag = "warmup" if trial < warmup else "measured"
@@ -90,6 +106,31 @@ def run_sweep(
                 f"ttft={result.ttft_ms:.1f}ms tpot={result.tpot_ms:.2f}ms "
                 f"peak_vram={result.peak_vram_mb:.1f}MB kv={result.kv_cache_mb:.2f}MB"
             )
+
+        if oom is not None or not trials:
+            row = BenchmarkResult(
+                system="huggingface_reference",
+                tag=cfg.tag,
+                attention="gqa",
+                model=cfg.model.name,
+                batch_size=1,
+                context_length=ctx_len,
+                output_length=output_tokens,
+                num_gpus=len(cfg.hardware.devices),
+                seed=cfg.generation.seed,
+                extra={
+                    "status": "oom" if oom else "no_trials",
+                    "error": oom,
+                    "attention_path": "huggingface_reference",
+                    "kv_cache": "hf_dynamic_cache",
+                },
+            )
+            writer.write(row)
+            written.append(row)
+            # Zeroed metrics would poison any median or plot that reads
+            # this file, so every consumer must filter on extra["status"].
+            print(f"  -> recorded status={row.extra['status']} for ctx={ctx_len}")
+            continue
 
         ttfts = [t.ttft_ms for t in trials]
         tpots = [t.tpot_ms for t in trials]
@@ -110,7 +151,9 @@ def run_sweep(
         result = BenchmarkResult(
             system="huggingface_reference",
             tag=cfg.tag,
-            attention="mha",  # Phase 1 = unmodified HF reference, no custom attention path yet
+            # The checkpoint is GQA here and in every later phase; what
+            # makes this row Phase 1 is `system`, not the architecture.
+            attention="gqa",
             model=cfg.model.name,
             batch_size=1,
             context_length=ctx_len,
@@ -129,6 +172,17 @@ def run_sweep(
             tpot_p95_ms=pct(pooled_decode, 0.95),
             tpot_p99_ms=pct(pooled_decode, 0.99),
             seed=cfg.generation.seed,
+            extra={
+                "status": "ok",
+                "attention_path": "huggingface_reference",
+                "kv_cache": "hf_dynamic_cache",
+                "gqa_group_size": ref.shape.gqa_group_size,
+                "kv_bytes_per_token": ref.shape.kv_bytes_per_token(
+                    dtype_bytes=2 if cfg.model.dtype in ("fp16", "bf16") else 4
+                ),
+                "load_ms": ref.load_ms,
+                "num_trials": len(trials),
+            },
         )
         path = writer.write(result)
         written.append(result)

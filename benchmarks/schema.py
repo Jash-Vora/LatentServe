@@ -111,6 +111,15 @@ class BenchmarkResult:
     perplexity: Optional[float] = None
     retrieval_accuracy: Optional[float] = None
 
+    # --- phase-specific fields ---
+    # Free-form, so a phase can record what only it measures (Phase 2:
+    # kv_bytes_per_token, kv_heads_mode, achieved bandwidth, weight vs.
+    # KV share of decode-step DRAM traffic; Phase 7: latent_dim;
+    # Phase 14: sparsity, indexer overhead) without a schema migration
+    # every few weeks. Anything that survives into the final report
+    # should graduate to a real typed field above.
+    extra: dict = field(default_factory=dict)
+
     # --- reproducibility (auto-filled, do not set manually) ---
     git_commit: str = field(default_factory=_git_commit)
     seed: int = 0

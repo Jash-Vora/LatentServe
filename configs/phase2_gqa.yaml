@@ -1,0 +1,46 @@
+# Phase 2 — LatentServe's own GQA + contiguous KV-cache execution path.
+# See docs/methodology.md Phase 2, docs/phase2.md, and
+# benchmarks/runners/phase2_gqa.py.
+#
+# attention.type is "gqa" and this time it is real: model/attention/gqa.py
+# computes attention against cache/kv_cache.py, driven by
+# model/latentserve_qwen.py's own layer loop. Phase 1's "mha" label meant
+# "unmodified Hugging Face, no custom path yet" — it was never a claim
+# about Qwen2.5-1.5B, which has been GQA (12 query heads / 2 KV heads)
+# all along.
+#
+# The sweep axes (context length, batch size, kv_heads_mode) are CLI
+# arguments rather than config fields, because one config should produce
+# a whole sweep rather than needing one YAML per point. What lives here
+# is everything that must be held *constant* across that sweep.
+
+tag: phase2_gqa
+
+model:
+  name: Qwen/Qwen2.5-1.5B-Instruct
+  dtype: fp16          # T4 is Turing (sm75): fp16 tensor cores, no bf16
+  max_position_embeddings: 131072
+
+attention:
+  type: gqa
+  kv_heads_mode: native
+  impl: sdpa
+  rope_dim: 64         # unused until Phase 8's decoupled positional path
+
+runtime:
+  batch_size: 1        # overridden per sweep point by --batch-sizes
+  block_size: 16       # Phase 3 (paged cache) knob, unused here
+  prefill_chunk_size: null
+  scheduler: fifo
+  continuous_batching: false
+  prefix_caching: false
+
+generation:
+  input_tokens: 4096   # overridden per sweep point by --context-lengths
+  output_tokens: 128
+  num_requests: 1
+  seed: 0
+  sampling: greedy
+
+hardware:
+  devices: [0]

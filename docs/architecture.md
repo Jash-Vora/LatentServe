@@ -38,3 +38,50 @@ around `transformers.AutoModelForCausalLM` for Qwen2.5-1.5B-Instruct:
 
 No custom attention kernel, KV-cache layout, or batching exists yet —
 that's Phases 2 through 4.
+
+## Phase 2 — what exists today
+
+From Phase 2 onward LatentServe drives the model itself. `model/qwen.py`
+(`QwenReference`) stays exactly as it was and becomes purely the
+correctness oracle; the serving path is:
+
+```
+        input_ids
+            |
+   LatentServeQwen                 model/latentserve_qwen.py
+   (own decoder layer loop,
+    borrowed HF weight modules)
+            |
+      +-----+------------------------------+
+      |                                    |
+  GQAAttention                     RMSNorm / MLP
+  model/attention/gqa.py           (HF modules, untouched)
+      |
+   RotaryEmbedding  model/rope.py
+      |
+   ContiguousKVCache  cache/kv_cache.py
+   preallocated [B, kv_heads, max_seq, head_dim] per layer
+```
+
+Three design decisions worth restating here because later phases depend
+on them:
+
+1. **Weights are borrowed, not copied.** `GQAAttention` holds references
+   to the loaded checkpoint's `q_proj`/`k_proj`/`v_proj`/`o_proj`
+   modules. The model is fixed and only the execution system changes —
+   sharing the same tensor objects makes that literally true, and avoids
+   a second 3.1 GB of weights on a 16 GB card.
+2. **We own the layer loop, not a patched HF attention module.**
+   Chunked prefill, continuous batching (Phase 4), prefix caching
+   (Phase 13) and adaptive backend selection (Phase 17) are decisions
+   made above attention, not inside it. Owning the loop also means the
+   code does not depend on HF's attention signature, which has moved
+   repeatedly across releases (`model/qwen.py::kv_cache_bytes` already
+   carries three compatibility branches for the cache alone).
+3. **The KV cache is preallocated and accounts for itself exactly.**
+   `kv_cache_mb` is read off the cache, not estimated by walking HF
+   tensors, and `bytes_read_per_decode_step()` is the numerator of every
+   bandwidth claim from here to Phase 18.
+
+See `docs/phase2.md` for the sweep, the measurement design, and the
+predictions registered before running it.

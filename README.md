@@ -8,10 +8,11 @@ DSA-inspired sparse attention → adaptive runtime), not the model. DSA is
 a core research axis alongside MLA, not an optional late-stage add-on.
 See `docs/methodology.md` for the full research plan.
 
-This README covers **Phase 0 and Phase 1**: environment + experimental
-infrastructure, then the Qwen2.5-1.5B-Instruct reference implementation
-and correctness harness. Phase 2 (LatentServe's own GQA + KV-cache
-execution path) is next.
+This README covers **Phases 0-2**: environment + experimental
+infrastructure, the Qwen2.5-1.5B-Instruct reference implementation and
+correctness harness, and LatentServe's own GQA + KV-cache execution
+path. Phase 3 (paged KV cache) is next. See `docs/phase2.md` for what
+Phase 2 measures and the predictions registered before measuring.
 
 ## What's in this scaffold
 
@@ -21,13 +22,19 @@ configs/                               # YAML experiment definitions (edit these
 benchmarks/schema.py                   # BenchmarkResult schema + JSONL writer (auto reproducibility metadata)
 benchmarks/runners/check_env.py        # Phase 0 gate: verifies CUDA/GPU/torch actually work
 benchmarks/runners/phase1_reference.py # Phase 1: context-length sweep -> results/raw/phase1_reference.jsonl
-model/qwen.py                          # Phase 1: instrumented QwenReference wrapper (load/prefill/decode/timing)
-cache/ runtime/ kernels/               # empty package stubs for Phases 2+
+benchmarks/runners/phase2_gqa.py       # Phase 2: GQA/KV sweep -> results/raw/phase2_gqa.jsonl
+model/qwen.py                          # Phase 1: instrumented QwenReference wrapper (now the correctness oracle)
+model/latentserve_qwen.py              # Phase 2: LatentServe's own decoder layer loop over the fixed weights
+model/attention/gqa.py                 # Phase 2: GQA attention against our KV cache (baseline for MLA/sparse)
+model/rope.py                          # Phase 2: our RoPE (Phase 8 decouples it, Phase 11 fuses it)
+cache/kv_cache.py                      # Phase 2: preallocated contiguous KV cache + byte accounting
+runtime/ kernels/                      # empty package stubs for Phases 4+
 evaluation/ comparisons/vllm/          # empty package stubs for Phases 6, 15
 profiling/                             # where .nsys-rep / .ncu-rep artifacts go (Phase 12)
 results/{raw,processed,figures}/       # results/raw is machine-written only, never hand-edited
 tests/test_phase0_infra.py             # proves config loading + result writing work
-tests/test_phase1_correctness.py       # Gate 1: HF vs LatentServe logits/cache/determinism
+tests/test_phase1_correctness.py       # Gate 1: HF teacher-forced vs incremental logits/cache/determinism
+tests/test_phase2_gqa.py               # Gate 2: LatentServe's execution path vs the HF oracle
 ```
 
 This is a **flat layout**: `model`, `cache`, `runtime`, etc. are top-level
