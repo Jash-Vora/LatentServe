@@ -68,18 +68,25 @@ def _row(cfg, system: str, batch_size: int, ctx: int, out_len: int, summary: dic
     )
 
 
-def run_latentserve(cfg, requests, batch_size: int, block_size: int, max_seq_len: int) -> dict:
+def run_latentserve(cfg, ref, requests, batch_size: int, block_size: int,
+                    max_seq_len: int) -> dict:
+    """Run one configuration on an *already loaded* reference.
+
+    The weights are loaded once, by the caller, and shared. Loading per
+    configuration would put another 2.88 GiB copy of Qwen2.5-1.5B on the
+    GPU each time — which is not merely slow, it inflates
+    `peak_vram_mb`, and peak VRAM is one of the quantities this phase
+    compares against vLLM.
+    """
     import torch
 
     from runtime.engine import ServingEngine
 
     from model.latentserve_qwen import LatentServeQwen
-    from model.qwen import QwenReference
 
-    device = f"cuda:{cfg.hardware.devices[0]}" if torch.cuda.is_available() else "cpu"
-    ref = QwenReference(model_name=cfg.model.name, dtype=cfg.model.dtype, device=device).load()
     model = LatentServeQwen.from_reference(ref, max_seq_len_hint=max_seq_len)
     if torch.cuda.is_available():
+        torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
     engine = ServingEngine(
@@ -91,6 +98,13 @@ def run_latentserve(cfg, requests, batch_size: int, block_size: int, max_seq_len
     t0 = time.perf_counter()
     finished = engine.run()
     wall = time.perf_counter() - t0
+    peak = torch.cuda.max_memory_allocated() / 1024 / 1024 if torch.cuda.is_available() else 0.0
+    stats = engine.stats()
+    # Drop the cache before the next configuration sizes its own.
+    model.cache = None
+    engine.cache = None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     ttft = summarise_latency([r.ttft_ms for r in finished])
     itl = summarise_latency([ms for r in finished for ms in r.decode_step_ms])
@@ -101,16 +115,22 @@ def run_latentserve(cfg, requests, batch_size: int, block_size: int, max_seq_len
         "output_tokens": total_out,
         "output_tokens_per_s": total_out / wall if wall else 0.0,
         "requests_per_s": len(finished) / wall if wall else 0.0,
-        "peak_vram_mb": (
-            torch.cuda.max_memory_allocated() / 1024 / 1024 if torch.cuda.is_available() else 0.0
-        ),
+        "peak_vram_mb": peak,
+        "weights_mb": ref.model.get_memory_footprint() / 1024 / 1024
+        if hasattr(ref.model, "get_memory_footprint")
+        else None,
         **{f"ttft_{k}": v for k, v in ttft.__dict__.items()},
         **{f"itl_{k}": v for k, v in itl.__dict__.items()},
-        **engine.stats(),
+        **stats,
     }
 
 
 def run_vllm(cfg, requests, batch_size: int, max_seq_len: int) -> dict:
+    """vLLM sizes its KV pool from *free* VRAM at construction
+    (`gpu_memory_utilization`), so anything LatentServe left resident
+    silently shrinks vLLM's cache and hands it a worse configuration.
+    The caller frees the reference weights before this runs.
+    """
     from comparisons.vllm.runner import VLLMRunner
 
     runner = VLLMRunner(
@@ -180,10 +200,13 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    # Prompts are built once, from the same tokenizer, and reused by both
-    # systems as raw token ids.
+    # Loaded once for the whole sweep: it supplies the tokenizer that
+    # builds the prompts *and* the weights every LatentServe run executes
+    # against. Prompts are then reused by both systems as raw token ids,
+    # so no tokenizer difference can enter the comparison.
     device = f"cuda:{cfg.hardware.devices[0]}" if torch.cuda.is_available() else "cpu"
     tok_ref = QwenReference(model_name=cfg.model.name, dtype=cfg.model.dtype, device=device).load()
+    print(f"Loaded {cfg.model.name} once in {tok_ref.load_ms:.0f} ms on {device}")
     writer = ResultWriter(results_dir=args.results_dir)
 
     for batch_size in args.batch_sizes:
@@ -207,8 +230,12 @@ def main() -> int:
                 tok_ref, args.workload, args.num_requests, args.max_prompt,
                 args.max_output, cfg.generation.seed,
             )
+            if system == "vllm" and tok_ref.model is not None:
+                tok_ref.model = tok_ref.model.to("cpu")
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                torch.cuda.reset_peak_memory_stats() if torch.cuda.is_available() else None
             summary = (
-                run_latentserve(cfg, fresh, batch_size, args.block_size, max_seq_len)
+                run_latentserve(cfg, tok_ref, fresh, batch_size, args.block_size, max_seq_len)
                 if system == "latentserve"
                 else run_vllm(cfg, fresh, batch_size, max_seq_len)
             )
