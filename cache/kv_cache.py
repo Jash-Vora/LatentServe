@@ -188,10 +188,15 @@ class ContiguousKVCache:
         self.k[layer_idx][:batch, :, start_pos:end].copy_(k)
         self.v[layer_idx][:batch, :, start_pos:end].copy_(v)
 
-    def read(self, layer_idx: int, batch_size: int, length: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Views of the first `length` cached positions. Views, not
+    def read(
+        self, layer_idx: int, batch_size: int, length: Optional[int] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Views of the cached positions, defaulting to everything the
+        cache currently holds (the caller should not have to derive that
+        from a start offset — a ragged batch has no single one). Views, not
         copies — a copy here would double KV traffic per decode step and
         quietly invalidate every bandwidth number Phase 2 reports."""
+        length = self._length if length is None else length
         return (
             self.k[layer_idx][:batch_size, :, :length],
             self.v[layer_idx][:batch_size, :, :length],

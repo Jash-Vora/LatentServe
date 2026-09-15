@@ -196,8 +196,13 @@ class GQAAttention(nn.Module):
 
         k, v = self._project_kv_for_cache(k, v)
         cache.write(self.layer_idx, k, v, start_pos)
-        kv_len = start_pos + s
-        k_all, v_all = cache.read(self.layer_idx, b, kv_len)
+        # Ask the cache how much it holds rather than deriving it from
+        # start_pos. In a ragged batch (Phase 4) rows sit at different
+        # positions, so `start_pos + s` describes no one; and since
+        # advance() now runs before the layer loop, the cache's own length
+        # is already correct for the uniform case too.
+        k_all, v_all = cache.read(self.layer_idx, b)
+        kv_len = k_all.shape[2]
 
         # A paged cache pads ragged batches to the longest sequence; those
         # pad slots hold another sequence's tokens and must be masked.

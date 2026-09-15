@@ -8,12 +8,13 @@ DSA-inspired sparse attention → adaptive runtime), not the model. DSA is
 a core research axis alongside MLA, not an optional late-stage add-on.
 See `docs/methodology.md` for the full research plan.
 
-This README covers **Phases 0-3**: environment + experimental
+This README covers **Phases 0-4**: environment + experimental
 infrastructure, the Qwen2.5-1.5B-Instruct reference implementation and
 correctness harness, and LatentServe's own GQA + KV-cache execution
-path, and the paged KV cache. Phase 4 (serving runtime) is next. See
-`docs/phase2.md` and `docs/phase3.md` for what each measures and the
-predictions registered before measuring.
+path, the paged KV cache, and the continuous-batching serving runtime.
+Phase 5/6 (benchmark harness, vLLM comparison) are next. See
+`docs/phase2.md`, `docs/phase3.md` and `docs/phase4.md` for what each
+measures and the predictions registered before measuring.
 
 ## What's in this scaffold
 
@@ -32,8 +33,13 @@ cache/kv_cache.py                      # Phase 2: preallocated contiguous KV cac
 cache/block_allocator.py               # Phase 3: block pool, free list, refcounts, block tables
 cache/paged_cache.py                   # Phase 3: block-paged KV cache (same contract as contiguous)
 benchmarks/runners/phase3_paged.py     # Phase 3: capacity simulation (CPU) + paging latency cost (GPU)
-benchmarks/workloads/ragged.py         # request streams (Workloads A-E); reused by Phase 4
-runtime/ kernels/                      # empty package stubs for Phases 4+
+benchmarks/workloads/ragged.py         # request streams (Workloads A-E)
+benchmarks/runners/phase4_serving.py   # Phase 4: continuous vs static batching + scheduler comparison
+runtime/engine.py                      # Phase 4: continuous-batching serving engine (+ static baseline)
+runtime/scheduler.py                   # Phase 4: FIFO / length-aware / fair / SLO-aware policies
+runtime/request.py                     # Phase 4: request lifecycle and per-request metrics
+runtime/batching.py                    # Phase 4: ragged decode-batch assembly (slots, positions)
+kernels/                               # empty package stubs for Phase 11
 evaluation/ comparisons/vllm/          # empty package stubs for Phases 6, 15
 profiling/                             # where .nsys-rep / .ncu-rep artifacts go (Phase 12)
 results/{raw,processed,figures}/       # results/raw is machine-written only, never hand-edited
@@ -41,6 +47,7 @@ tests/test_phase0_infra.py             # proves config loading + result writing 
 tests/test_phase1_correctness.py       # Gate 1: HF teacher-forced vs incremental logits/cache/determinism
 tests/test_phase2_gqa.py               # Gate 2: LatentServe's execution path vs the HF oracle
 tests/test_phase3_paged.py             # Gate 4: allocator behaviour + paged/contiguous equivalence
+tests/test_phase4_serving.py           # Gate 3: outputs identical under concurrency; scheduler policies
 ```
 
 This is a **flat layout**: `model`, `cache`, `runtime`, etc. are top-level

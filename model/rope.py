@@ -148,6 +148,22 @@ class RotaryEmbedding:
         sin = self._sin[start_pos:end].to(dtype)
         return cos[None, None, :, :], sin[None, None, :, :]
 
+    def cos_sin_at(self, positions: torch.Tensor, dtype: torch.dtype):
+        """cos/sin for explicit per-sequence positions.
+
+        `positions` is [B, S] of absolute positions, returning
+        [B, 1, S, head_dim] to broadcast over [B, H, S, D]. Continuous
+        batching (Phase 4) needs this: sequences in one decode batch sit
+        at different positions, so a single scalar offset no longer
+        describes the batch. Getting this wrong gives every sequence the
+        first one's positional phase — plausible output, quietly wrong.
+        """
+        end = int(positions.max().item()) + 1
+        if end > self.max_seq_len:
+            self._build_tables(max(end, self.max_seq_len * 2))
+        idx = positions.to(self._cos.device)
+        return self._cos[idx].to(dtype)[:, None], self._sin[idx].to(dtype)[:, None]
+
     def nbytes(self) -> int:
         return sum(t.nelement() * t.element_size() for t in (self._cos, self._sin) if t is not None)
 

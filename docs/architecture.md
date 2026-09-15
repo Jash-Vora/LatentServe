@@ -115,3 +115,33 @@ layer loop, not after. A paged cache must have block tables and slot
 indices built before any layer scatters into the pool; the contiguous
 cache only tracks a fill counter, so the earlier position is harmless
 there.
+
+## Phase 4 — what exists today
+
+```
+   requests ->  ServingEngine.step()            runtime/engine.py
+                     |
+                     |-- Scheduler.select()     runtime/scheduler.py
+                     |     fifo / length_aware / fair / slo_aware
+                     |
+                     |-- prefill_slot(ids, slot)      one request, one slot
+                     |
+                     `-- decode_step_ragged(tokens, positions, slots)
+                              |
+                         LatentServeQwen -> GQAAttention -> PagedKVCache
+```
+
+Request lifecycle: ARRIVED -> QUEUED -> PREFILL -> DECODING -> FINISHED,
+with per-request queue/prefill/TTFT/TPOT timings on `ServedRequest`.
+
+Two invariants the ragged path depends on, both easy to get wrong and
+both unit-tested in `tests/test_phase4_serving.py`:
+
+1. **Row index is not slot index.** Slot 7 can be row 0 once slots 0-6
+   retire. `batch_slots()` keeps the mapping explicit.
+2. **Positions are per row.** Sequences in one decode batch sit at
+   different absolute positions, so RoPE takes a `[B, S]` tensor
+   (`RotaryEmbedding.cos_sin_at`), not a scalar offset.
+
+Attention also now asks the cache for its own length rather than
+deriving `start_pos + s`, which describes no one in a ragged batch.

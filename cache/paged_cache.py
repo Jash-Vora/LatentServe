@@ -93,7 +93,11 @@ class PagedKVCache:
         # would show up as "paging overhead" that is really a bug.
         self._read_slots: Optional[torch.Tensor] = None
         self._write_slots: Optional[torch.Tensor] = None
-        self._active_batch = spec.max_batch_size
+        # Which sequence slots participate in the next forward pass, in
+        # batch order. Phase 3 always used range(batch_size); continuous
+        # batching (Phase 4) needs holes — slot 3 can finish and be reused
+        # by a new request while slots 0, 1, 2 keep decoding.
+        self._active: list[int] = list(range(spec.max_batch_size))
         self.gather_calls = 0
 
     # ------------------------------------------------------------------
@@ -106,18 +110,32 @@ class PagedKVCache:
         Raises on ragged state rather than silently returning the max —
         a caller that assumes uniformity on a ragged cache produces
         wrong attention, not an error."""
-        lengths = {t.length for t in self.tables[: self._active_batch]}
+        lengths = {self.tables[i].length for i in self._active}
         if len(lengths) > 1:
             raise RuntimeError(f"cache is ragged ({sorted(lengths)}); use seq_lens")
         return lengths.pop() if lengths else 0
 
     @property
     def seq_lens(self) -> list[int]:
-        return [t.length for t in self.tables[: self._active_batch]]
+        return [self.tables[i].length for i in self._active]
+
+    @property
+    def active_slots(self) -> list[int]:
+        return list(self._active)
+
+    def set_active(self, slots: Sequence[int]) -> None:
+        """Choose which slots the next forward pass covers, in batch order.
+
+        Row j of every tensor the model passes in or gets back
+        corresponds to `slots[j]`. Keeping that mapping explicit — rather
+        than implying it from a batch size — is what lets the scheduler
+        add and retire sequences mid-flight.
+        """
+        self._active = list(slots)
 
     @property
     def max_len(self) -> int:
-        return max((t.length for t in self.tables[: self._active_batch]), default=0)
+        return max((self.tables[i].length for i in self._active), default=0)
 
     def reset(self) -> None:
         for t in self.tables:
@@ -126,7 +144,14 @@ class PagedKVCache:
         self.allocator.reset()
         self.tables = [BlockTable(self.allocator) for _ in range(self.spec.max_batch_size)]
         self._read_slots = self._write_slots = None
+        self._active = list(range(self.spec.max_batch_size))
         self.gather_calls = 0
+
+    def can_admit(self, num_tokens: int) -> bool:
+        """Whether the pool can seat a prompt of this length right now.
+        The scheduler's admission test — a paged cache that dies on
+        exhaustion has thrown away the reason to page."""
+        return self.allocator.blocks_for_tokens(num_tokens) <= self.allocator.num_free
 
     def free_sequence(self, index: int) -> None:
         """Return one sequence's blocks to the pool. The operation a
@@ -139,31 +164,49 @@ class PagedKVCache:
     # Allocation
     # ------------------------------------------------------------------
 
-    def advance(self, n: int, batch_size: Optional[int] = None) -> None:
+    def advance(
+        self,
+        n: int,
+        batch_size: Optional[int] = None,
+        slots: Optional[Sequence[int]] = None,
+    ) -> None:
         """Reserve n more tokens for each active sequence and rebuild the
-        slot index."""
-        b = self._active_batch if batch_size is None else batch_size
-        self._active_batch = b
-        starts = [self.tables[i].length for i in range(b)]
-        for i in range(b):
+        slot index.
+
+        `slots` names the active set directly (Phase 4). `batch_size`
+        keeps the Phase 2/3 shorthand of "the first B slots".
+        """
+        if slots is not None:
+            self.set_active(slots)
+        elif batch_size is not None:
+            self.set_active(range(batch_size))
+        active = self._active
+        starts = [self.tables[i].length for i in active]
+        for i in active:
             self.tables[i].append(n)
 
         dev = self.device
         self._write_slots = torch.tensor(
-            [[self.tables[i].slot(p) for p in range(starts[i], starts[i] + n)] for i in range(b)],
+            [
+                [self.tables[i].slot(p) for p in range(start, start + n)]
+                for i, start in zip(active, starts)
+            ],
             dtype=torch.long,
             device=dev,
         )
+        b = len(active)
         max_len = self.max_len
         # Pad short sequences with slot 0. Padded positions must be
         # masked out by the caller (`padding_mask` below); block 0 is
         # never left unwritten in practice, so an unmasked pad would
         # silently attend to another sequence's tokens.
         self._read_slots = torch.zeros((b, max_len), dtype=torch.long, device=dev)
-        for i in range(b):
-            slots = self.tables[i].slots()
-            if slots:
-                self._read_slots[i, : len(slots)] = torch.tensor(slots, dtype=torch.long, device=dev)
+        for row, i in enumerate(active):
+            seq_slots = self.tables[i].slots()
+            if seq_slots:
+                self._read_slots[row, : len(seq_slots)] = torch.tensor(
+                    seq_slots, dtype=torch.long, device=dev
+                )
 
     def padding_mask(self) -> Optional[torch.Tensor]:
         """Boolean keep-mask [B, 1, 1, max_len], or None when the batch is
@@ -234,14 +277,14 @@ class PagedKVCache:
         )
 
     def used_bytes(self, batch_size: Optional[int] = None) -> int:
-        b = self._active_batch if batch_size is None else batch_size
-        return self.spec.bytes_per_token * sum(t.length for t in self.tables[:b])
+        rows = self._active if batch_size is None else list(self._active)[:batch_size]
+        return self.spec.bytes_per_token * sum(self.tables[i].length for i in rows)
 
     def reserved_bytes(self, batch_size: Optional[int] = None) -> int:
         """Bytes in allocated blocks, including the partly-empty tail of
         each sequence. reserved - used is internal fragmentation."""
-        b = self._active_batch if batch_size is None else batch_size
-        return self.spec.bytes_per_token * sum(t.capacity for t in self.tables[:b])
+        rows = self._active if batch_size is None else list(self._active)[:batch_size]
+        return self.spec.bytes_per_token * sum(self.tables[i].capacity for i in rows)
 
     def fragmentation(self, batch_size: Optional[int] = None) -> float:
         reserved = self.reserved_bytes(batch_size)
@@ -252,7 +295,8 @@ class PagedKVCache:
         return 0.0 if alloc == 0 else self.used_bytes(batch_size) / alloc
 
     def bytes_read_per_decode_step(self, batch_size: int) -> int:
-        return self.spec.bytes_per_token * sum(t.length for t in self.tables[:batch_size])
+        rows = list(self._active)[:batch_size]
+        return self.spec.bytes_per_token * sum(self.tables[i].length for i in rows)
 
     def gather_bytes_per_decode_step(self, batch_size: int) -> int:
         """Extra traffic paging adds: the gather reads the live KV and
@@ -260,7 +304,7 @@ class PagedKVCache:
         return 2 * self.bytes_read_per_decode_step(batch_size)
 
     def stats(self, batch_size: Optional[int] = None) -> dict:
-        b = self._active_batch if batch_size is None else batch_size
+        b = len(self._active) if batch_size is None else batch_size
         return {
             "kv_bytes_per_token": self.spec.bytes_per_token,
             "kv_allocated_mb": self.allocated_bytes / 1024 / 1024,

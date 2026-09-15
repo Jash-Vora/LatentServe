@@ -1,0 +1,37 @@
+# Phase 4 — serving runtime with continuous batching.
+# See docs/methodology.md Phase 4 and docs/phase4.md.
+#
+# runtime.batch_size here means *max concurrently resident sequences*,
+# not a fixed batch: continuous batching admits and retires every
+# iteration, so the number is a ceiling rather than a group size.
+# Sweep axes (concurrency, scheduler, workload) are CLI arguments.
+
+tag: phase4_serving
+
+model:
+  name: Qwen/Qwen2.5-1.5B-Instruct
+  dtype: fp16
+  max_position_embeddings: 131072
+
+attention:
+  type: gqa
+  kv_heads_mode: native
+  impl: sdpa
+
+runtime:
+  batch_size: 8
+  block_size: 16          # chosen in Phase 3; also the prefix-sharing granularity for Phase 13
+  prefill_chunk_size: 4096
+  scheduler: fifo
+  continuous_batching: true
+  prefix_caching: false
+
+generation:
+  input_tokens: 8192
+  output_tokens: 128
+  num_requests: 32
+  seed: 0
+  sampling: greedy
+
+hardware:
+  devices: [0]

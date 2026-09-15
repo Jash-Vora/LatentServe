@@ -107,6 +107,75 @@ Allocation overhead is ~0.01-0.05 us/token, i.e. nothing next to a
 blocks waste less tail (internal fragmentation is bounded by one block
 per sequence) and cost more bookkeeping.
 
+## Measured (8 GiB budget, 200 requests, seed 0; T4 for latency)
+
+### Capacity gain equals the workload's max/mean length ratio
+
+| workload | max/mean sequence | paged vs oracle |
+| --- | ---: | ---: |
+| mixed | 7.40 | 6.6x |
+| long_prompt | 1.47 | 1.4x |
+| long_generation | 1.10 | 1.1x |
+| short_interactive | 1.10 | 1.0x |
+
+This is not a coincidence, and it is derivable rather than empirical: a
+contiguous cache reserves the *longest* sequence for every slot, paging
+reserves roughly the *mean*, so the capacity ratio is max/mean. The
+simulation confirms the prediction to within 12% across a 6.7x range of
+heterogeneity.
+
+Stated as a rule for the report: **paging buys you exactly the
+heterogeneity of your workload, and nothing otherwise.** On uniform
+traffic it ties an oracle-tuned contiguous cache. Its real-world value
+on uniform traffic is that you do not have to *be* an oracle — the
+generic contiguous baseline, sized for the longest request the server
+accepts, is 46x worse on `short_interactive`.
+
+### Block size barely matters — prediction falsified
+
+Capacity efficiency stays between 98.8% and 100% from block_size 1 to
+256, and TPOT differs by under 1% between 16 and 128. The expectation
+that finer scattering would cost more locality was wrong: one token's KV
+is 2 heads x 128 dims x 2 bytes = 512 contiguous bytes even at
+block_size 1, which is already enough for a coalesced read. Scatter
+granularity is irrelevant; total bytes moved is everything.
+
+Allocation overhead falls with block size (0.27 -> 0.05 us/token) but
+never approaches relevance against a ~30 ms decode step.
+
+**Choose 16.** Capacity and latency are indifferent, so the tiebreaker
+is Phase 13: block size is the granularity at which prefixes can be
+shared, and 16 tokens is a far more likely common prefix boundary than
+256. (This is also what vLLM uses, for the same reason.)
+
+### Paging costs exactly what the gather costs
+
+| batch / ctx | contiguous | paged (bs=16) | overhead | gather | implied |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 / 4096 | 29.34 ms | 32.39 | +10.4% | 231 MiB | 79 GB/s |
+| 1 / 16384 | 43.78 | 52.55 | +20.0% | 903 MiB | 108 GB/s |
+| 4 / 8192 | 32.88 | 48.91 | +48.7% | 1820 MiB | 119 GB/s |
+| 4 / 16384 | 46.40 | 78.87 | +70.0% | 3612 MiB | 117 GB/s |
+
+The last column is the extra bytes divided by the extra time. It lands
+at 79-135 GB/s — the same band Phase 2 measured for every other
+memory-bound operation on this card (85-146 GB/s). So the whole of
+paging's latency cost is explained by one sentence: **the gather moves
+2x the live KV per step, at the machine's bandwidth.** Nothing is
+unaccounted for, and no profiling is needed to attribute it.
+
+TTFT is unchanged within a few percent, which is the control: prefill is
+compute-bound at O(S^2), so the same gather disappears into it.
+
+### What this hands to Phase 11
+
+A paged-attention kernel that walks the block table with an online
+softmax removes the gather entirely, and the table above says exactly
+what that is worth: up to 32 ms/token at batch 4 / 16K, ~70% of TPOT.
+Phase 11 now has a target with a number attached rather than a hunch,
+and a pre-registered prediction — a correct kernel should recover nearly
+all of that gap and land within noise of contiguous.
+
 ## Gate 4 checklist — "Can paged KV improve memory utilization?"
 
 - [ ] `pytest tests/test_phase3_paged.py` green, including

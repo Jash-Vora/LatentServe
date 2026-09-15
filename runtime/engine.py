@@ -1,0 +1,325 @@
+"""
+Phase 4 — the serving engine.
+
+docs/methodology.md Phase 4: turn the inference backend into a minimal
+serving engine with continuous batching.
+
+    Step 1: A B C D
+    Step 2: A B   D      <- C finished, its slot is reusable immediately
+    Step 3: A B     E    <- E joined without waiting for A, B, D
+    Step 4: A
+
+Static batching runs a fixed group to completion, so the whole batch
+waits for its slowest member and finished sequences keep their memory.
+Continuous batching retires and admits every iteration.
+
+## Why this could not have been built before Phase 3
+
+A ragged decode batch — sequences at positions 512, 9000 and 17 in the
+same step — cannot be represented by a contiguous cache at all: it has
+one shared fill length. Paging is what makes each sequence's KV
+independent, so Phase 3 is a prerequisite for Phase 4, not an
+optimization of it. That dependency is worth stating plainly in the
+report, because "paged KV" and "continuous batching" are usually
+presented as two separate features.
+
+## What one step does
+
+    1. retire finished sequences, freeing their blocks at once
+    2. ask the scheduler which waiting requests to admit
+    3. prefill each admitted request into its own slot
+    4. one ragged decode step across every resident sequence
+
+Prefill runs one request at a time rather than batched. Phase 2 measured
+prefill as compute-bound (O(S^2) attention, TTFT 650 ms at 4K against a
+31 ms decode step), so batching prefills buys little, while mixing a
+prefill into a decode batch requires a combined causal+padding mask that
+Phase 3 explicitly deferred. Chunked mixed batching is the upgrade path
+and belongs with the adaptive runtime in Phase 17.
+
+The cost of that choice is honest and should be reported: a long prefill
+blocks decoding for every resident sequence, so a 32K prompt arriving
+mid-flight adds its whole 17 s prefill to everyone else's inter-token
+latency. Expect it in the p99 TPOT.
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Optional
+
+import torch
+
+from cache.paged_cache import PagedKVCache
+from model.latentserve_qwen import LatentServeQwen
+from runtime.request import RequestState, ServedRequest
+from runtime.scheduler import Scheduler, build_scheduler
+
+
+class ServingEngine:
+    """Continuous-batching engine over a paged KV cache."""
+
+    def __init__(
+        self,
+        model: LatentServeQwen,
+        max_running: int = 16,
+        max_seq_len: int = 8192,
+        block_size: int = 16,
+        num_blocks: Optional[int] = None,
+        scheduler: str | Scheduler = "fifo",
+        prefill_chunk_size: Optional[int] = 4096,
+        eos_token_id: Optional[int] = None,
+    ):
+        self.model = model
+        self.max_running = max_running
+        self.prefill_chunk_size = prefill_chunk_size
+        self.eos_token_id = eos_token_id
+
+        cache = model.allocate_cache(
+            batch_size=max_running,
+            max_seq_len=max_seq_len,
+            paged=True,
+            block_size=block_size,
+            num_blocks=num_blocks,
+        )
+        assert isinstance(cache, PagedKVCache)
+        self.cache: PagedKVCache = cache
+
+        self.scheduler = (
+            scheduler if isinstance(scheduler, Scheduler)
+            else build_scheduler(scheduler, max_running=max_running)
+        )
+
+        self.waiting: list[ServedRequest] = []
+        self.running: list[ServedRequest] = []
+        self.finished: list[ServedRequest] = []
+        self._free_slots = list(range(max_running))
+
+        # Instrumentation. Scheduler overhead is a headline Phase 4
+        # metric, so it is measured rather than assumed negligible.
+        self.step_count = 0
+        self.decode_steps = 0
+        self.prefill_tokens = 0
+        self.decode_tokens = 0
+        self.prefill_s = 0.0
+        self.decode_s = 0.0
+        self.overhead_s = 0.0
+        self.batch_occupancy: list[int] = []
+
+    # ------------------------------------------------------------------
+
+    def add_request(self, request: ServedRequest) -> None:
+        request.state = RequestState.QUEUED
+        self.waiting.append(request)
+
+    @property
+    def has_work(self) -> bool:
+        return bool(self.waiting or self.running)
+
+    # ------------------------------------------------------------------
+
+    def _retire(self, request: ServedRequest) -> None:
+        request.finish_time = time.perf_counter()
+        request.state = RequestState.FINISHED
+        self.cache.free_sequence(request.slot)
+        self._free_slots.append(request.slot)
+        request.slot = None
+        self.finished.append(request)
+
+    def _admit_and_prefill(self) -> None:
+        admitted = self.scheduler.select(
+            self.waiting,
+            num_running=len(self.running),
+            can_admit=self.cache.can_admit,
+        )
+        for request in admitted:
+            if not self._free_slots:
+                break
+            # Re-check: earlier admissions in this same iteration consumed
+            # blocks the scheduler's snapshot did not know about.
+            if not self.cache.can_admit(request.prompt_len):
+                break
+            slot = self._free_slots.pop(0)
+            request.slot = slot
+            request.state = RequestState.PREFILL
+            request.scheduled_time = time.perf_counter()
+            self.waiting.remove(request)
+
+            ids = torch.tensor(
+                [request.prompt_ids], dtype=torch.long, device=self.model.device
+            )
+            t0 = time.perf_counter()
+            logits = self.model.prefill_slot(ids, slot, chunk_size=self.prefill_chunk_size)
+            if self.model.device.type == "cuda":
+                torch.cuda.synchronize()
+            self.prefill_s += time.perf_counter() - t0
+            self.prefill_tokens += request.prompt_len
+
+            next_id = int(logits[0, -1].argmax().item())
+            request.first_token_time = time.perf_counter()
+            request.output_ids.append(next_id)
+            request.state = RequestState.DECODING
+            self.running.append(request)
+            if self._should_stop(request):
+                self._retire(request)
+
+    def _should_stop(self, request: ServedRequest) -> bool:
+        if request.generated >= request.max_new_tokens:
+            return True
+        return self.eos_token_id is not None and request.output_ids[-1] == self.eos_token_id
+
+    def _decode(self) -> None:
+        if not self.running:
+            return
+        device = self.model.device
+        slots = [r.slot for r in self.running]
+        tokens = torch.tensor(
+            [[r.output_ids[-1]] for r in self.running], dtype=torch.long, device=device
+        )
+        # Absolute position of the token about to be processed: prompt
+        # plus everything generated so far, minus the one being fed in.
+        positions = torch.tensor(
+            [[r.prompt_len + r.generated - 1] for r in self.running],
+            dtype=torch.long,
+            device=device,
+        )
+
+        t0 = time.perf_counter()
+        logits = self.model.decode_step_ragged(tokens, positions, slots)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        step_ms = (time.perf_counter() - t0) * 1000
+        self.decode_s += step_ms / 1000
+        self.decode_steps += 1
+        self.batch_occupancy.append(len(self.running))
+
+        next_ids = logits[:, -1, :].argmax(dim=-1).tolist()
+        still: list[ServedRequest] = []
+        for request, token in zip(self.running, next_ids):
+            request.output_ids.append(int(token))
+            request.decode_step_ms.append(step_ms)
+            self.decode_tokens += 1
+            if self._should_stop(request):
+                self._retire(request)
+            else:
+                still.append(request)
+        self.running = still
+
+    def step(self) -> None:
+        """One engine iteration: admit, prefill, decode, retire."""
+        t0 = time.perf_counter()
+        gpu_before = self.prefill_s + self.decode_s
+        self.step_count += 1
+        self._admit_and_prefill()
+        self._decode()
+        # Everything in the step that was not GPU work: scheduling,
+        # block-table updates, Python bookkeeping. Reported as its own
+        # number because methodology Phase 4 asks for scheduler overhead
+        # explicitly, and "negligible" is a claim, not a given.
+        elapsed = time.perf_counter() - t0
+        self.overhead_s += max(0.0, elapsed - (self.prefill_s + self.decode_s - gpu_before))
+
+    def run(self, max_steps: int = 1_000_000) -> list[ServedRequest]:
+        """Drain the queue. Returns finished requests in completion order."""
+        steps = 0
+        while self.has_work and steps < max_steps:
+            before = (len(self.waiting), len(self.running))
+            self.step()
+            steps += 1
+            if not self.running and self.waiting and before == (len(self.waiting), 0):
+                # Nothing admitted and nothing running: the smallest
+                # waiting request cannot fit even in an empty pool. Fail
+                # loudly rather than spin — a silent hang here would be
+                # indistinguishable from a slow workload.
+                shortest = min(r.prompt_len for r in self.waiting)
+                raise RuntimeError(
+                    f"deadlock: {len(self.waiting)} requests waiting, shortest prompt "
+                    f"{shortest} tokens, but the block pool cannot seat it "
+                    f"({self.cache.allocator.num_free} blocks free)"
+                )
+        return self.finished
+
+    # ------------------------------------------------------------------
+
+    def stats(self) -> dict:
+        wall = self.prefill_s + self.decode_s
+        mean_batch = (
+            sum(self.batch_occupancy) / len(self.batch_occupancy) if self.batch_occupancy else 0.0
+        )
+        return {
+            "engine_steps": self.step_count,
+            "decode_steps": self.decode_steps,
+            "prefill_tokens": self.prefill_tokens,
+            "decode_tokens": self.decode_tokens,
+            "prefill_s": self.prefill_s,
+            "decode_s": self.decode_s,
+            "gpu_s": wall,
+            "decode_tokens_per_s": self.decode_tokens / self.decode_s if self.decode_s else 0.0,
+            "mean_batch_occupancy": mean_batch,
+            "runtime_overhead_s": self.overhead_s,
+            "runtime_overhead_pct": (
+                self.overhead_s / (wall + self.overhead_s) * 100 if wall + self.overhead_s else 0.0
+            ),
+            "runtime_overhead_ms_per_step": (
+                self.overhead_s * 1000 / self.step_count if self.step_count else 0.0
+            ),
+            # Fraction of the theoretical maximum batch actually used.
+            # Static batching's loss shows up here as sequences that
+            # finished early but still held a slot.
+            "batch_efficiency": mean_batch / self.max_running if self.max_running else 0.0,
+            "max_running": self.max_running,
+            **self.scheduler.stats(),
+            **self.cache.stats(),
+        }
+
+
+def run_static_batching(
+    model: LatentServeQwen,
+    requests: list[ServedRequest],
+    batch_size: int,
+    max_seq_len: int,
+    block_size: int = 16,
+    prefill_chunk_size: Optional[int] = 4096,
+) -> tuple[list[ServedRequest], dict]:
+    """Baseline: fixed groups run to completion.
+
+    The comparison continuous batching has to beat. Two costs are
+    structural here, and both are visible in the metrics rather than
+    argued for: every request in a group waits for the group's slowest
+    member before its slot can be reused, and a request that arrives one
+    step after a group starts waits for the whole group.
+
+    Implemented on the same engine primitives so the difference is the
+    batching policy alone, not two different code paths.
+    """
+    finished: list[ServedRequest] = []
+    total = {"prefill_s": 0.0, "decode_s": 0.0, "decode_tokens": 0, "occupancy": []}
+
+    for start in range(0, len(requests), batch_size):
+        group = requests[start : start + batch_size]
+        engine = ServingEngine(
+            model,
+            max_running=batch_size,
+            max_seq_len=max_seq_len,
+            block_size=block_size,
+            prefill_chunk_size=prefill_chunk_size,
+        )
+        for r in group:
+            engine.add_request(r)
+        # Admit the whole group, then decode until all are done — no new
+        # request may join mid-flight, which is the definition of static.
+        engine.run()
+        finished.extend(engine.finished)
+        total["prefill_s"] += engine.prefill_s
+        total["decode_s"] += engine.decode_s
+        total["decode_tokens"] += engine.decode_tokens
+        total["occupancy"].extend(engine.batch_occupancy)
+
+    occupancy = total.pop("occupancy")
+    total["mean_batch_occupancy"] = sum(occupancy) / len(occupancy) if occupancy else 0.0
+    total["batch_efficiency"] = total["mean_batch_occupancy"] / batch_size
+    total["gpu_s"] = total["prefill_s"] + total["decode_s"]
+    total["decode_tokens_per_s"] = (
+        total["decode_tokens"] / total["decode_s"] if total["decode_s"] else 0.0
+    )
+    return finished, total

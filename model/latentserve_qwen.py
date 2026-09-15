@@ -238,6 +238,17 @@ class LatentServeQwen:
     # Core forward
     # ------------------------------------------------------------------
 
+    def _cos_sin_at(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-sequence RoPE for a ragged batch (Phase 4)."""
+        if self.rope is None:
+            cos, sin = self.hf_rotary(
+                torch.zeros(positions.shape[0], positions.shape[1], 1, device=self.device,
+                            dtype=self.dtype),
+                positions,
+            )
+            return cos[:, None].to(self.dtype), sin[:, None].to(self.dtype)
+        return self.rope.cos_sin_at(positions, self.dtype)
+
     def _cos_sin(self, start_pos: int, length: int) -> tuple[torch.Tensor, torch.Tensor]:
         if self.rope is not None:
             return self.rope.cos_sin(start_pos, length, self.dtype)
@@ -248,7 +259,13 @@ class LatentServeQwen:
         return cos[:, None, :, :].to(self.dtype), sin[:, None, :, :].to(self.dtype)
 
     @torch.no_grad()
-    def _forward_block(self, input_ids: torch.Tensor, start_pos: int) -> torch.Tensor:
+    def _forward_block(
+        self,
+        input_ids: torch.Tensor,
+        start_pos: int,
+        positions: Optional[torch.Tensor] = None,
+        slots: Optional[list] = None,
+    ) -> torch.Tensor:
         """Run one block of tokens through every layer, updating the
         cache. Returns the final hidden states [B, S, hidden] *before*
         the final norm — the caller decides how many positions are worth
@@ -258,9 +275,16 @@ class LatentServeQwen:
         # slot indices built before any layer scatters into the pool. The
         # contiguous cache only tracks a fill counter, so the earlier
         # position is harmless there.
-        cache.advance(input_ids.shape[1], batch_size=input_ids.shape[0])
+        if slots is not None:
+            cache.advance(input_ids.shape[1], slots=slots)
+        else:
+            cache.advance(input_ids.shape[1], batch_size=input_ids.shape[0])
         h = self.embed_tokens(input_ids)
-        cos, sin = self._cos_sin(start_pos, input_ids.shape[1])
+        cos, sin = (
+            self._cos_sin(start_pos, input_ids.shape[1])
+            if positions is None
+            else self._cos_sin_at(positions)
+        )
 
         for layer in self.layers:
             residual = h
@@ -308,6 +332,36 @@ class LatentServeQwen:
         """One token per sequence. token_ids: [B, 1] -> logits [B, 1, V]."""
         cache = self._require_cache()
         hidden = self._forward_block(token_ids, start_pos=cache.length)
+        return self._to_logits(hidden)
+
+    @torch.no_grad()
+    def prefill_slot(self, input_ids: torch.Tensor, slot: int, chunk_size: Optional[int] = None):
+        """Prefill one request into one cache slot, leaving every other
+        slot untouched. The operation continuous batching is built from:
+        an arriving request must be able to run its prompt without
+        disturbing sequences already decoding."""
+        seq_len = input_ids.shape[1]
+        step = chunk_size or seq_len
+        hidden = None
+        for start in range(0, seq_len, step):
+            block = input_ids[:, start : start + step]
+            hidden = self._forward_block(block, start_pos=start, slots=[slot])
+        return self._to_logits(hidden[:, -1:, :])
+
+    @torch.no_grad()
+    def decode_step_ragged(
+        self, token_ids: torch.Tensor, positions: torch.Tensor, slots: list
+    ) -> torch.Tensor:
+        """One decode step across sequences at *different* positions.
+
+        `token_ids` is [B, 1], `positions` is [B, 1] of absolute
+        positions, and `slots[j]` says which cache slot row j belongs to.
+        Requires the paged cache: a contiguous cache has one shared fill
+        length and cannot represent this batch at all, which is the
+        concrete sense in which Phase 3 is a prerequisite for Phase 4
+        rather than an optimization of it.
+        """
+        hidden = self._forward_block(token_ids, start_pos=0, positions=positions, slots=slots)
         return self._to_logits(hidden)
 
     @torch.no_grad()

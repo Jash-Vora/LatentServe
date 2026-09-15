@@ -1,0 +1,261 @@
+"""
+Phase 4 — serving runtime benchmark.
+
+docs/methodology.md Phase 4 and Section 12: continuous batching vs.
+static batching, the four scheduler policies, and scheduler overhead
+measured rather than assumed.
+
+Run:
+
+    export PYTHONPATH=$(pwd):$PYTHONPATH
+
+    # continuous vs static, the headline comparison
+    python -m benchmarks.runners.phase4_serving --config configs/phase4_serving.yaml \\
+        --workload mixed --num-requests 32 --max-prompt 8192 \\
+        --batch-sizes 1 4 8
+
+    # scheduler policies at fixed concurrency
+    python -m benchmarks.runners.phase4_serving --experiment schedulers \\
+        --workload mixed --num-requests 32 --max-prompt 8192 --max-running 8
+
+## What changes about the metrics here
+
+TTFT stops meaning prefill latency. From Phase 4 on it is
+queue + prefill, and under load the queue term usually dominates. Both
+are recorded separately, because they respond to different fixes: queue
+time wants capacity or a different admission order, prefill time wants a
+faster kernel.
+
+Percentiles stop being optional. A scheduler that improves mean TTFT by
+starving its tail is a worse server, and only p95/p99 show that. Every
+row here carries p50/p95/p99 for TTFT and TPOT.
+
+## What to expect
+
+Phase 2 measured batching as nearly free at 4K — batch 1 to 8 left TPOT
+unchanged (31.0 -> 30.6 ms) for 8x the throughput, because decode is
+weight-bound and the weights are read once per step regardless of batch
+size. Continuous batching's win over static is therefore *not* about the
+per-step cost; it is about keeping the batch full. Static batching holds
+a slot until the slowest member of the group finishes, so on a workload
+with mixed output lengths its mean occupancy falls well below its
+nominal batch size. `mean_batch_occupancy` is the metric that shows it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import statistics
+import sys
+from typing import Optional
+
+import torch
+
+from benchmarks.schema import BenchmarkResult, ResultWriter
+from benchmarks.workloads.ragged import WORKLOADS, generate_requests
+from config import load_config
+from runtime.engine import ServingEngine, run_static_batching
+from runtime.request import ServedRequest
+from runtime.scheduler import SCHEDULERS, build_scheduler
+
+
+def _pct(xs: list, p: float) -> Optional[float]:
+    xs = sorted(x for x in xs if x is not None)
+    if not xs:
+        return None
+    return xs[min(len(xs) - 1, int(round(p * (len(xs) - 1))))]
+
+
+def build_served_requests(
+    ref, workload: str, num_requests: int, max_prompt: int, max_output: int, seed: int
+) -> list[ServedRequest]:
+    """Turn a workload stream into ServedRequests with real token ids.
+
+    `max_prompt` clamps the workload's long tail. The `mixed` family
+    reaches 64K prompts, and a 64K prefill alone is ~70 s on a T4 — fine
+    as a capacity experiment (Phase 3 simulated it for free), ruinous as
+    a serving experiment where the point is to observe many requests
+    interacting. Clamping is recorded in `extra` so the trim is visible
+    rather than silently baked into the numbers.
+    """
+    specs = generate_requests(workload, num_requests, seed=seed)
+    out = []
+    for spec in specs:
+        prompt_len = min(spec.prompt_tokens, max_prompt)
+        ids = ref.synthesize_input_ids(prompt_len, seed=seed + spec.request_id)
+        out.append(
+            ServedRequest(
+                request_id=spec.request_id,
+                prompt_ids=ids[0].tolist(),
+                max_new_tokens=min(spec.output_tokens, max_output),
+            )
+        )
+    return out
+
+
+def summarise(finished: list[ServedRequest], wall_s: float, extra: dict) -> dict:
+    ttfts = [r.ttft_ms for r in finished]
+    tpots = [r.tpot_ms for r in finished]
+    queues = [r.queue_ms for r in finished]
+    total_out = sum(r.generated for r in finished)
+    return {
+        "requests": len(finished),
+        "wall_s": wall_s,
+        "requests_per_s": len(finished) / wall_s if wall_s else 0.0,
+        "output_tokens_per_s": total_out / wall_s if wall_s else 0.0,
+        "ttft_p50": _pct(ttfts, 0.50), "ttft_p95": _pct(ttfts, 0.95), "ttft_p99": _pct(ttfts, 0.99),
+        "tpot_p50": _pct(tpots, 0.50), "tpot_p95": _pct(tpots, 0.95), "tpot_p99": _pct(tpots, 0.99),
+        "queue_p50": _pct(queues, 0.50), "queue_p95": _pct(queues, 0.95),
+        "mean_queue_ms": statistics.mean([q for q in queues if q is not None]) if queues else 0.0,
+        **extra,
+    }
+
+
+def _write(writer, cfg, system: str, summary: dict, batch_size: int, ctx: int) -> BenchmarkResult:
+    row = BenchmarkResult(
+        system=system, tag=cfg.tag, attention="gqa", model=cfg.model.name,
+        batch_size=batch_size, context_length=ctx,
+        output_length=int(summary.get("mean_output_tokens", 0)), num_gpus=1,
+        ttft_ms=summary["ttft_p50"] or 0.0,
+        tpot_ms=summary["tpot_p50"] or 0.0,
+        e2e_latency_ms=summary["wall_s"] * 1000,
+        throughput_tokens_sec=summary["output_tokens_per_s"],
+        requests_per_sec=summary["requests_per_s"],
+        ttft_p50_ms=summary["ttft_p50"], ttft_p95_ms=summary["ttft_p95"],
+        ttft_p99_ms=summary["ttft_p99"],
+        tpot_p50_ms=summary["tpot_p50"], tpot_p95_ms=summary["tpot_p95"],
+        tpot_p99_ms=summary["tpot_p99"],
+        peak_vram_mb=(
+            torch.cuda.max_memory_allocated() / 1024 / 1024 if torch.cuda.is_available() else 0.0
+        ),
+        seed=cfg.generation.seed,
+        extra={"status": "ok", **summary},
+    )
+    writer.write(row)
+    return row
+
+
+def run(
+    config_path: str, experiment: str, workload: str, num_requests: int, max_prompt: int,
+    max_output: int, batch_sizes: list, max_running: int, schedulers: list,
+    block_size: int, results_dir: str,
+) -> None:
+    import time
+
+    from model.latentserve_qwen import LatentServeQwen
+    from model.qwen import QwenReference
+
+    cfg = load_config(config_path)
+    device = f"cuda:{cfg.hardware.devices[0]}" if torch.cuda.is_available() else "cpu"
+    if device == "cpu":
+        print("[WARN] no CUDA device — plumbing check only.", file=sys.stderr)
+
+    ref = QwenReference(
+        model_name=cfg.model.name, dtype=cfg.model.dtype, device=device,
+        revision=cfg.model.revision, trust_remote_code=cfg.model.trust_remote_code,
+    ).load()
+    model = LatentServeQwen.from_reference(ref, max_seq_len_hint=max_prompt + max_output)
+    writer = ResultWriter(results_dir=results_dir)
+
+    requests = build_served_requests(ref, workload, num_requests, max_prompt, max_output,
+                                     cfg.generation.seed)
+    max_seq_len = max(r.total_len for r in requests) + 8
+    mean_out = statistics.mean([r.max_new_tokens for r in requests])
+    print(
+        f"workload={workload} n={len(requests)} "
+        f"prompt {min(r.prompt_len for r in requests)}-{max(r.prompt_len for r in requests)} "
+        f"(clamped at {max_prompt}), output mean {mean_out:.0f}"
+    )
+    common = {"workload": workload, "max_prompt": max_prompt,
+              "mean_output_tokens": mean_out, "block_size": block_size}
+
+    if experiment in ("batching", "both"):
+        for batch_size in batch_sizes:
+            for policy in ("static", "continuous"):
+                fresh = build_served_requests(ref, workload, num_requests, max_prompt,
+                                              max_output, cfg.generation.seed)
+                t0 = time.perf_counter()
+                if policy == "static":
+                    finished, stats = run_static_batching(
+                        model, fresh, batch_size=batch_size, max_seq_len=max_seq_len,
+                        block_size=block_size,
+                    )
+                else:
+                    engine = ServingEngine(
+                        model, max_running=batch_size, max_seq_len=max_seq_len,
+                        block_size=block_size, scheduler="fifo",
+                    )
+                    for r in fresh:
+                        engine.add_request(r)
+                    finished = engine.run()
+                    stats = engine.stats()
+                wall = time.perf_counter() - t0
+                summary = summarise(finished, wall, {**common, "policy": policy, **stats})
+                _write(writer, cfg, f"latentserve_{policy}", summary, batch_size,
+                       int(statistics.mean([r.prompt_len for r in fresh])))
+                print(
+                    f"  batch={batch_size:>2} {policy:<10} "
+                    f"{summary['output_tokens_per_s']:7.1f} tok/s  "
+                    f"ttft p50/p95 {summary['ttft_p50']:8.0f}/{summary['ttft_p95']:8.0f} ms  "
+                    f"tpot p50 {summary['tpot_p50']:6.2f} ms  "
+                    f"occupancy {summary.get('mean_batch_occupancy', 0):.2f}/{batch_size}"
+                )
+                model.cache = None
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+    if experiment in ("schedulers", "both"):
+        print(f"\n=== schedulers at max_running={max_running} ===")
+        for name in schedulers:
+            fresh = build_served_requests(ref, workload, num_requests, max_prompt, max_output,
+                                          cfg.generation.seed)
+            engine = ServingEngine(
+                model, max_running=max_running, max_seq_len=max_seq_len,
+                block_size=block_size,
+                scheduler=build_scheduler(name, max_running=max_running),
+            )
+            for r in fresh:
+                engine.add_request(r)
+            t0 = time.perf_counter()
+            finished = engine.run()
+            wall = time.perf_counter() - t0
+            summary = summarise(finished, wall, {**common, "policy": "continuous", **engine.stats()})
+            _write(writer, cfg, f"latentserve_sched_{name}", summary, max_running,
+                   int(statistics.mean([r.prompt_len for r in fresh])))
+            print(
+                f"  {name:<14} {summary['output_tokens_per_s']:7.1f} tok/s  "
+                f"ttft p50/p95/p99 {summary['ttft_p50']:7.0f}/{summary['ttft_p95']:7.0f}/"
+                f"{summary['ttft_p99']:7.0f} ms  queue p50 {summary['queue_p50']:7.0f} ms  "
+                f"sched {summary['scheduler_overhead_us_per_call']:.1f} us/call"
+            )
+            model.cache = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--config", default="configs/phase4_serving.yaml")
+    p.add_argument("--experiment", choices=["batching", "schedulers", "both"], default="both")
+    p.add_argument("--workload", default="mixed", choices=sorted(WORKLOADS))
+    p.add_argument("--num-requests", type=int, default=32)
+    p.add_argument("--max-prompt", type=int, default=8192,
+                   help="clamp the workload's long tail; recorded in results")
+    p.add_argument("--max-output", type=int, default=256,
+                   help="static batching only loses when output lengths vary, so do not "
+                   "clamp the workload's 128/256 mix down to a single value")
+    p.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4, 8])
+    p.add_argument("--max-running", type=int, default=8)
+    p.add_argument("--schedulers", nargs="+", default=sorted(SCHEDULERS), choices=sorted(SCHEDULERS))
+    p.add_argument("--block-size", type=int, default=16)
+    p.add_argument("--results-dir", default="results/raw")
+    args = p.parse_args()
+
+    run(args.config, args.experiment, args.workload, args.num_requests, args.max_prompt,
+        args.max_output, args.batch_sizes, args.max_running, args.schedulers,
+        args.block_size, args.results_dir)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
