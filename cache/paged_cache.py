@@ -266,15 +266,16 @@ class PagedKVCache:
     @property
     def allocated_bytes(self) -> int:
         """Whole pool, whether or not blocks are handed out — this is
-        what the GPU actually holds."""
-        return (
-            self.num_blocks
-            * self.block_size
-            * self.spec.num_kv_heads
-            * self.spec.head_dim
-            * 2
-            * self.spec.dtype_bytes
-        )
+        what the GPU actually holds.
+
+        There is one pool *per layer*, so the layer count belongs in this
+        product. Omitting it under-reported the allocation by 28x for
+        Qwen2.5-1.5B, which showed up as a 5 MB cache where 134 MB was
+        allocated. `KVCacheSpec.bytes_per_token` already folds the layers
+        in, so express it in terms of that rather than re-deriving the
+        product and risking the same omission twice.
+        """
+        return self.spec.bytes_per_token * self.num_blocks * self.block_size
 
     def used_bytes(self, batch_size: Optional[int] = None) -> int:
         rows = self._active if batch_size is None else list(self._active)[:batch_size]

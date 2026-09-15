@@ -208,6 +208,10 @@ def main() -> int:
     p.add_argument("--max-prompt", type=int, default=8192)
     p.add_argument("--max-output", type=int, default=256)
     p.add_argument("--batch-sizes", type=int, nargs="+", default=[4, 8])
+    p.add_argument("--output-lengths", type=int, nargs=2, default=None,
+                   metavar=("SHORT", "LONG"),
+                   help="run each point at two output lengths and difference them, "
+                   "separating decode cost from prefill without needing TTFT")
     p.add_argument("--context-lengths", type=int, nargs="+", default=None,
                    help="sweep uniform prompt lengths instead of a workload family; "
                    "this is what locates the LatentServe/vLLM crossover")
@@ -248,8 +252,18 @@ def main() -> int:
         if args.context_lengths
         else [(b, None) for b in args.batch_sizes]
     )
+    # Decode isolation: the same point at two output lengths. The extra
+    # wall time between them is pure decode (identical prompts, identical
+    # prefill), so decode cost per step comes out as a slope and prefill
+    # as the intercept. This is the only way to separate the two for vLLM,
+    # whose V1 engine does not report TTFT.
+    output_lengths = args.output_lengths or [args.max_output]
+    walls: dict = {}
 
     for batch_size, context_length in sweep:
+      for out_tokens in output_lengths:
+        args.max_output = out_tokens
+
         def make():
             return (
                 build_uniform_requests(
@@ -289,7 +303,18 @@ def main() -> int:
             )
             row = _row(cfg, system, batch_size, ctx, out_len, summary, controls)
             writer.write(row)
-            steps = max(1, sum(r.generated for r in fresh) // batch_size) if context_length else 0
+            walls.setdefault((system, batch_size, context_length), {})[args.max_output] = (
+                summary["wall_s"]
+            )
+            # Use the *requested* token counts, not r.generated: only the
+            # LatentServe arm writes generated tokens back onto the request
+            # objects, so r.generated is 0 for vLLM and the column silently
+            # printed total wall time instead of a per-step cost.
+            steps = (
+                max(1, sum(r.max_new_tokens for r in fresh) // batch_size)
+                if context_length
+                else 0
+            )
             print(
                 f"  {system:<12} batch={batch_size:>2} "
                 + (f"ctx={context_length:>6} " if context_length else "")
@@ -299,6 +324,27 @@ def main() -> int:
                 + f"itl p50 {summary.get('itl_p50') or float('nan'):6.1f} ms  "
                 + f"kv {(summary.get('kv_allocated_mb') or float('nan')):7.0f} MB"
             )
+    if args.output_lengths:
+        short, long = args.output_lengths
+        print(f"\nDecode isolated by differencing {short} vs {long} output tokens:")
+        print(f"{'system':<12} {'batch':>5} {'ctx':>6} {'decode ms/step':>15} "
+              f"{'prefill tok/s':>14}")
+        for (system, batch_size, context_length), by_out in sorted(walls.items()):
+            if short not in by_out or long not in by_out:
+                continue
+            extra_steps = (long - short) * args.num_requests / batch_size
+            decode_ms = (by_out[long] - by_out[short]) / extra_steps * 1000
+            short_steps = short * args.num_requests / batch_size
+            prefill_s = by_out[short] - decode_ms / 1000 * short_steps
+            prompt_tokens = (context_length or 0) * args.num_requests
+            rate = prompt_tokens / prefill_s if prefill_s > 0 and prompt_tokens else float("nan")
+            print(f"{system:<12} {batch_size:>5} {context_length or 0:>6} "
+                  f"{decode_ms:>15.1f} {rate:>14.0f}")
+        print(
+            "\nA high decode ms/step points at the decode attention kernel; a low "
+            "prefill tok/s points at prefill attention, which is O(S^2) and where a "
+            "weak kernel hurts most. They are different findings."
+        )
     return 0
 
 
