@@ -1,0 +1,288 @@
+"""
+Phase 3 — paged KV cache.
+
+A PagedAttention-style memory manager: KV lives in a pool of fixed-size
+blocks, and each sequence holds a block table mapping its logical
+positions to scattered physical blocks
+(`cache/block_allocator.py`). Compare against `cache/kv_cache.py`'s
+contiguous cache under variable sequence lengths, concurrent requests,
+request termination and high utilization.
+
+## Set expectations honestly
+
+Paging is a **capacity** optimization. It should make decode latency
+slightly *worse*, because attention can no longer read a contiguous
+tensor. Phase 2 already showed what that class of cost looks like: the
+`repeat_kv` materialisation was 13x the necessary traffic and dominated
+TPOT past 4K. The gather here is a 1x copy, not 13x, but it is not free
+and the honest framing of Phase 3 is "what capacity does paging buy,
+and what does it cost in latency" — not "paging makes things fast".
+
+## Layout
+
+Per layer: `[num_blocks, block_size, kv_heads, head_dim]`, viewed flat
+as `[num_blocks * block_size, kv_heads, head_dim]` so a slot index
+addresses one token's KV directly.
+
+This is the seq-major layout `cache/kv_cache.py` deliberately did not
+use. Phase 2's contiguous cache is head-major because SDPA wants
+`[B, H, S, D]` on the read path with no transpose. Here, a token's KV
+must be one contiguous run so that scattered blocks can be gathered by
+a single index operation, and the transpose moves to the read. Two
+caches, two layouts, for reasons that come from how each is accessed —
+worth stating in the report, since "which layout is faster" has no
+context-free answer.
+
+## The gather, and why it is the Phase 11 hook
+
+Attention needs `[B, kv_heads, L, head_dim]`. Blocks are scattered, so
+either (a) gather them into a contiguous buffer each step, or (b) have
+the kernel walk the block table itself with an online softmax. (b) is a
+real paged-attention kernel and belongs in Phase 11. Phase 3 does (a),
+measures it, and that measurement is the motivation for (b). Recording
+"the gather cost X ms/token in PyTorch, so a kernel is warranted" is a
+better Phase 11 setup than writing the kernel on a hunch.
+"""
+
+from __future__ import annotations
+
+from typing import Optional, Sequence
+
+import torch
+
+from cache.block_allocator import BlockAllocator, BlockTable
+from cache.kv_cache import KVCacheSpec
+
+
+class PagedKVCache:
+    """Block-paged KV storage with the same read/write contract as
+    `ContiguousKVCache`, so `GQAAttention` cannot tell them apart."""
+
+    def __init__(self, spec: KVCacheSpec, block_size: int = 16, num_blocks: Optional[int] = None):
+        self.spec = spec
+        self.block_size = block_size
+        self.device = torch.device(spec.device)
+
+        if num_blocks is None:
+            # Default to the same total capacity the contiguous cache
+            # would have reserved, so a like-for-like comparison starts
+            # from an equal memory budget rather than an equal number of
+            # sequences.
+            per_seq = (spec.max_seq_len + block_size - 1) // block_size
+            num_blocks = per_seq * spec.max_batch_size
+        self.num_blocks = num_blocks
+
+        self.allocator = BlockAllocator(num_blocks=num_blocks, block_size=block_size)
+        self.tables: list[BlockTable] = [
+            BlockTable(self.allocator) for _ in range(spec.max_batch_size)
+        ]
+
+        shape = (num_blocks, block_size, spec.num_kv_heads, spec.head_dim)
+        self.k_pool: list[torch.Tensor] = []
+        self.v_pool: list[torch.Tensor] = []
+        for _ in range(spec.num_layers):
+            self.k_pool.append(torch.zeros(shape, dtype=spec.dtype, device=self.device))
+            self.v_pool.append(torch.zeros(shape, dtype=spec.dtype, device=self.device))
+
+        self._flat_k = [t.view(-1, spec.num_kv_heads, spec.head_dim) for t in self.k_pool]
+        self._flat_v = [t.view(-1, spec.num_kv_heads, spec.head_dim) for t in self.v_pool]
+
+        # Slot indices are identical for all 28 layers, so they are built
+        # once per step and reused. Recomputing per layer would make the
+        # block-table lookup 28x more expensive than it needs to be and
+        # would show up as "paging overhead" that is really a bug.
+        self._read_slots: Optional[torch.Tensor] = None
+        self._write_slots: Optional[torch.Tensor] = None
+        self._active_batch = spec.max_batch_size
+        self.gather_calls = 0
+
+    # ------------------------------------------------------------------
+    # State
+    # ------------------------------------------------------------------
+
+    @property
+    def length(self) -> int:
+        """Uniform length, for interface parity with ContiguousKVCache.
+        Raises on ragged state rather than silently returning the max —
+        a caller that assumes uniformity on a ragged cache produces
+        wrong attention, not an error."""
+        lengths = {t.length for t in self.tables[: self._active_batch]}
+        if len(lengths) > 1:
+            raise RuntimeError(f"cache is ragged ({sorted(lengths)}); use seq_lens")
+        return lengths.pop() if lengths else 0
+
+    @property
+    def seq_lens(self) -> list[int]:
+        return [t.length for t in self.tables[: self._active_batch]]
+
+    @property
+    def max_len(self) -> int:
+        return max((t.length for t in self.tables[: self._active_batch]), default=0)
+
+    def reset(self) -> None:
+        for t in self.tables:
+            if t.blocks:
+                t.free()
+        self.allocator.reset()
+        self.tables = [BlockTable(self.allocator) for _ in range(self.spec.max_batch_size)]
+        self._read_slots = self._write_slots = None
+        self.gather_calls = 0
+
+    def free_sequence(self, index: int) -> None:
+        """Return one sequence's blocks to the pool. The operation a
+        contiguous cache cannot express — it can only free the whole
+        batch — and the reason paging survives churn."""
+        self.tables[index].free()
+        self._read_slots = None
+
+    # ------------------------------------------------------------------
+    # Allocation
+    # ------------------------------------------------------------------
+
+    def advance(self, n: int, batch_size: Optional[int] = None) -> None:
+        """Reserve n more tokens for each active sequence and rebuild the
+        slot index."""
+        b = self._active_batch if batch_size is None else batch_size
+        self._active_batch = b
+        starts = [self.tables[i].length for i in range(b)]
+        for i in range(b):
+            self.tables[i].append(n)
+
+        dev = self.device
+        self._write_slots = torch.tensor(
+            [[self.tables[i].slot(p) for p in range(starts[i], starts[i] + n)] for i in range(b)],
+            dtype=torch.long,
+            device=dev,
+        )
+        max_len = self.max_len
+        # Pad short sequences with slot 0. Padded positions must be
+        # masked out by the caller (`padding_mask` below); block 0 is
+        # never left unwritten in practice, so an unmasked pad would
+        # silently attend to another sequence's tokens.
+        self._read_slots = torch.zeros((b, max_len), dtype=torch.long, device=dev)
+        for i in range(b):
+            slots = self.tables[i].slots()
+            if slots:
+                self._read_slots[i, : len(slots)] = torch.tensor(slots, dtype=torch.long, device=dev)
+
+    def padding_mask(self) -> Optional[torch.Tensor]:
+        """Boolean keep-mask [B, 1, 1, max_len], or None when the batch is
+        uniform and no masking is needed."""
+        lens = self.seq_lens
+        if len(set(lens)) <= 1:
+            return None
+        max_len = max(lens)
+        pos = torch.arange(max_len, device=self.device)[None, :]
+        keep = pos < torch.tensor(lens, device=self.device)[:, None]
+        return keep[:, None, None, :]
+
+    # ------------------------------------------------------------------
+    # Read/write path
+    # ------------------------------------------------------------------
+
+    def write(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor, start_pos: int = 0) -> None:
+        """Scatter [B, kv_heads, n, head_dim] into the block pool.
+
+        `start_pos` is ignored: the destination comes from the block
+        table built by `advance()`, which is what lets sequences at
+        different lengths share one call. The parameter stays for
+        signature parity with ContiguousKVCache.
+        """
+        b, h, n, d = k.shape
+        slots = self._write_slots
+        if slots is None or slots.shape[0] < b or slots.shape[1] != n:
+            raise RuntimeError("call advance(n, batch_size) before write()")
+        flat = slots[:b].reshape(-1)
+        self._flat_k[layer_idx].index_copy_(0, flat, k.permute(0, 2, 1, 3).reshape(-1, h, d))
+        self._flat_v[layer_idx].index_copy_(0, flat, v.permute(0, 2, 1, 3).reshape(-1, h, d))
+
+    def read(
+        self, layer_idx: int, batch_size: int, length: Optional[int] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather scattered blocks into [B, kv_heads, L, head_dim].
+
+        This copy is the price of paging. It is one pass over the live
+        KV, per layer, per step — the same bytes a contiguous cache reads
+        directly, moved once more. `gather_bytes_per_decode_step()`
+        quantifies it and `benchmarks/runners/phase3_paged.py` measures
+        whether the prediction holds.
+        """
+        slots = self._read_slots
+        if slots is None:
+            raise RuntimeError("call advance() before read()")
+        idx = slots[:batch_size] if length is None else slots[:batch_size, :length]
+        self.gather_calls += 1
+        k = self._flat_k[layer_idx][idx]  # [B, L, H, D]
+        v = self._flat_v[layer_idx][idx]
+        return k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3)
+
+    # ------------------------------------------------------------------
+    # Accounting
+    # ------------------------------------------------------------------
+
+    @property
+    def allocated_bytes(self) -> int:
+        """Whole pool, whether or not blocks are handed out — this is
+        what the GPU actually holds."""
+        return (
+            self.num_blocks
+            * self.block_size
+            * self.spec.num_kv_heads
+            * self.spec.head_dim
+            * 2
+            * self.spec.dtype_bytes
+        )
+
+    def used_bytes(self, batch_size: Optional[int] = None) -> int:
+        b = self._active_batch if batch_size is None else batch_size
+        return self.spec.bytes_per_token * sum(t.length for t in self.tables[:b])
+
+    def reserved_bytes(self, batch_size: Optional[int] = None) -> int:
+        """Bytes in allocated blocks, including the partly-empty tail of
+        each sequence. reserved - used is internal fragmentation."""
+        b = self._active_batch if batch_size is None else batch_size
+        return self.spec.bytes_per_token * sum(t.capacity for t in self.tables[:b])
+
+    def fragmentation(self, batch_size: Optional[int] = None) -> float:
+        reserved = self.reserved_bytes(batch_size)
+        return 0.0 if reserved == 0 else 1 - self.used_bytes(batch_size) / reserved
+
+    def utilization(self, batch_size: Optional[int] = None) -> float:
+        alloc = self.allocated_bytes
+        return 0.0 if alloc == 0 else self.used_bytes(batch_size) / alloc
+
+    def bytes_read_per_decode_step(self, batch_size: int) -> int:
+        return self.spec.bytes_per_token * sum(t.length for t in self.tables[:batch_size])
+
+    def gather_bytes_per_decode_step(self, batch_size: int) -> int:
+        """Extra traffic paging adds: the gather reads the live KV and
+        writes a copy of it, per layer, per step."""
+        return 2 * self.bytes_read_per_decode_step(batch_size)
+
+    def stats(self, batch_size: Optional[int] = None) -> dict:
+        b = self._active_batch if batch_size is None else batch_size
+        return {
+            "kv_bytes_per_token": self.spec.bytes_per_token,
+            "kv_allocated_mb": self.allocated_bytes / 1024 / 1024,
+            "kv_used_mb": self.used_bytes(b) / 1024 / 1024,
+            "kv_reserved_mb": self.reserved_bytes(b) / 1024 / 1024,
+            "kv_utilization": self.utilization(b),
+            "internal_fragmentation": self.fragmentation(b),
+            "block_size": self.block_size,
+            "gather_calls": self.gather_calls,
+            **self.allocator.stats(),
+        }
+
+
+def contiguous_reserved_bytes(spec: KVCacheSpec, seq_lens: Sequence[int]) -> int:
+    """What a contiguous cache must reserve for these sequences: every
+    slot up to max_seq_len, for every sequence, regardless of how long
+    they actually get. The baseline paging is measured against."""
+    return spec.bytes_per_token * spec.max_seq_len * len(seq_lens)
+
+
+def paged_reserved_bytes(spec: KVCacheSpec, seq_lens: Sequence[int], block_size: int) -> int:
+    """What paging reserves: each sequence rounded up to a whole block."""
+    return spec.bytes_per_token * block_size * sum(
+        (n + block_size - 1) // block_size for n in seq_lens
+    )

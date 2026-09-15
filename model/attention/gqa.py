@@ -199,6 +199,16 @@ class GQAAttention(nn.Module):
         kv_len = start_pos + s
         k_all, v_all = cache.read(self.layer_idx, b, kv_len)
 
+        # A paged cache pads ragged batches to the longest sequence; those
+        # pad slots hold another sequence's tokens and must be masked.
+        # Uniform batches (all of Phase 2 and 3's benchmarks) get None.
+        key_mask = cache.padding_mask()
+        if key_mask is not None and s > 1:
+            raise NotImplementedError(
+                "ragged prefill needs a combined causal+padding mask; Phase 3 "
+                "benchmarks uniform batches and ragged execution lands in Phase 4"
+            )
+
         cached_kv_heads = k_all.shape[1]
         n_rep = self.num_attention_heads // cached_kv_heads
 
@@ -208,7 +218,7 @@ class GQAAttention(nn.Module):
             # cache used as-is. This is the difference between reading the
             # KV cache once and copying it 6x per layer per token.
             q_folded = q.reshape(b, cached_kv_heads, n_rep, self.head_dim)
-            out = self._attend(q_folded, k_all, v_all, mask=None, is_causal=False)
+            out = self._attend(q_folded, k_all, v_all, mask=key_mask, is_causal=False)
             attn_out = out.reshape(b, self.num_attention_heads, 1, self.head_dim)
             attn_out = attn_out.transpose(1, 2).contiguous().view(b, s, -1)
             return self.o_proj(attn_out)
@@ -221,7 +231,7 @@ class GQAAttention(nn.Module):
         v_all = repeat_kv(v_all, n_rep)
 
         if s == 1:
-            attn_out = self._attend(q, k_all, v_all, mask=None, is_causal=False)
+            attn_out = self._attend(q, k_all, v_all, mask=key_mask, is_causal=False)
         elif start_pos == 0:
             # Square causal block — let SDPA generate the mask internally
             # (its fused path avoids materialising one).

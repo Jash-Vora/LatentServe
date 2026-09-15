@@ -156,6 +156,66 @@ before/after belongs in the report: a theoretical memory saving erased
 by an implementation detail, visible only past the context where it
 clears the weight-read floor, is the project thesis in miniature.
 
+## Measured: Runs B and C — GQA is capacity, not speed
+
+Batch scaling (native, fold, output 128):
+
+| batch / ctx | TPOT | KV share of decode bytes | achieved BW |
+| --- | ---: | ---: | ---: |
+| 1 / 4096 | 31.3 ms | 3.8% | 103 GB/s |
+| 8 / 4096 | 30.6 ms | 23.9% | 132 GB/s |
+| 1 / 16384 | 42.4 ms | 13.3% | 85 GB/s |
+| 8 / 16384 | 49.4 ms | 55.1% | 139 GB/s |
+
+Batching is nearly free at 4K — batch 1 to 8 leaves TPOT unchanged for
+8x the throughput (32 -> 261 tok/s), because decode is weight-bound and
+the weights are read once per step regardless of batch. That is the
+Phase 4 argument, measured rather than asserted.
+
+P4, the GQA-configuration experiment (identical arithmetic, 6x the KV):
+
+| batch / ctx | native | mha_sim | delta | KV cache |
+| --- | ---: | ---: | ---: | ---: |
+| 1 / 4096 | 31.30 | 32.17 | +2.8% | 115 -> 693 MB |
+| 1 / 16384 | 42.44 | 47.41 | +11.7% | 452 -> 2709 MB |
+| 4 / 8192 | 32.30 | 44.45 | +37.6% | 910 -> 5459 MB |
+
+And mqa_sim, which *halves* KV bytes versus native:
+
+| ctx | native TPOT | mqa_sim TPOT | KV bytes/token |
+| --- | ---: | ---: | ---: |
+| 8192 | 30.26 ms | 31.13 ms | 28,672 -> 14,336 |
+| 16384 | 42.06 ms | 43.04 ms | 28,672 -> 14,336 |
+
+**Halving the cache made decode slightly slower.** Taken with mha_sim
+(6x the cache, +2.8% at batch 1), the conclusion is that at batch 1 the
+number of bytes in the KV cache barely affects decode latency at all.
+What it determines is what fits: mha_sim at batch 4 / 16K needs 10.8 GB
+and does not run on a T4, while native does.
+
+The mechanism is parallelism, and achieved bandwidth tracks
+`batch x kv_heads` almost monotonically: 2 blocks (B1 native) reaches
+83-103 GB/s, 12 blocks (B1 mha_sim) 119-133, 48 blocks (B4 mha_sim)
+198 GB/s — 62% of peak, the best number in the sweep. A smaller cache is
+read by fewer thread blocks on 40 SMs, so it is read less efficiently,
+and the byte saving is handed back.
+
+**Consequence for Phase 7.** MLA compresses toward one latent vector per
+token: fewer head-like axes than GQA's 2, not more. A bigger byte
+reduction *and* a worse occupancy problem, partly cancelling. That is
+Question 6 (do MLA and DSA move the bottleneck rather than remove it)
+with Phase 2 evidence behind it.
+
+**Consequence for the Phase 10 sweep.** GQA already caches only
+2 x 128 x 2 = 512 numbers per token per layer. MLA caches
+`latent_dim + rope_dim`, so with rope_dim 64 it only saves memory at all
+when `latent_dim < 448`. Three of the five values in the methodology
+doc's sweep (512, 768, 1024) make the cache *larger* than the GQA
+baseline. MLA's headline memory win is stated against MHA; against
+2-head GQA the headroom is much narrower. Re-centre on roughly
+96 / 128 / 192 / 256 / 384, and measure latency at batch 4-8 where KV is
+38-55% of traffic rather than at batch 1 where it is 4-13%.
+
 ## Gate 2 checklist — "Can LatentServe execute cached decoding?"
 
 - [ ] `pytest tests/test_phase2_gqa.py` green (tier 1, CPU)

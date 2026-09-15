@@ -55,6 +55,7 @@ import torch
 from torch import nn
 
 from cache.kv_cache import ContiguousKVCache, KVCacheSpec, KVHeadsMode, effective_kv_heads
+from cache.paged_cache import PagedKVCache
 from model.attention.gqa import AttnImpl, GQAAttention, KVExpansion
 from model.qwen import ModelShape, QwenReference, TimedGenerationResult
 from model.rope import RotaryEmbedding
@@ -203,14 +204,32 @@ class LatentServeQwen:
             device=str(self.device),
         )
 
-    def allocate_cache(self, batch_size: int, max_seq_len: int) -> ContiguousKVCache:
+    def allocate_cache(
+        self,
+        batch_size: int,
+        max_seq_len: int,
+        paged: bool = False,
+        block_size: int = 16,
+        num_blocks: Optional[int] = None,
+    ):
         """Allocate once, up front, for input + output tokens. Reused
         across trials via `reset()` so the benchmark measures steady
-        state rather than the allocator."""
-        self.cache = ContiguousKVCache(self.cache_spec(batch_size, max_seq_len))
+        state rather than the allocator.
+
+        `paged=True` swaps in Phase 3's block-paged cache. The attention
+        path is unchanged — that interchangeability is the point of
+        giving both caches the same read/write contract, and it is what
+        makes the contiguous-vs-paged comparison a controlled one.
+        """
+        spec = self.cache_spec(batch_size, max_seq_len)
+        self.cache = (
+            PagedKVCache(spec, block_size=block_size, num_blocks=num_blocks)
+            if paged
+            else ContiguousKVCache(spec)
+        )
         return self.cache
 
-    def _require_cache(self) -> ContiguousKVCache:
+    def _require_cache(self):
         if self.cache is None:
             raise RuntimeError("call allocate_cache(batch_size, max_seq_len) first")
         return self.cache
@@ -235,6 +254,11 @@ class LatentServeQwen:
         the final norm — the caller decides how many positions are worth
         projecting to vocabulary."""
         cache = self._require_cache()
+        # Reserve before writing: a paged cache must have block tables and
+        # slot indices built before any layer scatters into the pool. The
+        # contiguous cache only tracks a fill counter, so the earlier
+        # position is harmless there.
+        cache.advance(input_ids.shape[1], batch_size=input_ids.shape[0])
         h = self.embed_tokens(input_ids)
         cos, sin = self._cos_sin(start_pos, input_ids.shape[1])
 
@@ -249,7 +273,6 @@ class LatentServeQwen:
             h = layer.mlp(h)
             h = residual + h
 
-        cache.advance(input_ids.shape[1])
         return h
 
     def _to_logits(self, hidden: torch.Tensor) -> torch.Tensor:

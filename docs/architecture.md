@@ -85,3 +85,33 @@ on them:
 
 See `docs/phase2.md` for the sweep, the measurement design, and the
 predictions registered before running it.
+
+## Phase 3 — what exists today
+
+`ContiguousKVCache` and `PagedKVCache` implement the same read/write
+contract, so `GQAAttention` is unchanged and
+`allocate_cache(..., paged=True)` is the only difference between the two
+arms of the comparison:
+
+```
+   LatentServeQwen
+         |
+   GQAAttention  ---- cache.advance(n, batch_size)
+         |             cache.write(layer, k, v, start_pos)
+         |             cache.read(layer, batch, length)
+         |             cache.padding_mask()
+         +---> ContiguousKVCache   [B, kv_heads, S, D] per layer
+         |     preallocated, head-major, read in place
+         |
+         +---> PagedKVCache        [num_blocks, block_size, kv_heads, D]
+               block pool + BlockTable per sequence, gathered per read
+```
+
+The same contract is how Phase 7's latent cache drops in without
+touching the executor.
+
+One ordering constraint worth knowing: `advance()` now runs *before* the
+layer loop, not after. A paged cache must have block tables and slot
+indices built before any layer scatters into the pool; the contiguous
+cache only tracks a fill counter, so the earlier position is harmless
+there.

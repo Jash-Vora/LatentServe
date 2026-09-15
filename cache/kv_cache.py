@@ -157,7 +157,11 @@ class ContiguousKVCache:
         pays."""
         self._length = 0
 
-    def advance(self, n: int) -> None:
+    def advance(self, n: int, batch_size: Optional[int] = None) -> None:
+        """`batch_size` is accepted and ignored: a contiguous cache has
+        one shared fill length. PagedKVCache needs it to build per-sequence
+        block tables, and the two must be interchangeable from the
+        executor's point of view."""
         if self._length + n > self.spec.max_seq_len:
             raise RuntimeError(
                 f"KV cache overflow: {self._length} + {n} > max_seq_len="
@@ -213,6 +217,16 @@ class ContiguousKVCache:
         workloads."""
         alloc = self.allocated_bytes
         return 0.0 if alloc == 0 else self.used_bytes(batch_size) / alloc
+
+    def padding_mask(self) -> None:
+        """Always None: uniform lengths, nothing to mask. Present so the
+        attention path can ask either cache the same question."""
+        return None
+
+    def gather_bytes_per_decode_step(self, batch_size: int) -> int:
+        """Zero — a contiguous cache is read in place. The paged cache's
+        non-zero answer here is exactly the cost Phase 3 measures."""
+        return 0
 
     def bytes_read_per_decode_step(self, batch_size: int) -> int:
         """KV bytes attention must read to decode one token per sequence:

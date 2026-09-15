@@ -1,0 +1,135 @@
+# Phase 3 — Paged KV Cache
+
+Goal (docs/methodology.md Phase 3): a PagedAttention-style memory
+manager, compared against the contiguous cache under variable sequence
+lengths, concurrent requests, request termination and high utilization.
+Metrics: fragmentation, usable cache capacity, allocation overhead,
+latency impact.
+
+## Set expectations first
+
+**Paging is a capacity optimization and should make decode slightly
+slower.** Attention can no longer read a contiguous tensor, so scattered
+blocks are gathered into one each step — a real copy of the live KV, per
+layer, per step. Phase 2 calibrates the cost: `repeat_kv` was 13x the
+necessary traffic and dominated TPOT past 4K; this is 2x (one read, one
+write) on a term that was 4-13% of decode bytes at batch 1.
+
+Any result showing paging *faster* on a uniform-length benchmark is
+measuring a mistake, not a win.
+
+## What landed
+
+| File | Role |
+| --- | --- |
+| `cache/block_allocator.py` | `BlockAllocator` (free list, refcounts, typed `OutOfBlocks`) and `BlockTable` (logical -> physical, grows on demand) |
+| `cache/paged_cache.py` | `PagedKVCache`: block pool, scatter write, gather read, fragmentation accounting |
+| `benchmarks/workloads/ragged.py` | request streams for Workloads A-E; reused by Phase 4 |
+| `benchmarks/runners/phase3_paged.py` | capacity simulation (CPU) and paging latency cost (GPU) |
+| `tests/test_phase3_paged.py` | allocator behaviour + paged/contiguous equivalence |
+| `configs/phase3_paged.yaml` | held constant across the sweep |
+
+`ContiguousKVCache` and `PagedKVCache` expose the same read/write
+contract, so `GQAAttention` cannot tell them apart and
+`allocate_cache(..., paged=True)` is the only difference between the two
+arms. That interchangeability is what makes the comparison controlled —
+and it is also how Phase 7's latent cache will drop in.
+
+## Layouts differ, on purpose
+
+Contiguous is head-major `[B, kv_heads, S, head_dim]`: SDPA wants
+`[B, H, S, D]` and no transpose is needed on the read path.
+
+Paged is `[num_blocks, block_size, kv_heads, head_dim]`, viewed flat as
+`[num_blocks * block_size, kv_heads, head_dim]`. A token's KV has to be
+one contiguous run so scattered blocks can be gathered by a single index
+operation; the transpose moves to the read.
+
+Two caches, two layouts, each following from how it is accessed. "Which
+layout is faster" has no context-free answer, which is worth saying
+plainly in the report.
+
+## Run it
+
+```bash
+export PYTHONPATH=$(pwd):$PYTHONPATH
+
+pytest tests/test_phase3_paged.py -v          # no GPU, no download
+
+# Experiment A — capacity. CPU, seconds.
+python -m benchmarks.runners.phase3_paged --experiment capacity \
+    --workloads mixed long_generation short_interactive \
+    --block-sizes 1 8 16 32 64 128 256 --budget-gb 8 --num-requests 200
+
+# Experiment B — latency cost. T4.
+python -m benchmarks.runners.phase3_paged --experiment latency \
+    --context-lengths 4096 8192 16384 --batch-sizes 1 4 \
+    --latency-block-sizes 16 128
+```
+
+## Why most of Phase 3 needs no GPU
+
+Fragmentation, usable capacity and allocation overhead are properties of
+the allocation policy, not of the T4. Simulating 200 requests across a
+seven-point block-size sweep and three workloads takes seconds on CPU
+and produces the Gate 4 numbers directly. Only the latency comparison
+needs the GPU. Spending T4 hours to rediscover arithmetic would be a
+poor trade on a 30-hour weekly quota.
+
+## Two contiguous baselines
+
+The comparison depends entirely on what `max_model_len` a contiguous
+cache was sized for, so the runner reports both:
+
+* **generic** — sized for the longest request the server will accept
+  (65536). What you get without workload knowledge.
+* **oracle** — sized to the longest sequence this workload actually
+  produces. Unachievable in practice, since it requires knowing the
+  future. Included so paging has to beat the best possible contiguous
+  configuration rather than a strawman.
+
+Indicative simulation output (8 GiB budget, 60 requests, seed 0):
+
+| workload | contiguous | oracle | paged (bs=128) |
+| --- | ---: | ---: | ---: |
+| mixed | 5,375 tok/GiB | 6,705 | **31,928** |
+| short_interactive | 534 | 7,483 | 7,483 |
+
+Paging's benefit is **heterogeneity**, not paging. On `mixed`
+(max/mean sequence ratio 6.3) it serves ~4.8x the concurrency of even an
+oracle-tuned contiguous cache. On `short_interactive`, where every
+request is ~1K, it ties the oracle exactly — all it buys there is not
+having to know the workload in advance. Reporting only the mixed number
+would overclaim; reporting only the uniform one would miss the point.
+
+Allocation overhead is ~0.01-0.05 us/token, i.e. nothing next to a
+~31 ms decode step. The block-size trade is real but mild: smaller
+blocks waste less tail (internal fragmentation is bounded by one block
+per sequence) and cost more bookkeeping.
+
+## Gate 4 checklist — "Can paged KV improve memory utilization?"
+
+- [ ] `pytest tests/test_phase3_paged.py` green, including
+      `test_paged_matches_contiguous_logits` at block_size 1, 4 and 16
+- [ ] capacity simulation run across all three workloads and the full
+      block-size sweep
+- [ ] paging's advantage stated against the **oracle** baseline, not
+      only the generic one
+- [ ] measured paging latency cost recorded at batch 1 and batch 4
+- [ ] a block size chosen, with the fragmentation/overhead numbers that
+      justify it
+
+## Deliberately deferred
+
+* **Ragged execution.** The cache stores ragged batches and builds the
+  padding mask, and the allocator frees one sequence at a time, but the
+  GPU path still benchmarks uniform batches. Ragged *scheduling* is
+  Phase 4's subject; doing it here would mean building a scheduler to
+  test an allocator.
+* **A real paged-attention kernel.** Walking the block table inside the
+  kernel with an online softmax removes the gather entirely. That is
+  Phase 11. Phase 3's job is to measure what the gather costs so that
+  kernel is motivated by a number rather than a hunch.
+* **Preemption and swapping.** The simulation records a capacity failure
+  when a running sequence cannot grow; real systems preempt. The policy
+  belongs to the scheduler, so it lands in Phase 4.

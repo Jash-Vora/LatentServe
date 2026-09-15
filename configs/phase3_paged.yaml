@@ -1,0 +1,36 @@
+# Phase 3 — paged KV cache. See docs/methodology.md Phase 3 and
+# docs/phase3.md.
+#
+# Paging is a capacity optimization: it should make decode slightly
+# slower (the gather is a real copy) and make far more concurrency fit
+# under a fixed VRAM budget. Held constant here; sweep axes are CLI args.
+
+tag: phase3_paged
+
+model:
+  name: Qwen/Qwen2.5-1.5B-Instruct
+  dtype: fp16
+  max_position_embeddings: 131072
+
+attention:
+  type: gqa
+  kv_heads_mode: native
+  impl: sdpa
+
+runtime:
+  batch_size: 1
+  block_size: 16        # now load-bearing: tokens per KV block
+  prefill_chunk_size: 4096
+  scheduler: fifo
+  continuous_batching: false
+  prefix_caching: false
+
+generation:
+  input_tokens: 8192
+  output_tokens: 128
+  num_requests: 1
+  seed: 0
+  sampling: greedy
+
+hardware:
+  devices: [0]
