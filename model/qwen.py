@@ -90,23 +90,46 @@ def kv_cache_bytes(past_key_values) -> int:
     """Actual measured KV-cache size from a HF `past_key_values` object,
     as opposed to `ModelShape.kv_bytes_per_token`'s theoretical estimate.
     Both numbers should agree (that agreement is itself a Phase 1
-    correctness check) but this one is ground truth from real tensors."""
+    correctness check) but this one is ground truth from real tensors.
+
+    HF's Cache object has been reshaped more than once across
+    `transformers` releases, so this deliberately doesn't assume a
+    single layout:
+      - newest releases: `Cache.layers` is a list of per-layer cache
+        objects (e.g. `DynamicLayer`) exposing `.keys` / `.values`
+        tensors (either of which may still be `None` for a layer that
+        hasn't been written to, e.g. an empty cache).
+      - transformers >=4.40,<~4.56: `Cache` exposes flat
+        `.key_cache` / `.value_cache` lists of tensors.
+      - older/back-compat: `past_key_values` iterates as a legacy
+        tuple-of-tuples, `((k0, v0), (k1, v1), ...)`.
+    """
     if past_key_values is None:
         return 0
 
     total = 0
-    # transformers >=4.40 may return either a legacy tuple-of-tuples or a
-    # Cache object exposing .key_cache / .value_cache (list of tensors).
+
+    layers = getattr(past_key_values, "layers", None)
+    if layers is not None:
+        for layer in layers:
+            for tensor in (getattr(layer, "keys", None), getattr(layer, "values", None)):
+                if tensor is not None:
+                    total += tensor.nelement() * tensor.element_size()
+        return total
+
     if hasattr(past_key_values, "key_cache") and hasattr(past_key_values, "value_cache"):
         for k in past_key_values.key_cache:
-            total += k.nelement() * k.element_size()
+            if k is not None:
+                total += k.nelement() * k.element_size()
         for v in past_key_values.value_cache:
-            total += v.nelement() * v.element_size()
+            if v is not None:
+                total += v.nelement() * v.element_size()
         return total
 
     for layer_kv in past_key_values:
         for tensor in layer_kv:
-            total += tensor.nelement() * tensor.element_size()
+            if tensor is not None:
+                total += tensor.nelement() * tensor.element_size()
     return total
 
 
