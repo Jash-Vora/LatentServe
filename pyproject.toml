@@ -11,6 +11,13 @@ dependencies = [
     "tqdm",
     "psutil",
     "nvidia-ml-py3; platform_system=='Linux'",
+    # Qwen2.5-1.5B-Instruct is the fixed real model substrate for the
+    # whole project (docs/methodology.md "Model Strategy") — no scratch
+    # Transformer, so these are required from Phase 1, not optional.
+    "transformers>=4.40",
+    "accelerate",
+    "safetensors",
+    "huggingface_hub",
 ]
 
 [project.optional-dependencies]

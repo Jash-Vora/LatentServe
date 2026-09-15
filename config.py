@@ -4,14 +4,11 @@ Experiment configuration system.
 Every LatentServe experiment is defined by a YAML file matching the
 schema below, never by hand-editing code. Load with `load_config(path)`.
 
-Example YAML (see configs/baseline_gqa.yaml):
+Example YAML (see configs/baseline_gqa4.yaml):
 
     model:
-      name: research-transformer
-      layers: 24
-      hidden_dim: 2048
-      heads: 16
-      kv_heads: 4
+      name: Qwen/Qwen2.5-1.5B-Instruct
+      dtype: fp16
 
     attention:
       type: gqa
@@ -28,6 +25,13 @@ Example YAML (see configs/baseline_gqa.yaml):
 
     hardware:
       devices: [0]
+
+Note: LatentServe uses Qwen2.5-1.5B-Instruct as a *fixed* real model
+substrate (see docs/methodology.md, "Model Strategy"). ModelConfig
+therefore does not expose architecture hyperparameters (layers, heads,
+hidden_dim, ...) for the user to set — there is no scratch model to
+configure. Those values are read off the loaded Hugging Face model at
+runtime (that discovery is Phase 2's job), not declared here.
 """
 
 from __future__ import annotations
@@ -40,30 +44,16 @@ from pydantic import BaseModel, Field, model_validator
 
 
 class ModelConfig(BaseModel):
-    name: str = "research-transformer"
-    layers: int = 24
-    hidden_dim: int = 2048
-    heads: int = 16
-    kv_heads: int = 4
-    head_dim: Optional[int] = None  # derived from hidden_dim / heads if unset
-    vocab_size: int = 32000
+    # Fixed real model substrate — see docs/methodology.md "Model Strategy".
+    # Intentionally does NOT expose layers/hidden_dim/heads/kv_heads: this is
+    # a Hugging Face checkpoint identifier, not a from-scratch architecture
+    # spec. Actual head/layer/kv-head counts are introspected from the
+    # loaded HF config in Phase 2, not declared here.
+    name: str = "Qwen/Qwen2.5-1.5B-Instruct"
+    revision: Optional[str] = None
+    dtype: Literal["fp16", "bf16", "fp32"] = "fp16"
+    trust_remote_code: bool = False
     max_position_embeddings: int = 131072
-
-    @model_validator(mode="after")
-    def _derive_head_dim(self) -> "ModelConfig":
-        if self.head_dim is None:
-            if self.hidden_dim % self.heads != 0:
-                raise ValueError(
-                    f"hidden_dim ({self.hidden_dim}) must be divisible by "
-                    f"heads ({self.heads}) when head_dim is not set explicitly"
-                )
-            self.head_dim = self.hidden_dim // self.heads
-        if self.heads % self.kv_heads != 0:
-            raise ValueError(
-                f"heads ({self.heads}) must be divisible by kv_heads "
-                f"({self.kv_heads}) for GQA grouping"
-            )
-        return self
 
 
 class AttentionConfig(BaseModel):
@@ -99,7 +89,8 @@ class GenerationConfig(BaseModel):
 
 class HardwareConfig(BaseModel):
     devices: list[int] = Field(default_factory=lambda: [0])
-    dtype: Literal["fp16", "bf16", "fp32"] = "fp16"
+    # dtype lives on ModelConfig (it's a property of the weights being
+    # loaded, e.g. Qwen2.5-1.5B-Instruct in fp16) — not duplicated here.
 
 
 class ExperimentConfig(BaseModel):

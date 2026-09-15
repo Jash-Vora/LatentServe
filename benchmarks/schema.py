@@ -147,7 +147,7 @@ if __name__ == "__main__":
         system="latentserve",
         tag="smoke_test",
         attention="gqa",
-        model="research-1b",
+        model="Qwen/Qwen2.5-1.5B-Instruct",
         batch_size=1,
         context_length=1024,
         output_length=32,

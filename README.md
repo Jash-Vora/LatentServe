@@ -1,7 +1,12 @@
 # LatentServe
 
 Memory-efficient and sparse long-context LLM inference on commodity GPUs
-(1–2× NVIDIA T4). See `docs/methodology.md` for the full research plan.
+(1–2× NVIDIA T4), using **Qwen2.5-1.5B-Instruct as a fixed real-model
+substrate** — no scratch Transformer. The experimental variable is the
+execution system (GQA → paged/latent KV → MLA-inspired attention →
+DSA-inspired sparse attention → adaptive runtime), not the model. DSA is
+a core research axis alongside MLA, not an optional late-stage add-on.
+See `docs/methodology.md` for the full research plan.
 
 This README covers **Phase 0 only**: environment + experimental
 infrastructure. Nothing here trains or runs a model yet — that's Phase 1.
@@ -109,8 +114,10 @@ benchmark number into a doc or notebook by hand.
 
 ## Next: Phase 1
 
-Implement the boring, obviously-correct decoder Transformer baseline in
-`model/transformer.py` (plain MHA, causal mask, naive KV cache, greedy
-decode) and the correctness test comparing full vs. cached attention
-logits at 1 / 16 / 1K / long-context lengths. See `docs/methodology.md`
-Phase 1 for details.
+There is no scratch model to write. Load **Qwen2.5-1.5B-Instruct** via
+`transformers` in `model/qwen.py` and treat the Hugging Face reference
+implementation as the correctness oracle. Then build LatentServe's own
+GQA + KV-cache execution path around those same fixed weights, and write
+the correctness harness comparing Hugging Face vs. LatentServe logits,
+attention masking, RoPE, and greedy decode output at 1 / 16 / 1K / 4K /
+8K / 16K+ tokens. See `docs/methodology.md` Phase 1 for details.

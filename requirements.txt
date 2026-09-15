@@ -9,6 +9,13 @@ pydantic>=2
 tqdm
 psutil
 
+# Qwen2.5-1.5B-Instruct is the fixed real model substrate for the whole
+# project (see docs/methodology.md "Model Strategy") — needed from Phase 1.
+transformers>=4.40
+accelerate
+safetensors
+huggingface_hub
+
 # Add once you reach Phase 11 (custom kernels):
 # triton>=2.2
 

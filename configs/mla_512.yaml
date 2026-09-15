@@ -1,12 +1,8 @@
 tag: phase7_mla_512
 
 model:
-  name: research-transformer
-  layers: 24
-  hidden_dim: 2048
-  heads: 16
-  kv_heads: 4
-  vocab_size: 32000
+  name: Qwen/Qwen2.5-1.5B-Instruct
+  dtype: fp16
   max_position_embeddings: 131072
 
 attention:
@@ -30,4 +26,3 @@ generation:
 
 hardware:
   devices: [0]
-  dtype: fp16

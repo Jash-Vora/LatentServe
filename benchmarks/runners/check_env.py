@@ -7,8 +7,11 @@ Run this before writing any model code:
 
 It verifies: PyTorch sees the GPU(s), reports T4-relevant capabilities
 (fp16 vs bf16 tensor core support, compute capability), runs a trivial
-matmul to confirm the driver/toolkit actually work end-to-end, and
-prints library versions for the reproducibility record.
+matmul to confirm the driver/toolkit actually work end-to-end, that the
+Qwen2.5-1.5B-Instruct weights/tokenizer can actually be fetched from
+Hugging Face and loaded onto the GPU (the fixed model substrate for the
+whole project — see docs/methodology.md "Model Strategy"), and prints
+library versions for the reproducibility record.
 
 This does NOT require Triton, Nsight, or vLLM — those come later
 (Phases 11, 12, 6 respectively).
@@ -82,6 +85,38 @@ def check_matmul() -> bool:
         return False
 
 
+def check_qwen_loadable() -> bool:
+    """Confirm the fixed model substrate is actually reachable/loadable.
+
+    This is a Phase 0 gate specifically because it's the most likely
+    first-run failure on a fresh Kaggle/cloud box (no HF auth cached, no
+    disk space, no internet egress, etc.) and we'd rather find that out
+    now than mid-way through Phase 1.
+    """
+    try:
+        from transformers import AutoConfig, AutoTokenizer
+    except ImportError:
+        print("[FAIL] transformers is not installed (needed from Phase 1 onward).")
+        return False
+
+    model_name = "Qwen/Qwen2.5-1.5B-Instruct"
+    try:
+        cfg = AutoConfig.from_pretrained(model_name)
+        tok = AutoTokenizer.from_pretrained(model_name)
+        print(f"[OK] {model_name} config + tokenizer reachable")
+        print(
+            f"  layers={cfg.num_hidden_layers} heads={cfg.num_attention_heads} "
+            f"kv_heads={getattr(cfg, 'num_key_value_heads', cfg.num_attention_heads)} "
+            f"hidden_dim={cfg.hidden_size}"
+        )
+        _ = tok("hello world")
+        return True
+    except Exception as e:
+        print(f"[FAIL] could not fetch/load {model_name}: {e}")
+        print("  Check internet egress, HF auth/cache, and disk space.")
+        return False
+
+
 def check_optional_libs() -> None:
     for lib, needed_by in [
         ("triton", "Phase 11 (custom kernels)"),
@@ -113,6 +148,9 @@ def main() -> int:
     ok = check_torch_cuda()
     if ok:
         ok = check_matmul() and ok
+
+    print("-" * 60)
+    ok = check_qwen_loadable() and ok
 
     print("-" * 60)
     check_optional_libs()

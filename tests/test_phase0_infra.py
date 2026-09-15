@@ -15,9 +15,8 @@ from benchmarks.schema import BenchmarkResult, ResultWriter
 
 def test_load_baseline_gqa_config():
     cfg = load_config("configs/baseline_gqa4.yaml")
-    assert cfg.model.heads == 16
-    assert cfg.model.kv_heads == 4
-    assert cfg.model.head_dim == 128  # derived: 2048 / 16
+    assert cfg.model.name == "Qwen/Qwen2.5-1.5B-Instruct"
+    assert cfg.model.dtype == "fp16"
     assert cfg.attention.type == "gqa"
 
 
@@ -32,10 +31,18 @@ def test_mla_config_without_latent_dim_rejected():
         ExperimentConfig(attention={"type": "mla"})
 
 
-def test_gqa_grouping_validated():
-    # heads=16 not divisible by kv_heads=3 -> invalid grouping
+def test_model_config_defaults_to_qwen():
+    # LatentServe uses Qwen2.5-1.5B-Instruct as the fixed real model
+    # substrate (docs/methodology.md, "Model Strategy") — no scratch
+    # architecture hyperparameters (layers/heads/hidden_dim) are settable
+    # here, so the default alone should already point at the real model.
+    cfg = ExperimentConfig()
+    assert cfg.model.name == "Qwen/Qwen2.5-1.5B-Instruct"
+
+
+def test_model_config_rejects_invalid_dtype():
     with pytest.raises(ValueError):
-        ExperimentConfig(model={"heads": 16, "kv_heads": 3, "hidden_dim": 2048})
+        ExperimentConfig(model={"dtype": "int8"})
 
 
 def test_config_roundtrip(tmp_path):
