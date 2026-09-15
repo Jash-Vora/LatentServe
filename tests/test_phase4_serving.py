@@ -276,6 +276,48 @@ def test_engine_reports_occupancy_and_overhead(tiny_model, tiny_shape):
     assert stats["decode_tokens"] == 6 * 5 - 6  # first token comes from prefill
 
 
+def test_inter_token_latency_captures_prefill_blocking(tiny_model, tiny_shape):
+    """An incumbent's inter-token gap must include a newcomer's prefill.
+
+    This is what the client experiences and what the decode-kernel timer
+    cannot see: the engine runs prefill between two decode steps, so a
+    2 s prompt admitted mid-flight is a 2 s gap between two of the
+    incumbent's tokens while every decode call still takes ~65 ms. The
+    first Phase 4 sweep reported p99/p50 TPOT of 1.1 for exactly this
+    reason.
+    """
+    model = build(tiny_model, tiny_shape)
+    engine = ServingEngine(model, max_running=2, max_seq_len=600, block_size=16)
+    incumbent = ServedRequest(0, torch.randint(0, TINY["vocab_size"], (16,)).tolist(),
+                              max_new_tokens=25)
+    engine.add_request(incumbent)
+    for _ in range(4):
+        engine.step()
+
+    engine.add_request(
+        ServedRequest(1, torch.randint(0, TINY["vocab_size"], (400,)).tolist(), max_new_tokens=3)
+    )
+    engine.run()
+
+    gaps = sorted(incumbent.decode_step_ms)
+    assert max(gaps) > 5 * gaps[len(gaps) // 2], (
+        "a large prefill admitted mid-flight must appear as a spike in the "
+        "incumbent's inter-token latency"
+    )
+
+
+def test_slo_attainment_is_per_request(tiny_model, tiny_shape):
+    """The SLO policy has to be judged on deadlines met, not on p50/p99
+    TTFT — metrics it is not optimising for."""
+    r = ServedRequest(0, [1, 2, 3], max_new_tokens=1, slo_ttft_ms=1.0)
+    assert r.met_slo is None, "no TTFT recorded yet"
+    r.arrival_time = 100.0
+    r.first_token_time = 100.5
+    assert r.met_slo is False  # 500 ms against a 1 ms target
+    r.slo_ttft_ms = 2000.0
+    assert r.met_slo is True
+
+
 def test_oversized_request_fails_loudly_not_silently(tiny_model, tiny_shape):
     """A prompt that cannot fit even an empty pool must raise, not spin.
     A silent hang here is indistinguishable from a slow workload."""

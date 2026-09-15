@@ -123,6 +123,134 @@ matched nominal batch.** Higher occupancy means more resident KV, so more
 bytes per decode step. Throughput up, per-token latency mildly down: the
 trade should be stated rather than buried.
 
+## Measured (mixed workload, 32 requests, prompts clamped at 8192, burst arrivals)
+
+| policy | batch | tok/s | occupancy | TPOT p50 |
+| --- | ---: | ---: | ---: | ---: |
+| static | 1 | 24.81 | 1.00 | 33.43 ms |
+| continuous | 1 | 24.70 | 1.00 | 33.27 ms |
+| static | 4 | 50.85 | 3.58 | 50.19 ms |
+| continuous | 4 | 52.18 | 3.84 | 51.51 ms |
+| static | 8 | 67.42 | 7.15 | 66.79 ms |
+| continuous | 8 | 67.49 | 7.21 | 65.27 ms |
+
+Batch 1 static and continuous agree to 0.4%, which is the sanity check:
+at `max_running=1` they are the same algorithm.
+
+**P1 falsified — the premise, not the mechanism.** P1 assumed batching
+stays free, as Phase 2 measured on the contiguous cache (batch 1 to 8
+left TPOT at ~31 ms). It does not here: TPOT goes 33.3 -> 51.5 -> 65.3 ms,
+roughly 2x from batch 1 to 8. The cause is Phase 3's gather, which costs
+2x the *resident* KV per step, and resident KV is proportional to batch:
+~455 MiB at batch 4, ~854 MiB at batch 8, i.e. ~9 ms and ~16 ms of pure
+gather at the 110 GB/s this card sustains. Add the attention read itself
+and most of the gap is accounted for.
+
+So continuous batching's occupancy advantage is real but small, and it
+is partly cancelled by its own success: running 3.84 sequences instead
+of 3.58 means more resident KV and a more expensive step. Decode-only
+throughput (occupancy / TPOT) is 74.5 vs 71.3 tok/s at batch 4 — a 4.5%
+edge that prefill time dilutes to the measured 2.6%.
+
+**The honest headline is that continuous batching bought ~0-3% here, and
+the reason is the paged gather.** That is the third independent argument
+for the Phase 11 paged-attention kernel: without the gather, batching
+returns to nearly free (Phase 2's contiguous result) and the occupancy
+advantage would actually pay. Worth re-running this sweep after Phase 11
+as a direct before/after.
+
+**P2 falsified by a bug in the harness, not by the system.** Measured
+p99/p50 TPOT was 1.0-1.2, against a predicted 100x. The percentiles were
+taken over each *request's mean* inter-token latency rather than over
+individual decode steps, so a 2 s prefill stall spread across a request's
+229 steps added 9 ms to its mean and disappeared. Phases 1-3 pooled
+per-step latencies precisely to avoid this; this runner did not. Fixed:
+`tpot_p50/p95/p99` now come from pooled steps, with per-request means
+kept separately under `tpot_mean_per_request_*`. **The P2 numbers above
+should be re-measured.**
+
+**P3 confirmed.** Scheduler cost is 6-10 us/call and total non-GPU
+runtime overhead is 0.20-0.23% of wall time. Negligible, as claimed, and
+now measured rather than asserted.
+
+**P4 untestable as run, and the reason is interesting.** length_aware
+improved TTFT p50 by 39% over FIFO (29.3 s vs 47.9 s) and improved p99
+too (88.9 s vs 92.4 s) — it was supposed to trade the tail away. `fair`
+was best on everything, including throughput (73.2 tok/s).
+
+Nothing starved because nothing *can* starve in a finite burst: with all
+32 requests queued at t=0, the last one finishes when the total work
+does, in whatever order you serve it. Starvation needs a stream of
+newcomers to keep overtaking the waiting long request. Use
+`--arrival-rate 0.5` (Poisson, open-loop) to test P4 properly.
+
+**slo_aware was a FIFO clone** — it matched FIFO to four decimal places,
+because no request carried an `slo_ttft_ms`, so every sort key reduced
+to arrival order. Fixed: `assign_slo_ms()` now gives tiered targets by
+prompt size (2 s interactive / 10 s document / 30 s batch). A policy that
+cannot be distinguished from the baseline has not been tested.
+
+**TTFT here is 99.6% queue time** (queue p50 47.7 s of a 47.9 s TTFT).
+Under a burst these numbers measure queueing, not prefill speed. Worth
+stating explicitly wherever they appear, and another reason to re-run
+with arrivals.
+
+## Measured with open-loop arrivals — P4 confirmed
+
+Poisson arrivals, max_running 8. This is the run where the scheduler
+comparison becomes meaningful: in a burst nobody can starve, because the
+last request finishes when the total work does.
+
+| policy | tok/s | TTFT p50 | TTFT p99 |
+| --- | ---: | ---: | ---: |
+| fifo | 65.12 | 10.06 s | 18.20 s |
+| length_aware | 64.60 | **3.06 s** | **42.19 s** |
+| fair | 68.69 | 5.79 s | **13.39 s** |
+| slo_aware | 65.38 | 10.30 s | 21.57 s |
+
+**P4 confirmed.** Shortest-job-first buys a 3.3x better median TTFT and
+pays with a 2.3x worse p99 — the starvation the burst could not show.
+
+**`fair` dominates, which was not predicted.** SJF-with-aging has the
+best p99 of any policy (13.4 s, better than FIFO's 18.2 s), the second
+best p50, and the highest throughput. It was included as a compromise
+between FIFO and SJF and turned out to beat both on the tail. Worth
+investigating in the writeup rather than just reporting: aging plausibly
+helps throughput too by clearing long requests before they accumulate.
+
+P3 holds under arrivals: 4.6-5.5 us per scheduler call, 0.20-0.22%
+runtime overhead.
+
+## Two more metric bugs, both found by predictions that refused to die
+
+**Inter-token latency was measuring kernel time, not client experience.**
+After pooling per-step latencies (the first fix), P2 still came back at
+1.1-1.2 with a worst gap of 119 ms — nowhere near the seconds predicted.
+The remaining error: `decode_step_ms` recorded the *duration of the
+decode call*, while prefill runs between two decode calls. A 2 s prompt
+admitted mid-flight leaves every decode call at a healthy 65 ms and the
+incumbent's client waiting two seconds.
+
+Now recorded as the wall gap between consecutive tokens for that request,
+which is what a user experiences. A regression test admits a large prompt
+mid-flight and asserts the incumbent's inter-token latency spikes;
+without the fix it measured 1.2 ms where the gap was 102 ms, an 89x
+understatement. **P2 needs re-measuring a third time.**
+
+The general lesson is worth keeping for the report: three predictions in
+this phase were "falsified", and two of those were the harness being
+wrong rather than the system. A prediction specific enough to be wrong is
+also specific enough to catch a measurement that quietly answers a
+different question.
+
+**slo_aware was being judged on metrics it does not optimise.** It looked
+strictly worse than FIFO (p99 21.6 s vs 18.2 s) — but its job is meeting
+deadlines, and nothing measured whether deadlines were met.
+`slo_attainment` is now reported overall and per tier (2 s interactive /
+10 s document / 30 s batch), since a policy that saves the interactive
+tier by sacrificing the batch tier is working as designed and the
+aggregate alone would hide it.
+
 ## Gate 3 checklist
 
 - [ ] `pytest tests/test_phase4_serving.py` green (all tiers, CPU)

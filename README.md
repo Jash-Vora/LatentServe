@@ -8,13 +8,14 @@ DSA-inspired sparse attention → adaptive runtime), not the model. DSA is
 a core research axis alongside MLA, not an optional late-stage add-on.
 See `docs/methodology.md` for the full research plan.
 
-This README covers **Phases 0-4**: environment + experimental
+This README covers **Phases 0-6**: environment + experimental
 infrastructure, the Qwen2.5-1.5B-Instruct reference implementation and
 correctness harness, and LatentServe's own GQA + KV-cache execution
 path, the paged KV cache, and the continuous-batching serving runtime.
-Phase 5/6 (benchmark harness, vLLM comparison) are next. See
-`docs/phase2.md`, `docs/phase3.md` and `docs/phase4.md` for what each
-measures and the predictions registered before measuring.
+the shared benchmark harness, and the vLLM comparison. Phase 7
+(MLA-inspired latent KV attention) is next. See `docs/phase2.md` through
+`docs/phase6.md` for what each measures and the predictions registered
+before measuring.
 
 ## What's in this scaffold
 
@@ -22,6 +23,9 @@ measures and the predictions registered before measuring.
 config.py                              # experiment config schema (pydantic) + YAML loader
 configs/                               # YAML experiment definitions (edit these, not code)
 benchmarks/schema.py                   # BenchmarkResult schema + JSONL writer (auto reproducibility metadata)
+benchmarks/harness.py                  # Phase 5: percentiles, CIs, stall-aware summaries, fairness guards
+benchmarks/runners/phase6_vllm.py      # Phase 6: LatentServe vs vLLM under asserted-matched conditions
+comparisons/vllm/runner.py             # Phase 6: offline vLLM engine with every control recorded
 benchmarks/runners/check_env.py        # Phase 0 gate: verifies CUDA/GPU/torch actually work
 benchmarks/runners/phase1_reference.py # Phase 1: context-length sweep -> results/raw/phase1_reference.jsonl
 benchmarks/runners/phase2_gqa.py       # Phase 2: GQA/KV sweep -> results/raw/phase2_gqa.jsonl
@@ -48,6 +52,7 @@ tests/test_phase1_correctness.py       # Gate 1: HF teacher-forced vs incrementa
 tests/test_phase2_gqa.py               # Gate 2: LatentServe's execution path vs the HF oracle
 tests/test_phase3_paged.py             # Gate 4: allocator behaviour + paged/contiguous equivalence
 tests/test_phase4_serving.py           # Gate 3: outputs identical under concurrency; scheduler policies
+tests/test_phase5_harness.py           # the harness's own failure modes (percentiles, bimodality, fairness)
 ```
 
 This is a **flat layout**: `model`, `cache`, `runtime`, etc. are top-level

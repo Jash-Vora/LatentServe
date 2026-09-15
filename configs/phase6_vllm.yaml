@@ -1,0 +1,38 @@
+# Phase 6 — LatentServe vs vLLM under matched conditions.
+# See docs/methodology.md Phase 6 and Section 33 ("Fairness Rules"),
+# plus docs/phase6.md.
+#
+# Everything here is a *control*, not a tuning knob: both systems get the
+# same weights, precision, GPU, prompts, output lengths, concurrency and
+# sampling. benchmarks/harness.py::assert_comparable enforces it before
+# any ratio is printed.
+
+tag: phase6_vllm
+
+model:
+  name: Qwen/Qwen2.5-1.5B-Instruct
+  dtype: fp16
+  max_position_embeddings: 131072
+
+attention:
+  type: gqa
+  kv_heads_mode: native
+  impl: sdpa
+
+runtime:
+  batch_size: 8
+  block_size: 16
+  prefill_chunk_size: 4096
+  scheduler: fifo
+  continuous_batching: true
+  prefix_caching: false    # LatentServe has none until Phase 13; vLLM's is disabled to match
+
+generation:
+  input_tokens: 8192
+  output_tokens: 256
+  num_requests: 32
+  seed: 0
+  sampling: greedy
+
+hardware:
+  devices: [0]

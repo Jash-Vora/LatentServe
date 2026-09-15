@@ -59,11 +59,9 @@ from runtime.request import ServedRequest
 from runtime.scheduler import SCHEDULERS, build_scheduler
 
 
-def _pct(xs: list, p: float) -> Optional[float]:
-    xs = sorted(x for x in xs if x is not None)
-    if not xs:
-        return None
-    return xs[min(len(xs) - 1, int(round(p * (len(xs) - 1))))]
+# Phase 5 owns the percentile definition now; every runner shares it so
+# "p99" means one thing across the whole project.
+from benchmarks.harness import percentile as _pct  # noqa: E402
 
 
 def assign_slo_ms(prompt_len: int) -> float:
