@@ -147,7 +147,21 @@ def summarise(finished: list[ServedRequest], wall_s: float, extra: dict) -> dict
         "output_tokens_per_s": total_out / wall_s if wall_s else 0.0,
         "ttft_p50": _pct(ttfts, 0.50), "ttft_p95": _pct(ttfts, 0.95), "ttft_p99": _pct(ttfts, 0.99),
         "tpot_p50": _pct(steps, 0.50), "tpot_p95": _pct(steps, 0.95),
-        "tpot_p99": _pct(steps, 0.99), "tpot_max": max(steps) if steps else None,
+        "tpot_p99": _pct(steps, 0.99), "tpot_p999": _pct(steps, 0.999),
+        "tpot_max": max(steps) if steps else None,
+        # Inter-token latency is bimodal under prefill blocking: a normal
+        # population around the decode step, and a stall population at
+        # the length of whatever prompt was admitted. With ~1% of gaps
+        # stalled, p99 lands exactly on the boundary between the two, so
+        # it moves with sampling noise rather than with scheduler policy.
+        # Report how often a stall happens and how bad it gets instead.
+        "tpot_stall_rate": (
+            sum(1 for ms in steps if ms > 10 * (_pct(steps, 0.50) or 1)) / len(steps)
+            if steps else None
+        ),
+        "tpot_stalled_ms_total": sum(
+            ms for ms in steps if ms > 10 * (_pct(steps, 0.50) or 1)
+        ) if steps else None,
         # Per-request means, kept separately so the two are never confused.
         "tpot_mean_per_request_p50": _pct(tpots, 0.50),
         "tpot_mean_per_request_p95": _pct(tpots, 0.95),
