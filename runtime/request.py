@@ -44,6 +44,10 @@ class ServedRequest:
     max_new_tokens: int
     arrival_time: float = field(default_factory=time.perf_counter)
     slo_ttft_ms: Optional[float] = None  # target used by the SLO-aware policy
+    # Seconds after the run starts that this request should be released.
+    # 0 for everything means a burst; Poisson offsets make an open-loop
+    # load test, which is the only way starvation becomes observable.
+    arrival_offset_s: float = 0.0
 
     state: RequestState = RequestState.ARRIVED
     slot: Optional[int] = None  # cache slot while resident
@@ -53,7 +57,13 @@ class ServedRequest:
     scheduled_time: Optional[float] = None  # admitted, prefill about to run
     first_token_time: Optional[float] = None
     finish_time: Optional[float] = None
+    # Wall-clock gap between consecutive tokens, as the client sees it.
+    # NOT the duration of the decode call: between two decode steps the
+    # engine may run another request's 2 s prefill, and that gap is the
+    # whole of what prefill-blocking costs. Measuring kernel time instead
+    # reports a healthy 65 ms while a user waits two seconds.
     decode_step_ms: list = field(default_factory=list)
+    last_token_time: Optional[float] = None
 
     # How many times this request was evicted and had to redo its prompt.
     preemptions: int = 0
@@ -102,6 +112,16 @@ class ServedRequest:
         return (self.first_token_time - self.arrival_time) * 1000
 
     @property
+    def met_slo(self) -> Optional[bool]:
+        """Did this request hit its TTFT target? The only metric that
+        judges the SLO-aware policy on its own terms — p50/p99 TTFT say
+        nothing about whether deadlines were met, and a policy evaluated
+        solely on metrics it is not optimising will always look worse."""
+        if self.slo_ttft_ms is None or self.ttft_ms is None:
+            return None
+        return self.ttft_ms <= self.slo_ttft_ms
+
+    @property
     def tpot_ms(self) -> Optional[float]:
         if not self.decode_step_ms:
             return None
@@ -124,5 +144,7 @@ class ServedRequest:
             "tpot_ms": self.tpot_ms,
             "e2e_ms": self.e2e_ms,
             "preemptions": self.preemptions,
+            "slo_ttft_ms": self.slo_ttft_ms,
+            "met_slo": self.met_slo,
             "state": self.state.value,
         }

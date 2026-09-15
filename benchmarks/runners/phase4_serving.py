@@ -130,6 +130,16 @@ def summarise(finished: list[ServedRequest], wall_s: float, extra: dict) -> dict
     steps = [ms for r in finished for ms in r.decode_step_ms]
     tpots = [r.tpot_ms for r in finished]
     total_out = sum(r.generated for r in finished)
+    judged = [r for r in finished if r.met_slo is not None]
+    met = [r for r in judged if r.met_slo]
+    # Per-tier attainment: a policy that saves the 2 s interactive tier by
+    # sacrificing the 30 s batch tier is doing its job, and the aggregate
+    # rate alone would hide that.
+    tiers: dict = {}
+    for r in judged:
+        tier = tiers.setdefault(f"slo_{int(r.slo_ttft_ms)}ms", [0, 0])
+        tier[1] += 1
+        tier[0] += 1 if r.met_slo else 0
     return {
         "requests": len(finished),
         "wall_s": wall_s,
@@ -143,6 +153,8 @@ def summarise(finished: list[ServedRequest], wall_s: float, extra: dict) -> dict
         "tpot_mean_per_request_p95": _pct(tpots, 0.95),
         "queue_p50": _pct(queues, 0.50), "queue_p95": _pct(queues, 0.95),
         "mean_queue_ms": statistics.mean([q for q in queues if q is not None]) if queues else 0.0,
+        "slo_attainment": len(met) / len(judged) if judged else None,
+        **{f"{k}_attainment": v[0] / v[1] for k, v in sorted(tiers.items())},
         **extra,
     }
 
@@ -327,8 +339,9 @@ def run(
                    int(statistics.mean([r.prompt_len for r in fresh])))
             print(
                 f"  {name:<14} {summary['output_tokens_per_s']:7.1f} tok/s  "
-                f"ttft p50/p95/p99 {summary['ttft_p50']:7.0f}/{summary['ttft_p95']:7.0f}/"
-                f"{summary['ttft_p99']:7.0f} ms  queue p50 {summary['queue_p50']:7.0f} ms  "
+                f"ttft p50/p99 {summary['ttft_p50']:7.0f}/{summary['ttft_p99']:7.0f} ms  "
+                f"itl p50/p99 {summary['tpot_p50']:6.1f}/{summary['tpot_p99']:8.1f} ms  "
+                f"SLO {(summary['slo_attainment'] or 0) * 100:5.1f}%  "
                 f"sched {summary['scheduler_overhead_us_per_call']:.1f} us/call"
             )
             model.cache = None

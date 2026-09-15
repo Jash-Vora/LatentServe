@@ -69,11 +69,17 @@ class ServingEngine:
         scheduler: str | Scheduler = "fifo",
         prefill_chunk_size: Optional[int] = 4096,
         eos_token_id: Optional[int] = None,
+        on_retire: Optional[callable] = None,
     ):
         self.model = model
         self.max_running = max_running
         self.prefill_chunk_size = prefill_chunk_size
         self.eos_token_id = eos_token_id
+        # Called as each request completes. A long sweep that prints only
+        # when a whole configuration finishes is indistinguishable from a
+        # hang, and "is it stuck?" is not a question a benchmark should
+        # make you ask.
+        self.on_retire = on_retire
 
         cache = model.allocate_cache(
             batch_size=max_running,
@@ -125,6 +131,8 @@ class ServingEngine:
         self._free_slots.append(request.slot)
         request.slot = None
         self.finished.append(request)
+        if self.on_retire is not None:
+            self.on_retire(request, self)
 
     def _admit_and_prefill(self) -> None:
         admitted = self.scheduler.select(
@@ -157,6 +165,7 @@ class ServingEngine:
 
             next_id = int(logits[0, -1].argmax().item())
             request.first_token_time = time.perf_counter()
+            request.last_token_time = request.first_token_time
             request.output_ids.append(next_id)
             request.state = RequestState.DECODING
             self.running.append(request)
@@ -194,10 +203,15 @@ class ServingEngine:
         self.batch_occupancy.append(len(self.running))
 
         next_ids = logits[:, -1, :].argmax(dim=-1).tolist()
+        now = time.perf_counter()
         still: list[ServedRequest] = []
         for request, token in zip(self.running, next_ids):
             request.output_ids.append(int(token))
-            request.decode_step_ms.append(step_ms)
+            # Wall gap since this request's previous token. Includes any
+            # prefill the engine ran in between, which is exactly the
+            # cost the step timer above cannot see.
+            request.decode_step_ms.append((now - (request.last_token_time or now)) * 1000)
+            request.last_token_time = now
             self.decode_tokens += 1
             if self._should_stop(request):
                 self._retire(request)
@@ -280,6 +294,7 @@ def run_static_batching(
     max_seq_len: int,
     block_size: int = 16,
     prefill_chunk_size: Optional[int] = 4096,
+    on_retire: Optional[callable] = None,
 ) -> tuple[list[ServedRequest], dict]:
     """Baseline: fixed groups run to completion.
 
@@ -303,6 +318,7 @@ def run_static_batching(
             max_seq_len=max_seq_len,
             block_size=block_size,
             prefill_chunk_size=prefill_chunk_size,
+            on_retire=on_retire,
         )
         for r in group:
             engine.add_request(r)
