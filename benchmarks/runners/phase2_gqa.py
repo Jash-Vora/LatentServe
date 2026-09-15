@@ -68,6 +68,25 @@ THEORETICAL_PEAK_BW_GB_S = {
 }
 
 
+def _oom_errors():
+    """torch.cuda.OutOfMemoryError and torch.OutOfMemoryError are the same
+    class in recent torch but not in every release this might run on, and
+    older versions raise a plain RuntimeError."""
+    import torch
+
+    errs = {RuntimeError}
+    for name in ("OutOfMemoryError",):
+        for mod in (torch, torch.cuda):
+            err = getattr(mod, name, None)
+            if err is not None:
+                errs.add(err)
+    return tuple(errs)
+
+
+def _is_oom(e: Exception) -> bool:
+    return isinstance(e, tuple(_oom_errors())) and "out of memory" in str(e).lower()
+
+
 def _pct(xs: list, p: float) -> Optional[float]:
     if not xs:
         return None
@@ -90,6 +109,7 @@ def run_sweep(
     kv_heads_modes: list,
     prefill_chunk_size: Optional[int],
     attn_impl: str,
+    kv_expansion: str,
     include_hf_baseline: bool,
     kv_budget_gb: float,
     results_dir: str = "results/raw",
@@ -131,6 +151,7 @@ def run_sweep(
             ref,
             kv_heads_mode=mode,
             attn_impl=attn_impl,
+            kv_expansion=kv_expansion,
             max_seq_len_hint=max(context_lengths) + output_tokens,
         )
         weight_bytes = engine.weight_bytes()
@@ -159,12 +180,22 @@ def run_sweep(
                 input_ids = base_ids.expand(batch_size, -1).contiguous()
 
                 trials = []
+                oom = None
                 for trial in range(warmup + repeats):
-                    result = engine.generate_with_timing(
-                        input_ids=input_ids,
-                        max_new_tokens=output_tokens,
-                        chunk_size=prefill_chunk_size,
-                    )
+                    try:
+                        result = engine.generate_with_timing(
+                            input_ids=input_ids,
+                            max_new_tokens=output_tokens,
+                            chunk_size=prefill_chunk_size,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        if not _is_oom(e):
+                            raise
+                        oom = str(e).split("\n")[0]
+                        engine.cache = None
+                        torch.cuda.empty_cache()
+                        print(f"  mode={mode} B={batch_size} ctx={ctx_len} [OOM] {oom}")
+                        break
                     if trial >= warmup:
                         trials.append(result)
                     label = "warmup" if trial < warmup else "measured"
@@ -173,6 +204,29 @@ def run_sweep(
                         f"[{label}] ttft={result.ttft_ms:.1f}ms tpot={result.tpot_ms:.2f}ms "
                         f"peak_vram={result.peak_vram_mb:.1f}MB kv={result.kv_cache_mb:.1f}MB"
                     )
+
+                if oom is not None or not trials:
+                    row = BenchmarkResult(
+                        system="latentserve_gqa",
+                        tag=cfg.tag,
+                        attention="gqa",
+                        model=cfg.model.name,
+                        batch_size=batch_size,
+                        context_length=ctx_len,
+                        output_length=output_tokens,
+                        num_gpus=len(cfg.hardware.devices),
+                        seed=cfg.generation.seed,
+                        extra={
+                            "status": "oom" if oom else "no_trials",
+                            "error": oom,
+                            "kv_heads_mode": mode,
+                            "kv_allocated_mb": spec.total_mb,
+                            "gpu_name": gpu_name,
+                        },
+                    )
+                    writer.write(row)
+                    written.append(row)
+                    continue
 
                 ttfts = [t.ttft_ms for t in trials]
                 tpots = [t.tpot_ms for t in trials]
@@ -205,8 +259,10 @@ def run_sweep(
                     "achieved_bandwidth_gb_s": achieved_bw,
                     "theoretical_peak_bw_gb_s": peak_bw,
                     "bandwidth_utilization": (achieved_bw / peak_bw) if peak_bw else None,
+                    "status": "ok",
                     "prefill_chunk_size": prefill_chunk_size,
                     "attn_impl": attn_impl,
+                    "kv_expansion": kv_expansion,
                     "prefill_ms": statistics.median([t.prefill_ms for t in trials]),
                     "gpu_name": gpu_name,
                     "num_trials": len(trials),
@@ -248,11 +304,42 @@ def run_sweep(
                 )
 
                 if include_hf_baseline and mode == kv_heads_modes[0] and batch_size == 1:
-                    written.append(
-                        _run_hf_baseline(
-                            ref, cfg, writer, ctx_len, output_tokens, repeats, warmup, gpu_name
+                    # The HF reference runs out of memory long before
+                    # LatentServe does (it materialises a full
+                    # [B, heads, S, S] score matrix — 12 GiB in fp32 at
+                    # 16K, on a 14.6 GiB card). That is a finding about
+                    # the baseline and must not abort the sweep that is
+                    # measuring it.
+                    try:
+                        written.append(
+                            _run_hf_baseline(
+                                ref, cfg, writer, ctx_len, output_tokens, repeats, warmup, gpu_name
+                            )
                         )
-                    )
+                    except Exception as e:  # noqa: BLE001
+                        if not _is_oom(e):
+                            raise
+                        torch.cuda.empty_cache()
+                        row = BenchmarkResult(
+                            system="huggingface_reference",
+                            tag=cfg.tag,
+                            attention="gqa",
+                            model=cfg.model.name,
+                            batch_size=1,
+                            context_length=ctx_len,
+                            output_length=output_tokens,
+                            num_gpus=len(cfg.hardware.devices),
+                            seed=cfg.generation.seed,
+                            extra={
+                                "status": "oom",
+                                "error": str(e).split("\n")[0],
+                                "paired_with": "latentserve_gqa",
+                                "gpu_name": gpu_name,
+                            },
+                        )
+                        writer.write(row)
+                        written.append(row)
+                        print(f"  -> [HF paired] ctx={ctx_len} OOM, recorded")
 
         engine.cache = None
         if torch.cuda.is_available():
@@ -331,6 +418,13 @@ def main() -> int:
     )
     parser.add_argument("--attn-impl", default="sdpa", choices=["sdpa", "math"])
     parser.add_argument(
+        "--kv-expansion",
+        default="fold",
+        choices=["fold", "materialize"],
+        help="how GQA matches KV heads to query heads on the decode path; "
+        "'materialize' reproduces the first sweep's 13x decode traffic",
+    )
+    parser.add_argument(
         "--include-hf-baseline",
         action="store_true",
         help="rerun the Phase 1 HF path on the same points in the same process",
@@ -354,6 +448,7 @@ def main() -> int:
         kv_heads_modes=args.kv_heads_modes,
         prefill_chunk_size=args.prefill_chunk_size,
         attn_impl=args.attn_impl,
+        kv_expansion=args.kv_expansion,
         include_hf_baseline=args.include_hf_baseline,
         kv_budget_gb=args.kv_budget_gb,
         results_dir=args.results_dir,

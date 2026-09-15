@@ -55,7 +55,7 @@ import torch
 from torch import nn
 
 from cache.kv_cache import ContiguousKVCache, KVCacheSpec, KVHeadsMode, effective_kv_heads
-from model.attention.gqa import AttnImpl, GQAAttention
+from model.attention.gqa import AttnImpl, GQAAttention, KVExpansion
 from model.qwen import ModelShape, QwenReference, TimedGenerationResult
 from model.rope import RotaryEmbedding
 
@@ -90,6 +90,7 @@ class LatentServeQwen:
         device: str = "cuda",
         kv_heads_mode: KVHeadsMode = "native",
         attn_impl: AttnImpl = "sdpa",
+        kv_expansion: KVExpansion = "fold",
         rope_source: str = "latentserve",
         max_seq_len_hint: int = 4096,
     ):
@@ -99,6 +100,7 @@ class LatentServeQwen:
         self.device = torch.device(device)
         self.kv_heads_mode = kv_heads_mode
         self.attn_impl = attn_impl
+        self.kv_expansion = kv_expansion
         self.rope_source = rope_source
 
         config = hf_model.config
@@ -128,6 +130,7 @@ class LatentServeQwen:
                 layer_idx=idx,
                 kv_heads_mode=kv_heads_mode,
                 attn_impl=attn_impl,
+                kv_expansion=kv_expansion,
             )
             self.layers.append(
                 _Layer(
@@ -385,6 +388,7 @@ class LatentServeQwen:
             f"q_heads={self.shape.num_attention_heads}, "
             f"kv_heads={self.shape.num_key_value_heads} "
             f"(group={self.shape.gqa_group_size}), mode={self.kv_heads_mode}, "
-            f"attn={self.attn_impl}, rope={self.rope_source}, "
+            f"attn={self.attn_impl}, kv_expansion={self.kv_expansion}, "
+            f"rope={self.rope_source}, "
             f"cache={spec.describe() if spec else 'unallocated'})"
         )

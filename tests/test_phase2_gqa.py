@@ -331,6 +331,45 @@ def test_mha_sim_is_numerically_equivalent(tiny_model, tiny_shape):
     assert simulated.cache.spec.bytes_per_token == native.cache.spec.bytes_per_token * group
 
 
+def test_fold_and_materialize_agree(tiny_model, tiny_shape):
+    """Folding the GQA group into the query axis on the decode path must
+    be arithmetically identical to expanding the cache with repeat_kv.
+    It is the same attention, reassociated to avoid copying the cache 6x
+    per layer per token — so if these ever diverge, the fast path is
+    silently pairing query heads with the wrong KV head."""
+    folded = build(tiny_model, tiny_shape, kv_expansion="fold")
+    expanded = build(tiny_model, tiny_shape, kv_expansion="materialize")
+    ids = torch.randint(0, TINY["vocab_size"], (2, 12))
+
+    outs = []
+    for engine in (folded, expanded):
+        engine.allocate_cache(2, 32)
+        engine.cache.reset()
+        engine.prefill(ids[:, :8])
+        steps = [engine.decode_step(ids[:, t : t + 1]) for t in range(8, 12)]
+        outs.append(torch.cat(steps, dim=1))
+
+    torch.testing.assert_close(outs[0], outs[1], rtol=1e-4, atol=1e-4)
+
+
+def test_fold_handles_mqa_sim(tiny_model, tiny_shape):
+    """mqa_sim leaves a single cached KV head serving all query heads —
+    the largest fold factor, and the one where a reshape ordering bug
+    would be least obvious."""
+    folded = build(tiny_model, tiny_shape, kv_heads_mode="mqa_sim", kv_expansion="fold")
+    expanded = build(tiny_model, tiny_shape, kv_heads_mode="mqa_sim", kv_expansion="materialize")
+    ids = torch.randint(0, TINY["vocab_size"], (1, 10))
+
+    outs = []
+    for engine in (folded, expanded):
+        engine.allocate_cache(1, 32)
+        engine.cache.reset()
+        engine.prefill(ids[:, :6])
+        outs.append(torch.cat([engine.decode_step(ids[:, t : t + 1]) for t in range(6, 10)], dim=1))
+
+    torch.testing.assert_close(outs[0], outs[1], rtol=1e-4, atol=1e-4)
+
+
 def test_math_and_sdpa_impls_agree(tiny_model, tiny_shape):
     """The explicit-math attention path is the reference Phase 11's
     custom kernels get checked against, so it must already agree with

@@ -115,6 +115,47 @@ so the MLA experiments get run where they can show something: large
 batch, long context. Reporting "MLA didn't help" from a 4K/batch-1 point
 would be a statement about the workload, not about MLA.
 
+## Measured: P2 falsified, and why (first sweep, batch 1, native)
+
+| ctx | LatentServe TPOT | HF TPOT | LatentServe peak VRAM | HF peak VRAM |
+| ---: | ---: | ---: | ---: | ---: |
+| 1024 | 33.0 ms | 40.7 ms | 3079 MB | — |
+| 4096 | 33.0 ms | 45.7 ms | 3340 MB | — |
+| 8192 | 48.9 ms | 72.4 ms | 3463 MB | 10654 MB |
+| 16384 | 79.1 ms | OOM | 3794 MB | OOM |
+
+P1 confirmed: 94-97 GB/s at short context, 29-30% of the T4's peak.
+P3 confirmed: 7.2 GB less peak VRAM at 8K, and 16K runs where the HF
+reference cannot allocate at all.
+
+P2 falsified. TPOT is flat 1024 -> 4096 and then rises 48% at 8K and
+140% at 16K. The slope above 4K is ~3.8 us per token of context per
+decode step; reading the KV cache once at the measured ~100 GB/s would
+cost 0.28 us/token. That is ~13x the necessary traffic, and 13 is
+exactly what `repeat_kv` costs on the decode path: 1x read of the cache,
+6x written by the copy the reshape forces, 6x read back by SDPA. GQA
+stores 2 KV heads instead of 12, and the attention path handed the
+saving straight back every step, in every one of the 28 layers.
+
+Below 4K it is invisible because it is smaller than the 33 ms weight-read
+floor — which is itself P1. Two independent findings interacting is the
+kind of thing the three-layer evidence rule (math, benchmark, profile)
+exists to catch.
+
+Fix: on the decode path a single query attends to everything, so no mask
+is needed and the group of query heads sharing a KV head can be folded
+into the query axis instead — [B, 12, 1, D] -> [B, 2, 6, D] against an
+un-expanded [B, 2, S, D] cache. Identical arithmetic
+(`test_fold_and_materialize_agree`), cache read exactly once. Prefill
+keeps `repeat_kv`: it is compute-bound at O(S^2), so the copy is a much
+smaller share there, and the folded mask would be [n_rep * q_len, kv_len]
+booleans.
+
+`--kv-expansion materialize` reproduces the slow path on purpose. The
+before/after belongs in the report: a theoretical memory saving erased
+by an implementation detail, visible only past the context where it
+clears the weight-read floor, is the project thesis in miniature.
+
 ## Gate 2 checklist — "Can LatentServe execute cached decoding?"
 
 - [ ] `pytest tests/test_phase2_gqa.py` green (tier 1, CPU)

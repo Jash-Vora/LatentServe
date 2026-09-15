@@ -35,6 +35,23 @@ from model.rope import apply_rope
 
 AttnImpl = Literal["sdpa", "math"]
 
+# How the KV heads get matched up to the query heads they serve.
+#
+#   materialize — repeat_kv the cache out to one KV head per query head.
+#                 Correct, obvious, and the reason Phase 2's first sweep
+#                 measured ~13x the necessary decode memory traffic: the
+#                 reshape inside repeat_kv cannot stay a view, so every
+#                 decode step copies the whole cache 6x per layer, then
+#                 reads the copy. Kept as a config option because the
+#                 before/after is a result worth reporting, not just a
+#                 bug worth deleting.
+#   fold        — on the decode path, reinterpret the group of query
+#                 heads sharing a KV head as extra *queries* against the
+#                 un-expanded cache: [B, 12, 1, D] -> [B, 2, 6, D] against
+#                 K/V of [B, 2, S, D]. Identical arithmetic, no copy, and
+#                 the cache is read exactly once.
+KVExpansion = Literal["materialize", "fold"]
+
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """[B, kv_heads, S, D] -> [B, kv_heads * n_rep, S, D].
@@ -90,6 +107,7 @@ class GQAAttention(nn.Module):
         layer_idx: int,
         kv_heads_mode: KVHeadsMode = "native",
         attn_impl: AttnImpl = "sdpa",
+        kv_expansion: KVExpansion = "fold",
     ):
         super().__init__()
         self.q_proj, self.k_proj, self.v_proj, self.o_proj = q_proj, k_proj, v_proj, o_proj
@@ -99,6 +117,7 @@ class GQAAttention(nn.Module):
         self.layer_idx = layer_idx
         self.kv_heads_mode = kv_heads_mode
         self.attn_impl = attn_impl
+        self.kv_expansion = kv_expansion
         self.scaling = head_dim**-0.5
 
     # ------------------------------------------------------------------
@@ -180,7 +199,24 @@ class GQAAttention(nn.Module):
         kv_len = start_pos + s
         k_all, v_all = cache.read(self.layer_idx, b, kv_len)
 
-        n_rep = self.num_attention_heads // k_all.shape[1]
+        cached_kv_heads = k_all.shape[1]
+        n_rep = self.num_attention_heads // cached_kv_heads
+
+        if s == 1 and n_rep > 1 and self.kv_expansion == "fold":
+            # Decode: no mask is needed (one query attends to everything),
+            # so the group axis can be folded into the query axis and the
+            # cache used as-is. This is the difference between reading the
+            # KV cache once and copying it 6x per layer per token.
+            q_folded = q.reshape(b, cached_kv_heads, n_rep, self.head_dim)
+            out = self._attend(q_folded, k_all, v_all, mask=None, is_causal=False)
+            attn_out = out.reshape(b, self.num_attention_heads, 1, self.head_dim)
+            attn_out = attn_out.transpose(1, 2).contiguous().view(b, s, -1)
+            return self.o_proj(attn_out)
+
+        # Prefill, or the materialize ablation. Prefill is compute-bound
+        # (attention is O(S^2) there), so the expansion copy is a much
+        # smaller share of the cost and the folded mask would itself be
+        # large — [n_rep * q_len, kv_len] booleans.
         k_all = repeat_kv(k_all, n_rep)
         v_all = repeat_kv(v_all, n_rep)
 
