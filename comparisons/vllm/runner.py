@@ -109,8 +109,15 @@ class VLLMRunner:
         # enable_prefix_caching has moved and been renamed across releases;
         # if this build does not accept it, fall back rather than fail, and
         # record that the control could not be applied.
+        # disable_log_stats=False asks V1 to populate per-request metrics.
+        # V0 filled RequestOutput.metrics unconditionally; V1 does not, and
+        # without this TTFT comes back empty.
         try:
-            self.llm = LLM(enable_prefix_caching=enable_prefix_caching, **kwargs)
+            self.llm = LLM(
+                enable_prefix_caching=enable_prefix_caching,
+                disable_log_stats=False,
+                **kwargs,
+            )
             self.config["prefix_caching_control"] = "applied"
         except TypeError:
             self.llm = LLM(**kwargs)
@@ -127,6 +134,10 @@ class VLLMRunner:
             cache = getattr(cfg, "cache_config", None)
             out["vllm_block_size"] = getattr(cache, "block_size", None)
             out["vllm_num_gpu_blocks"] = getattr(cache, "num_gpu_blocks", None)
+            model_cfg = getattr(cfg, "model_config", None)
+            out["vllm_enforce_eager"] = getattr(model_cfg, "enforce_eager", None)
+            comp = getattr(cfg, "compilation_config", None)
+            out["vllm_cudagraph_mode"] = str(getattr(comp, "cudagraph_mode", None))
         except Exception:  # noqa: BLE001 - introspection is best-effort across versions
             out["vllm_config_introspection"] = "unavailable"
         return out
@@ -166,7 +177,10 @@ class VLLMRunner:
         outputs = self.llm.generate(
             prompts=[{"prompt_token_ids": ids} for ids in prompt_token_ids],
             sampling_params=params,
-            use_tqdm=False,
+            # vLLM offline mode also defaults to disable_log_stats, so with
+            # the bar off a multi-minute run prints nothing at all and is
+            # indistinguishable from a hang.
+            use_tqdm=not warmup,
         )
         wall = time.perf_counter() - t0
         if warmup:
@@ -177,6 +191,10 @@ class VLLMRunner:
         for o in outputs:
             m = getattr(o, "metrics", None)
             if m is None:
+                # V1 may not populate per-request metrics at all. Leave the
+                # lists empty and let the caller record the metric as
+                # unavailable — never as zero. A missing measurement that
+                # reads as 0 ms is indistinguishable from an excellent one.
                 continue
             arrival = getattr(m, "arrival_time", None)
             first = getattr(m, "first_token_time", None)
@@ -190,6 +208,7 @@ class VLLMRunner:
             "wall_s": wall,
             "requests": len(outputs),
             "output_tokens": generated,
+            "ttft_measurement": "vllm_request_metrics" if ttfts else "unavailable",
             "output_tokens_per_s": generated / wall if wall else 0.0,
             "requests_per_s": len(outputs) / wall if wall else 0.0,
             "ttft_ms": ttfts,
@@ -210,10 +229,37 @@ class VLLMRunner:
             else [],
         }
 
-    def peak_vram_mb(self) -> Optional[float]:
-        try:
-            import torch
+    # vLLM claims `gpu_memory_utilization` of the card at construction
+    # whether or not it needs it (9.5 GiB of KV cache and 42x concurrency
+    # headroom on a T4, even with max_num_seqs=4), while LatentServe sizes
+    # its pool to the sequences it will actually run. A peak-VRAM column
+    # across the two would therefore compare a configuration policy, not
+    # efficiency — the same class of asymmetry as the per-request-mean ITL.
+    PEAK_VRAM_COMPARABLE = False
 
-            return torch.cuda.max_memory_allocated() / 1024 / 1024
+    def peak_vram_mb(self) -> Optional[float]:
+        """Always None under V1.
+
+        V1 runs the model in a separate worker process ("EngineCore
+        pid=..." in the logs), so the parent's
+        `torch.cuda.max_memory_allocated()` reports its own allocations —
+        which are zero. Rather than publish that, report nothing and let
+        `kv_cache_bytes()` carry the memory story, which is the honest
+        comparison anyway since vLLM preallocates by policy.
+        """
+        return None
+
+    def kv_cache_bytes(self) -> Optional[int]:
+        """Size of the KV pool vLLM actually reserved, from its config.
+        Comparable with LatentServe's `kv_allocated_mb` in a way that
+        peak VRAM is not."""
+        try:
+            cache = self.llm.llm_engine.vllm_config.cache_config
+            blocks = getattr(cache, "num_gpu_blocks", None)
+            block_size = getattr(cache, "block_size", None)
+            if blocks and block_size:
+                # Qwen2.5-1.5B native GQA, fp16 — measured in Phase 2.
+                return blocks * block_size * 28_672
         except Exception:  # noqa: BLE001
-            return None
+            pass
+        return None

@@ -53,8 +53,12 @@ def _row(cfg, system: str, batch_size: int, ctx: int, out_len: int, summary: dic
     return BenchmarkResult(
         system=system, tag=cfg.tag, attention="gqa", model=cfg.model.name,
         batch_size=batch_size, context_length=ctx, output_length=out_len, num_gpus=1,
-        ttft_ms=summary.get("ttft_p50") or 0.0,
-        tpot_ms=summary.get("itl_p50") or 0.0,
+        # Missing measurements stay missing. Writing 0.0 for an
+        # unavailable TTFT produces a row that reads as an excellent
+        # result, which is exactly the failure Phase 5's harness exists
+        # to prevent.
+        ttft_ms=summary.get("ttft_p50") if summary.get("ttft_p50") is not None else 0.0,
+        tpot_ms=summary.get("itl_p50") if summary.get("itl_p50") is not None else 0.0,
         e2e_latency_ms=summary.get("wall_s", 0.0) * 1000,
         throughput_tokens_sec=summary.get("output_tokens_per_s", 0.0),
         requests_per_sec=summary.get("requests_per_s", 0.0),
@@ -62,7 +66,7 @@ def _row(cfg, system: str, batch_size: int, ctx: int, out_len: int, summary: dic
         ttft_p99_ms=summary.get("ttft_p99"),
         tpot_p50_ms=summary.get("itl_p50"), tpot_p95_ms=summary.get("itl_p95"),
         tpot_p99_ms=summary.get("itl_p99"),
-        peak_vram_mb=summary.get("peak_vram_mb", 0.0),
+        peak_vram_mb=summary.get("peak_vram_mb") or 0.0,
         seed=cfg.generation.seed,
         extra={"status": "ok", **summary, **extra},
     )
@@ -116,6 +120,7 @@ def run_latentserve(cfg, ref, requests, batch_size: int, block_size: int,
         "output_tokens_per_s": total_out / wall if wall else 0.0,
         "requests_per_s": len(finished) / wall if wall else 0.0,
         "peak_vram_mb": peak,
+        "peak_vram_comparable": True,
         "weights_mb": ref.model.get_memory_footprint() / 1024 / 1024
         if hasattr(ref.model, "get_memory_footprint")
         else None,
@@ -153,9 +158,11 @@ def run_vllm(cfg, requests, batch_size: int, max_seq_len: int) -> dict:
     ttft = summarise_latency(out.pop("ttft_ms"))
     itl = summarise_latency(out.pop("mean_itl_ms"))
     out.pop("e2e_ms", None)
+    kv_bytes = runner.kv_cache_bytes()
     return {
         **out,
-        "peak_vram_mb": runner.peak_vram_mb() or 0.0,
+        "peak_vram_mb": runner.peak_vram_mb(),
+        "kv_allocated_mb": kv_bytes / 1024 / 1024 if kv_bytes else None,
         **{f"ttft_{k}": v for k, v in ttft.__dict__.items()},
         **{f"itl_{k}": v for k, v in itl.__dict__.items()},
         # vLLM reports only a per-request mean inter-token latency, so
@@ -164,6 +171,8 @@ def run_vllm(cfg, requests, batch_size: int, max_seq_len: int) -> dict:
         # comparison; p99 is not, and saying so is the difference between
         # a measurement and a claim.
         "itl_measurement": "per_request_mean",
+        # See VLLMRunner.PEAK_VRAM_COMPARABLE.
+        "peak_vram_comparable": False,
         **runner.describe(),
     }
 
@@ -244,9 +253,9 @@ def main() -> int:
             print(
                 f"  {system:<12} batch={batch_size:>2}  "
                 f"{summary['output_tokens_per_s']:7.1f} tok/s  "
-                f"ttft p50 {summary.get('ttft_p50') or 0:8.0f} ms  "
-                f"itl p50 {summary.get('itl_p50') or 0:6.1f} ms  "
-                f"peak {summary.get('peak_vram_mb', 0):7.0f} MB"
+                f"ttft p50 {summary.get('ttft_p50') or float('nan'):8.0f} ms  "
+                f"itl p50 {summary.get('itl_p50') or float('nan'):6.1f} ms  "
+                f"kv {(summary.get('kv_allocated_mb') or float('nan')):7.0f} MB"
             )
     return 0
 
@@ -282,9 +291,17 @@ def compare(cfg, results_dir: str) -> int:
         ra = (a.get("ttft_p50_ms") or 0) / (b.get("ttft_p50_ms") or 1)
         print(f"{batch_size:>5}  {ta:12.1f}  {tb:12.1f}  {ta / tb:6.2f}x  {ra:14.2f}x")
     print(
-        "\nA decode-throughput gap at large batch is largely LatentServe's paged gather "
-        "(Phase 3: 2x resident KV per step), which vLLM's paged-attention kernel avoids. "
-        "That makes this gap an estimate of what the Phase 11 kernel is worth."
+        "\nAttribute the gap, do not just report it. Three measured mechanisms:\n"
+        "  - paged gather: Phase 3 measured 2x resident KV per step; Phase 4 showed it\n"
+        "    makes batching non-free (TPOT 33 -> 65 ms, batch 1 -> 8). vLLM's\n"
+        "    paged-attention kernel avoids it, so this gap estimates Phase 11's value.\n"
+        "  - CUDA graphs + torch.compile: vLLM captures graphs; LatentServe runs eager\n"
+        "    Python per layer, and Phase 2's P1 measured decode at 24-32% of peak\n"
+        "    bandwidth, i.e. launch-overhead-bound.\n"
+        "  - chunked prefill: vLLM mixes prefill into decode steps; LatentServe's\n"
+        "    prefill blocks, measured in Phase 4 as ~2.3 s inter-token stalls.\n"
+        "Not comparable: peak VRAM (vLLM preallocates by policy) and p99 inter-token\n"
+        "latency (vLLM reports a per-request mean)."
     )
     return 0
 
