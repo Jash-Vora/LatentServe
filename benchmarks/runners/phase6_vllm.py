@@ -48,6 +48,28 @@ from benchmarks.workloads.ragged import WORKLOADS
 from config import load_config
 
 
+def build_uniform_requests(ref, context_length: int, num_requests: int,
+                           output_tokens: int, seed: int) -> list:
+    """Fixed-length prompts, for the context sweep.
+
+    A workload family mixes prompt lengths, which is right for serving
+    questions and wrong for locating a crossover: the two systems'
+    per-step costs scale differently with context, so a mixed workload
+    reports one blended number and hides where they cross. Uniform
+    prompts make context the only variable.
+    """
+    from runtime.request import ServedRequest
+
+    out = []
+    for i in range(num_requests):
+        ids = ref.synthesize_input_ids(context_length, seed=seed + i)
+        out.append(
+            ServedRequest(request_id=i, prompt_ids=ids[0].tolist(),
+                          max_new_tokens=output_tokens)
+        )
+    return out
+
+
 def _row(cfg, system: str, batch_size: int, ctx: int, out_len: int, summary: dict,
          extra: dict) -> BenchmarkResult:
     return BenchmarkResult(
@@ -186,6 +208,9 @@ def main() -> int:
     p.add_argument("--max-prompt", type=int, default=8192)
     p.add_argument("--max-output", type=int, default=256)
     p.add_argument("--batch-sizes", type=int, nargs="+", default=[4, 8])
+    p.add_argument("--context-lengths", type=int, nargs="+", default=None,
+                   help="sweep uniform prompt lengths instead of a workload family; "
+                   "this is what locates the LatentServe/vLLM crossover")
     p.add_argument("--block-size", type=int, default=16)
     p.add_argument("--results-dir", default="results/raw")
     p.add_argument("--compare", action="store_true",
@@ -218,16 +243,33 @@ def main() -> int:
     print(f"Loaded {cfg.model.name} once in {tok_ref.load_ms:.0f} ms on {device}")
     writer = ResultWriter(results_dir=args.results_dir)
 
-    for batch_size in args.batch_sizes:
-        requests = build_served_requests(
-            tok_ref, args.workload, args.num_requests, args.max_prompt,
-            args.max_output, cfg.generation.seed,
-        )
+    sweep = (
+        [(b, c) for b in args.batch_sizes for c in args.context_lengths]
+        if args.context_lengths
+        else [(b, None) for b in args.batch_sizes]
+    )
+
+    for batch_size, context_length in sweep:
+        def make():
+            return (
+                build_uniform_requests(
+                    tok_ref, context_length, args.num_requests, args.max_output,
+                    cfg.generation.seed,
+                )
+                if context_length
+                else build_served_requests(
+                    tok_ref, args.workload, args.num_requests, args.max_prompt,
+                    args.max_output, cfg.generation.seed,
+                )
+            )
+
+        requests = make()
         max_seq_len = max(r.total_len for r in requests) + 8
         ctx = int(statistics.mean([r.prompt_len for r in requests]))
         out_len = int(statistics.mean([r.max_new_tokens for r in requests]))
         controls = {
-            "workload": args.workload, "max_prompt": args.max_prompt,
+            "workload": f"uniform_{context_length}" if context_length else args.workload,
+            "max_prompt": context_length or args.max_prompt,
             "dtype": cfg.model.dtype, "sampling": cfg.generation.sampling,
             "arrival_rate": 0.0, "arrival_pattern": "burst",
             "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
@@ -235,10 +277,7 @@ def main() -> int:
         }
 
         for system in (["latentserve", "vllm"] if args.system == "both" else [args.system]):
-            fresh = build_served_requests(
-                tok_ref, args.workload, args.num_requests, args.max_prompt,
-                args.max_output, cfg.generation.seed,
-            )
+            fresh = make()
             if system == "vllm" and tok_ref.model is not None:
                 tok_ref.model = tok_ref.model.to("cpu")
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
@@ -250,12 +289,15 @@ def main() -> int:
             )
             row = _row(cfg, system, batch_size, ctx, out_len, summary, controls)
             writer.write(row)
+            steps = max(1, sum(r.generated for r in fresh) // batch_size) if context_length else 0
             print(
-                f"  {system:<12} batch={batch_size:>2}  "
-                f"{summary['output_tokens_per_s']:7.1f} tok/s  "
-                f"ttft p50 {summary.get('ttft_p50') or float('nan'):8.0f} ms  "
-                f"itl p50 {summary.get('itl_p50') or float('nan'):6.1f} ms  "
-                f"kv {(summary.get('kv_allocated_mb') or float('nan')):7.0f} MB"
+                f"  {system:<12} batch={batch_size:>2} "
+                + (f"ctx={context_length:>6} " if context_length else "")
+                + (f"~{summary['wall_s'] / steps * 1000:6.1f} ms/step  " if steps else "")
+                + f"{summary['output_tokens_per_s']:7.1f} tok/s  "
+                + f"ttft p50 {summary.get('ttft_p50') or float('nan'):8.0f} ms  "
+                + f"itl p50 {summary.get('itl_p50') or float('nan'):6.1f} ms  "
+                + f"kv {(summary.get('kv_allocated_mb') or float('nan')):7.0f} MB"
             )
     return 0
 
