@@ -1,0 +1,21 @@
+# Baseline environment for Phase 0.
+# Install with: pip install -r requirements.txt
+# On Kaggle, torch/CUDA are usually preinstalled — skip that line there.
+
+torch>=2.2
+numpy
+pyyaml
+pydantic>=2
+tqdm
+psutil
+
+# Add once you reach Phase 11 (custom kernels):
+# triton>=2.2
+
+# Add once you reach Phase 6 (vLLM baseline):
+# vllm
+
+# Dev/test tooling:
+pytest
+pytest-cov
+ruff

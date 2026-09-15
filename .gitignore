@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Results are regenerated, not hand-edited — keep raw dumps out of git
+# unless you deliberately want to snapshot a headline number.
+results/raw/*.jsonl
+results/processed/*
+results/figures/*
+!results/raw/.gitkeep
+!results/processed/.gitkeep
+!results/figures/.gitkeep
+
+# Profiling artifacts are large binaries — store pointers/commands, not the files, in git.
+profiling/nsight_systems/*.nsys-rep
+profiling/nsight_compute/*.ncu-rep
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Model checkpoints (if any get saved locally during dev)
+*.pt
+*.safetensors

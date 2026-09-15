@@ -1,0 +1,35 @@
+[project]
+name = "latentserve"
+version = "0.0.1"
+description = "Memory-efficient and sparse long-context LLM inference on commodity GPUs"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2",
+    "numpy",
+    "pyyaml",
+    "pydantic>=2",
+    "tqdm",
+    "psutil",
+    "nvidia-ml-py3; platform_system=='Linux'",
+]
+
+[project.optional-dependencies]
+kernels = ["triton>=2.2"]
+serving = ["fastapi", "uvicorn"]
+compare = ["vllm"]
+dev = ["pytest", "pytest-cov", "ruff", "ipykernel"]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# Flat layout: this repo root is the import root (add it to PYTHONPATH,
+# or `pip install -e .` from here). Top-level dirs (model, cache, runtime,
+# kernels, benchmarks, evaluation, comparisons) are the packages — there is
+# no wrapping "latentserve" package directory, matching docs/architecture.md.
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["model*", "cache*", "runtime*", "kernels*", "benchmarks*", "evaluation*", "comparisons*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
