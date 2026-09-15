@@ -8,21 +8,26 @@ DSA-inspired sparse attention → adaptive runtime), not the model. DSA is
 a core research axis alongside MLA, not an optional late-stage add-on.
 See `docs/methodology.md` for the full research plan.
 
-This README covers **Phase 0 only**: environment + experimental
-infrastructure. Nothing here trains or runs a model yet — that's Phase 1.
+This README covers **Phase 0 and Phase 1**: environment + experimental
+infrastructure, then the Qwen2.5-1.5B-Instruct reference implementation
+and correctness harness. Phase 2 (LatentServe's own GQA + KV-cache
+execution path) is next.
 
 ## What's in this scaffold
 
 ```
-config.py                          # experiment config schema (pydantic) + YAML loader
-configs/                           # YAML experiment definitions (edit these, not code)
-benchmarks/schema.py               # BenchmarkResult schema + JSONL writer (auto reproducibility metadata)
-benchmarks/runners/check_env.py    # Phase 0 gate: verifies CUDA/GPU/torch actually work
-model/ cache/ runtime/ kernels/    # empty package stubs for Phases 1+
-evaluation/ comparisons/vllm/      # empty package stubs for Phases 6, 15
-profiling/                         # where .nsys-rep / .ncu-rep artifacts go (Phase 12)
-results/{raw,processed,figures}/   # results/raw is machine-written only, never hand-edited
-tests/test_phase0_infra.py         # proves config loading + result writing work
+config.py                              # experiment config schema (pydantic) + YAML loader
+configs/                               # YAML experiment definitions (edit these, not code)
+benchmarks/schema.py                   # BenchmarkResult schema + JSONL writer (auto reproducibility metadata)
+benchmarks/runners/check_env.py        # Phase 0 gate: verifies CUDA/GPU/torch actually work
+benchmarks/runners/phase1_reference.py # Phase 1: context-length sweep -> results/raw/phase1_reference.jsonl
+model/qwen.py                          # Phase 1: instrumented QwenReference wrapper (load/prefill/decode/timing)
+cache/ runtime/ kernels/               # empty package stubs for Phases 2+
+evaluation/ comparisons/vllm/          # empty package stubs for Phases 6, 15
+profiling/                             # where .nsys-rep / .ncu-rep artifacts go (Phase 12)
+results/{raw,processed,figures}/       # results/raw is machine-written only, never hand-edited
+tests/test_phase0_infra.py             # proves config loading + result writing work
+tests/test_phase1_correctness.py       # Gate 1: HF vs LatentServe logits/cache/determinism
 ```
 
 This is a **flat layout**: `model`, `cache`, `runtime`, etc. are top-level
@@ -112,12 +117,38 @@ This appends one JSON line to `results/raw/<tag>.jsonl`, self-tagged with
 git commit, library versions, GPU model, and timestamp — never type a
 benchmark number into a doc or notebook by hand.
 
-## Next: Phase 1
+## Phase 1 — Qwen reference + correctness baseline
 
-There is no scratch model to write. Load **Qwen2.5-1.5B-Instruct** via
-`transformers` in `model/qwen.py` and treat the Hugging Face reference
-implementation as the correctness oracle. Then build LatentServe's own
-GQA + KV-cache execution path around those same fixed weights, and write
-the correctness harness comparing Hugging Face vs. LatentServe logits,
-attention masking, RoPE, and greedy decode output at 1 / 16 / 1K / 4K /
-8K / 16K+ tokens. See `docs/methodology.md` Phase 1 for details.
+`model/qwen.py` loads **Qwen2.5-1.5B-Instruct** via `transformers` and
+wraps it in `QwenReference`: an instrumented prefill/decode-step API
+plus `ModelShape` (layer/head/kv-head introspection that Phase 2's GQA
+work needs) and `kv_cache_bytes()` (measured KV-cache size from a real
+`past_key_values`, checked against the theoretical estimate). At this
+phase "LatentServe" *is* the Hugging Face model — no custom attention or
+KV-cache layout exists yet; that starts Phase 2. The point of Phase 1 is
+ground truth + a trustworthy measurement harness for everything after it.
+
+```bash
+export PYTHONPATH=$(pwd):$PYTHONPATH
+
+# Correctness harness (Gate 1): incremental decode vs. teacher-forced
+# logits, prefill+decode-step agreement, deterministic greedy generation,
+# KV-cache memory vs. theoretical estimate. Skips cleanly without
+# torch/transformers/CUDA/network instead of failing.
+pytest tests/test_phase1_correctness.py -v
+
+# Full context-length sweep (1/16/1K/4K/8K/16K), needs a real GPU:
+LATENTSERVE_LONG_CONTEXT_TESTS=1 pytest tests/test_phase1_correctness.py -v
+
+# Reference benchmark: load time, TTFT, TPOT, E2E, throughput, peak
+# VRAM, KV-cache memory, written to results/raw/phase1_reference.jsonl
+python -m benchmarks.runners.phase1_reference --config configs/phase1_reference.yaml
+```
+
+## Next: Phase 2
+
+Build LatentServe's own GQA + KV-cache execution path (`model/attention/gqa.py`,
+`cache/kv_cache.py`) around the same fixed Qwen weights, using
+`QwenReference.shape` for head/layer counts and `test_phase1_correctness.py`'s
+teacher-forced-vs-incremental pattern as the template for checking the
+custom path against ground truth. See `docs/methodology.md` Phase 2.

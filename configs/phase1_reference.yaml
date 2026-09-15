@@ -1,0 +1,36 @@
+# Phase 1 — Qwen2.5-1.5B-Instruct reference + correctness baseline.
+# See docs/methodology.md Phase 1 and benchmarks/runners/phase1_reference.py.
+#
+# attention.type is set to "mha" here as a label only: Phase 1 runs the
+# unmodified Hugging Face implementation end-to-end (no custom GQA/paged/
+# latent/sparse attention path exists yet — those start Phase 2 onward).
+# It is not read by model/qwen.py; it exists so this config validates
+# against config.py's schema and so results are labeled consistently in
+# results/raw/phase1_reference.jsonl.
+
+tag: phase1_reference
+
+model:
+  name: Qwen/Qwen2.5-1.5B-Instruct
+  dtype: fp16
+  max_position_embeddings: 131072
+
+attention:
+  type: mha
+
+runtime:
+  batch_size: 1
+  block_size: 16
+  scheduler: fifo
+  continuous_batching: false
+  prefix_caching: false
+
+generation:
+  input_tokens: 4096
+  output_tokens: 256
+  num_requests: 1
+  seed: 0
+  sampling: greedy
+
+hardware:
+  devices: [0]
