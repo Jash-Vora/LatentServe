@@ -153,7 +153,11 @@ class TimedGenerationResult:
 
     @property
     def output_tokens(self) -> int:
-        return len(self.decode_step_ms)
+        """Total generated tokens. Note this is len(decode_step_ms) + 1,
+        not len(decode_step_ms): the first output token comes from the
+        prefill step, not a decode_step call, so decode_step_ms alone
+        undercounts by exactly one."""
+        return int(self.output_ids.shape[-1])
 
     @property
     def ttft_ms(self) -> float:

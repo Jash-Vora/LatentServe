@@ -66,6 +66,23 @@ def ref() -> QwenReference:
     return QwenReference(dtype="fp16", device="cuda").load()
 
 
+@pytest.fixture(scope="module")
+def ref_fp32() -> QwenReference:
+    """fp32 variant used only for the numerical correctness gates
+    (1b/1c below). On the uniformly-random, out-of-distribution token
+    sequences `synthesize_input_ids` produces, fp16's accumulation-order
+    differences between the batched teacher-forced path and the
+    per-step/cached incremental path get amplified layer over layer
+    into mismatches far beyond ordinary rounding noise. fp32 removes
+    that precision axis so these tests isolate a real masking/RoPE/
+    cache bug (if one exists) instead of fp16 noise on adversarial
+    inputs. The actual serving-path benchmarks (`generate_with_timing`,
+    below) still use the fp16 `ref` fixture above, since fp16 is the
+    real deployment dtype and those tests aren't numerically comparing
+    two code paths against each other."""
+    return QwenReference(dtype="fp32", device="cuda").load()
+
+
 # ---------------------------------------------------------------------
 # Gate 1a — model loads and shape introspection is sane (feeds Phase 2's
 # GQA group-size math directly, so wrong values here would be silently
@@ -98,7 +115,8 @@ def test_shape_introspection_is_consistent(ref: QwenReference):
 
 @requires_model
 @pytest.mark.parametrize("num_tokens", SHORT_LENGTHS)
-def test_incremental_matches_teacher_forced(ref: QwenReference, num_tokens: int):
+def test_incremental_matches_teacher_forced(ref_fp32: QwenReference, num_tokens: int):
+    ref = ref_fp32
     input_ids = ref.synthesize_input_ids(num_tokens, seed=0)
 
     teacher_forced_logits = ref.forward_teacher_forced(input_ids)
@@ -119,11 +137,11 @@ def test_incremental_matches_teacher_forced(ref: QwenReference, num_tokens: int)
 @requires_model
 @pytest.mark.skipif(not _LONG, reason="set LATENTSERVE_LONG_CONTEXT_TESTS=1 to run")
 @pytest.mark.parametrize("num_tokens", LONG_LENGTHS)
-def test_incremental_matches_teacher_forced_long_context(ref: QwenReference, num_tokens: int):
+def test_incremental_matches_teacher_forced_long_context(ref_fp32: QwenReference, num_tokens: int):
     # Long-context version of the above. Kept separate so the fast
     # subset stays fast; incremental (token-by-token) decode at 16K
     # tokens means 16K sequential forward passes and is genuinely slow.
-    test_incremental_matches_teacher_forced(ref, num_tokens)
+    test_incremental_matches_teacher_forced(ref_fp32, num_tokens)
 
 
 # ---------------------------------------------------------------------
@@ -135,10 +153,11 @@ def test_incremental_matches_teacher_forced_long_context(ref: QwenReference, num
 
 @requires_model
 @pytest.mark.parametrize("num_tokens", SHORT_LENGTHS)
-def test_prefill_then_decode_matches_teacher_forced(ref: QwenReference, num_tokens: int):
+def test_prefill_then_decode_matches_teacher_forced(ref_fp32: QwenReference, num_tokens: int):
     if num_tokens < 2:
         pytest.skip("needs at least a 1-token prompt + 1 decode step to be meaningful")
 
+    ref = ref_fp32
     input_ids = ref.synthesize_input_ids(num_tokens, seed=1)
     prompt_ids, last_id = input_ids[:, :-1], input_ids[:, -1:]
 
