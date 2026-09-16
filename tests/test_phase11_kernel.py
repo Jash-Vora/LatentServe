@@ -262,6 +262,46 @@ def test_block_tables_tensor_matches_the_block_tables():
     assert cache.seq_lens_tensor(3).tolist() == [40, 40, 40]
 
 
+def test_kernel_inputs_are_built_once_per_step_not_per_layer():
+    """The tensors are built in `advance()` and handed out unchanged.
+
+    Rebuilding them per call cost ~20 ms per decode step — 28 Python
+    loops and 28 host-to-device copies, more than the gather this kernel
+    exists to remove. `_read_slots` is built once for the same reason,
+    and its docstring warned about exactly this.
+    """
+    from cache.kv_cache import KVCacheSpec
+    from cache.paged_cache import PagedKVCache
+
+    spec = KVCacheSpec(num_layers=28, num_kv_heads=2, head_dim=8, max_batch_size=2,
+                       max_seq_len=128, dtype=torch.float32, device="cpu")
+    cache = PagedKVCache(spec, block_size=16)
+    cache.advance(40, batch_size=2)
+    first = cache.block_tables_tensor(2)
+    # Every layer asks again during one step. What matters is that no
+    # rebuild and no copy happens — same storage, not necessarily the
+    # same Python object, since a partial-batch request returns a view.
+    for _ in range(28):
+        again = cache.block_tables_tensor(2)
+        assert again.data_ptr() == first.data_ptr()
+    partial = cache.block_tables_tensor(1)
+    assert partial.data_ptr() == first.data_ptr()
+    assert partial.shape[0] == 1
+
+
+def test_kernel_inputs_raise_before_advance():
+    """Better than returning a stale or empty table: the kernel would
+    read block 0 for every page and produce plausible nonsense."""
+    from cache.kv_cache import KVCacheSpec
+    from cache.paged_cache import PagedKVCache
+
+    spec = KVCacheSpec(num_layers=1, num_kv_heads=2, head_dim=8, max_batch_size=1,
+                       max_seq_len=32, dtype=torch.float32, device="cpu")
+    cache = PagedKVCache(spec, block_size=16)
+    with pytest.raises(RuntimeError, match="advance"):
+        cache.block_tables_tensor(1)
+
+
 def test_block_tables_grow_with_each_decode_step():
     """Rebuilt per advance, not cached: a stale table is a silent
     correctness bug rather than a crash."""

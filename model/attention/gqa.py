@@ -246,6 +246,7 @@ class GQAAttention(nn.Module):
                 k_zero=(getattr(cache, "k_zero_pool", None) or [None] * 99)[self.layer_idx],
                 v_zero=(getattr(cache, "v_zero_pool", None) or [None] * 99)[self.layer_idx],
                 softmax_scale=self.scaling,
+                max_seq_len=cache.max_len,
             )
             attn_out = out.reshape(b, self.num_attention_heads, 1, self.head_dim)
             attn_out = attn_out.transpose(1, 2).contiguous().view(b, s, -1)

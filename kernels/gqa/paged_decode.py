@@ -364,6 +364,7 @@ def paged_decode_attention(
     v_zero: Optional[torch.Tensor] = None,
     num_splits: Optional[int] = None,
     softmax_scale: Optional[float] = None,
+    max_seq_len: Optional[int] = None,
     force_reference: bool = False,
 ) -> torch.Tensor:
     """Dispatch to Triton when possible, else the reference.
@@ -380,8 +381,13 @@ def paged_decode_attention(
         )
 
     page = k_pool.shape[1]
-    max_len = int(seq_lens.max().item())
-    num_pages = (max_len + page - 1) // page
+    # `.item()` on a device tensor synchronizes. Called once per layer it
+    # is 28 syncs per decode step, which is the same class of error as
+    # rebuilding the block table per layer. The caller already knows the
+    # length as a Python int, so it passes it in.
+    if max_seq_len is None:
+        max_seq_len = int(seq_lens.max().item())
+    num_pages = (max_seq_len + page - 1) // page
     if num_splits is None:
         sms = torch.cuda.get_device_properties(q.device).multi_processor_count
         num_splits = max(1, min(num_pages, -(-sms // max(1, b * h_kv))))

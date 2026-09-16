@@ -93,6 +93,9 @@ class PagedKVCache:
         # would show up as "paging overhead" that is really a bug.
         self._read_slots: Optional[torch.Tensor] = None
         self._write_slots: Optional[torch.Tensor] = None
+        # Phase 11 kernel inputs, rebuilt alongside _read_slots.
+        self._block_tables: Optional[torch.Tensor] = None
+        self._seq_lens_tensor: Optional[torch.Tensor] = None
         # Which sequence slots participate in the next forward pass, in
         # batch order. Phase 3 always used range(batch_size); continuous
         # batching (Phase 4) needs holes — slot 3 can finish and be reused
@@ -144,6 +147,7 @@ class PagedKVCache:
         self.allocator.reset()
         self.tables = [BlockTable(self.allocator) for _ in range(self.spec.max_batch_size)]
         self._read_slots = self._write_slots = None
+        self._block_tables = self._seq_lens_tensor = None
         self._active = list(range(self.spec.max_batch_size))
         self.gather_calls = 0
 
@@ -207,6 +211,33 @@ class PagedKVCache:
                 self._read_slots[row, : len(seq_slots)] = torch.tensor(
                     seq_slots, dtype=torch.long, device=dev
                 )
+        self._rebuild_kernel_inputs()
+
+    def _rebuild_kernel_inputs(self) -> None:
+        """Block table and lengths as device tensors, for the Phase 11
+        kernel.
+
+        Built **once per step, in `advance()`**, for exactly the reason
+        `_read_slots` is: these are identical across all 28 layers, and
+        each rebuild is a Python loop plus a host-to-device copy. Doing
+        it inside attention instead cost ~20 ms per decode step — 28
+        rebuilds and 28 H2D transfers — which is more than the gather
+        this kernel exists to remove. The docstring above `_read_slots`
+        warned about precisely this; the kernel path did it anyway.
+        """
+        active = self._active
+        max_pages = max((len(self.tables[i].blocks) for i in active), default=0)
+        table = torch.zeros((len(active), max(1, max_pages)), dtype=torch.int32,
+                            device=self.device)
+        for r, i in enumerate(active):
+            blocks = self.tables[i].blocks
+            if blocks:
+                table[r, : len(blocks)] = torch.tensor(blocks, dtype=torch.int32,
+                                                       device=self.device)
+        self._block_tables = table
+        self._seq_lens_tensor = torch.tensor(
+            [self.tables[i].length for i in active], dtype=torch.int32, device=self.device
+        )
 
     def block_tables_tensor(self, batch_size: Optional[int] = None) -> torch.Tensor:
         """[B, max_pages] of physical block ids, for the Phase 11 kernel.
@@ -215,26 +246,19 @@ class PagedKVCache:
         into per-token slot indices. A kernel that walks the table itself
         needs the pages, not the slots — that difference is the whole
         point, since the slot form is what forces the copy.
-
-        Rebuilt on `advance()` rather than cached across calls: block
-        tables grow every decode step, and a stale table reads another
-        sequence's blocks while looking entirely healthy.
         """
-        rows = self._active if batch_size is None else list(self._active)[:batch_size]
-        max_pages = max((len(self.tables[i].blocks) for i in rows), default=0)
-        table = torch.zeros((len(rows), max(1, max_pages)), dtype=torch.int32,
-                            device=self.device)
-        for r, i in enumerate(rows):
-            blocks = self.tables[i].blocks
-            if blocks:
-                table[r, : len(blocks)] = torch.tensor(blocks, dtype=torch.int32,
-                                                       device=self.device)
-        return table
+        if self._block_tables is None:
+            raise RuntimeError("call advance() before block_tables_tensor()")
+        if batch_size is None or batch_size >= self._block_tables.shape[0]:
+            return self._block_tables
+        return self._block_tables[:batch_size]
 
     def seq_lens_tensor(self, batch_size: Optional[int] = None) -> torch.Tensor:
-        rows = self._active if batch_size is None else list(self._active)[:batch_size]
-        return torch.tensor([self.tables[i].length for i in rows], dtype=torch.int32,
-                            device=self.device)
+        if self._seq_lens_tensor is None:
+            raise RuntimeError("call advance() before seq_lens_tensor()")
+        if batch_size is None or batch_size >= self._seq_lens_tensor.shape[0]:
+            return self._seq_lens_tensor
+        return self._seq_lens_tensor[:batch_size]
 
     def padding_mask(self) -> Optional[torch.Tensor]:
         """Boolean keep-mask [B, 1, 1, max_len], or None when the batch is
