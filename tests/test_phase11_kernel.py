@@ -424,3 +424,40 @@ def test_tunables_are_per_call_not_module_level():
     for name in ("pages_per_iter", "num_warps", "num_stages", "num_splits"):
         assert name in params, f"{name} must be tunable per call"
         assert params[name].default is None, f"{name} should default to the module setting"
+
+
+@requires_gpu
+def test_kernel_path_does_not_gather():
+    """The whole point of Phase 11 is to stop staging the cache into an
+    fp16 buffer. Placed after `cache.read()`, the kernel branch paid the
+    gather *and* the kernel — torch.profiler showed 56 `aten::index`
+    calls per decode step, two per layer, on a path that should have
+    none. Counting the calls is the only way this stays fixed.
+    """
+    from model.latentserve_qwen import LatentServeQwen
+    from model.qwen import ModelShape
+
+    model, cfg = _tiny_model()
+    model = model.half().cuda()
+    shape = ModelShape(2, 8, 2, 16, 128, 128, 1024, "torch.float16")
+    prompt = torch.randint(0, 128, (1, 64)).cuda()
+
+    def gather_calls(impl: str) -> int:
+        ls = LatentServeQwen(hf_model=model, tokenizer=None, shape=shape, device="cuda",
+                             attn_impl=impl, max_seq_len_hint=256)
+        ls.allocate_cache(1, 256, paged=True, block_size=16)
+        ls.cache.reset()
+        ls.prefill(prompt)
+        token = torch.zeros(1, 1, dtype=torch.long, device="cuda")
+        ls.decode_step(token)                       # warm up
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA]
+        ) as prof:
+            ls.decode_step(token)
+            torch.cuda.synchronize()
+        return sum(
+            e.count for e in prof.key_averages() if e.key in ("aten::index", "aten::index_select")
+        )
+
+    assert gather_calls("sdpa") > 0, "the SDPA path gathers, by construction"
+    assert gather_calls("triton_paged") == 0, "the kernel path must not gather"

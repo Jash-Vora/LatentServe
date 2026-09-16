@@ -208,44 +208,28 @@ class GQAAttention(nn.Module):
 
         k, v = self._project_kv_for_cache(k, v)
         cache.write(self.layer_idx, k, v, start_pos)
-        # Ask the cache how much it holds rather than deriving it from
-        # start_pos. In a ragged batch (Phase 4) rows sit at different
-        # positions, so `start_pos + s` describes no one; and since
-        # advance() now runs before the layer loop, the cache's own length
-        # is already correct for the uniform case too.
-        k_all, v_all = cache.read(self.layer_idx, b)
-        kv_len = k_all.shape[2]
 
         # A paged cache pads ragged batches to the longest sequence; those
         # pad slots hold another sequence's tokens and must be masked.
         # Uniform batches (all of Phase 2 and 3's benchmarks) get None.
         key_mask = cache.padding_mask()
-        if key_mask is not None and s > 1:
-            raise NotImplementedError(
-                "ragged prefill needs a combined causal+padding mask; Phase 3 "
-                "benchmarks uniform batches and ragged execution lands in Phase 4"
-            )
 
-        cached_kv_heads = k_all.shape[1]
-        n_rep = self.num_attention_heads // cached_kv_heads
-
+        # The kernel branch has to come *before* cache.read(). Placed
+        # after it, every layer gathered the whole cache into an fp16
+        # buffer and the kernel then ignored it and re-read the pool —
+        # paying the gather this phase exists to remove, plus the kernel.
+        # torch.profiler showed it plainly: 56 `aten::index` calls per
+        # decode step, two per layer, on a path that should have none.
         if (
             s == 1
             and self.attn_impl == "triton_paged"
             and hasattr(cache, "block_tables_tensor")
             and key_mask is None
         ):
-            # Read the cache in place: no gather, no fp16 staging buffer.
-            # Phase 3 measured the gather at 2x resident KV per step
-            # (17.3 ms at 8K/batch 4); Phase 7.3 measured the INT8
-            # dequantize pass on top of it. This path pays neither.
-            #
-            # Ragged batches fall through to the gather for now: the
-            # kernel masks per sequence from `seq_lens`, but the padding
-            # mask above is built for the staged layout, and mixing the
-            # two would be a correctness risk for no measurement gain.
             from kernels.gqa.paged_decode import paged_decode_attention
 
+            cached_kv_heads = k.shape[1]
+            n_rep = self.num_attention_heads // cached_kv_heads
             q_folded = q.reshape(b, cached_kv_heads, n_rep, self.head_dim)
             out = paged_decode_attention(
                 q_folded,
@@ -263,6 +247,22 @@ class GQAAttention(nn.Module):
             attn_out = out.reshape(b, self.num_attention_heads, 1, self.head_dim)
             attn_out = attn_out.transpose(1, 2).contiguous().view(b, s, -1)
             return self.o_proj(attn_out)
+
+        # Ask the cache how much it holds rather than deriving it from
+        # start_pos. In a ragged batch (Phase 4) rows sit at different
+        # positions, so `start_pos + s` describes no one; and since
+        # advance() now runs before the layer loop, the cache's own length
+        # is already correct for the uniform case too.
+        k_all, v_all = cache.read(self.layer_idx, b)
+        kv_len = k_all.shape[2]
+        if key_mask is not None and s > 1:
+            raise NotImplementedError(
+                "ragged prefill needs a combined causal+padding mask; Phase 3 "
+                "benchmarks uniform batches and ragged execution lands in Phase 4"
+            )
+
+        cached_kv_heads = k_all.shape[1]
+        n_rep = self.num_attention_heads // cached_kv_heads
 
         if s == 1 and n_rep > 1 and self.kv_expansion == "fold":
             # Decode: no mask is needed (one query attends to everything),
