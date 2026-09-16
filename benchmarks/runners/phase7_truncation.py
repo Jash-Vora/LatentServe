@@ -109,6 +109,24 @@ def measure(ref, ids, chunk_size: int, install_fn) -> dict:
     return meter.result()
 
 
+def effective_ratio(
+    n_per_token: int, k_bits: int, v_bits: int, block: int,
+    k_asym: bool = True, v_asym: bool = True, num_heads: int = 2,
+) -> float:
+    """fp16 bytes / (payload + scale metadata), per token per layer.
+
+    The nominal 16/bits ignores the scales, which are real storage: one
+    per (head, channel) per block for K, one per (token, head) for V, and
+    two values each when asymmetric because a zero-point rides along.
+    Quoting nominal would repeat 7.1's mistake of reporting a ratio that
+    the implementation does not deliver.
+    """
+    fp16 = 2 * n_per_token * 2
+    k = n_per_token * k_bits / 8 + n_per_token * (2 if k_asym else 1) * 2 / block
+    v = n_per_token * v_bits / 8 + num_heads * (2 if v_asym else 1) * 2
+    return fp16 / (k + v)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--config", default="configs/phase2_gqa.yaml")
@@ -120,6 +138,17 @@ def main() -> int:
     p.add_argument("--quant-bits", type=int, nargs="+", default=None,
                    help="bit-width sweep. INT8 costs 0.000%% of argmax decisions on real "
                    "text, so the open question is where quantization actually breaks.")
+    p.add_argument("--kv-bit-pairs", nargs="+", default=None, metavar="K:V",
+                   help="uneven K/V bit allocations, e.g. 4:8 4:6 3:6. Measured: K4/V8 beats "
+                   "K8/V4 by 4.8x in KL at identical memory, so the efficient frontier is "
+                   "K-light and V-heavy. K has effective rank 5.6, so per-channel scaling "
+                   "already gives each channel a tight range and few bits cover it; V has "
+                   "effective rank 72, so one per-token scale must span many channels and "
+                   "needs bits to resolve them.")
+    p.add_argument("--block-sizes", type=int, nargs="+", default=None,
+                   help="sweep the K block size. Asymmetric stores a zero-point alongside "
+                   "each scale, so per-block overhead doubles: 25%% of the int8 K payload at "
+                   "block 16, 6%% at block 64. Reported as effective_ratio, not nominal.")
     p.add_argument("--block-size", type=int, default=16,
                    help="block-local per-channel K scaling, as 7.3 measured. Scales computed "
                    "over the whole sequence are not implementable in a streaming cache, so "
@@ -178,13 +207,45 @@ def main() -> int:
             k_mode=k_mode, v_mode=v_mode,
         )
 
+    n_per_token = heads * head_dim
+
+    if args.block_sizes:
+        print("\n=== K block size, asymmetric (quality vs. scale overhead) ===")
+        for block in args.block_sizes:
+            for bits in (args.quant_bits or [8]):
+                record(
+                    f"int{bits} asym block={block}",
+                    effective_ratio(n_per_token, bits, bits, block, num_heads=heads),
+                    measure(ref, ids, args.chunk_size,
+                            lambda b=bits, bl=block: install_quantization(
+                                ref.model, "per_channel", "per_token", heads, head_dim,
+                                bits=b, asymmetric=True, k_block_size=bl)),
+                    bits=bits, asymmetric=True, block_size=block,
+                )
+
+    if args.kv_bit_pairs:
+        print(f"\n=== uneven K/V allocation, asymmetric (block={args.block_size}) ===")
+        for pair in args.kv_bit_pairs:
+            k_bits, v_bits = (int(x) for x in pair.split(":"))
+            record(
+                f"K{k_bits}/V{v_bits} asym",
+                effective_ratio(n_per_token, k_bits, v_bits, args.block_size, num_heads=heads),
+                measure(ref, ids, args.chunk_size,
+                        lambda kb=k_bits, vb=v_bits: install_quantization(
+                            ref.model, "per_channel", "per_token", heads, head_dim,
+                            k_bits=kb, v_bits=vb, asymmetric=True,
+                            k_block_size=args.block_size)),
+                k_bits=k_bits, v_bits=v_bits, block_size=args.block_size,
+            )
+
     if args.quant_bits:
         print(f"\n=== bit-width sweep, K per-channel (block={args.block_size}) / V per-token ===")
         for bits in args.quant_bits:
             for asym in (False, True):
                 record(
                     f"int{bits}{' asym' if asym else '     '} block={args.block_size}",
-                    16 / bits,
+                    effective_ratio(n_per_token, bits, bits, args.block_size,
+                                    k_asym=asym, v_asym=asym, num_heads=heads),
                     measure(ref, ids, args.chunk_size,
                             lambda b=bits, a=asym: install_quantization(
                                 ref.model, "per_channel", "per_token", heads, head_dim,
@@ -192,10 +253,12 @@ def main() -> int:
                     bits=bits, asymmetric=asym, block_size=args.block_size,
                 )
 
-        print("\n=== uneven K/V allocation (K is the sensitive side) ===")
-        for k_bits, v_bits in ((8, 4), (8, 3), (6, 4), (5, 3), (4, 8)):
+        print("\n=== uneven K/V allocation (legacy fixed pairs) ===")
+        for k_bits, v_bits in (() if args.kv_bit_pairs else ((8, 4), (8, 3), (6, 4), (5, 3), (4, 8))):
             record(
-                f"K{k_bits}/V{v_bits} bits", 2 * 16 / (k_bits + v_bits),
+                f"K{k_bits}/V{v_bits} bits",
+                effective_ratio(heads * head_dim, k_bits, v_bits, args.block_size,
+                                num_heads=heads),
                 measure(ref, ids, args.chunk_size,
                         lambda kb=k_bits, vb=v_bits: install_quantization(
                             ref.model, "per_channel", "per_token", heads, head_dim,
