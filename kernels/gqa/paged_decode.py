@@ -58,6 +58,7 @@ CPU, so the logic is testable without a GPU.
 from __future__ import annotations
 
 import math
+import os
 from typing import Optional
 
 import torch
@@ -73,6 +74,17 @@ except ImportError:  # pragma: no cover
 # Pages per program, bounding the length of the serial online-softmax
 # chain. 32 pages at block 16 is 512 tokens per program.
 TARGET_PAGES_PER_SPLIT = 32
+
+# Pages fetched per loop iteration. One 16-token page is 4 KB of K and
+# 4 KB of V, and the online-softmax dependency serialises the iterations,
+# so memory latency is never hidden: the kernel measured ~27 GB/s of KV
+# against the ~105 GB/s the gather+SDPA path achieves on 3x the bytes.
+# Four pages give a 64-token tile, which is a real `tl.dot` N dimension
+# and enough in flight to pipeline. Set LATENTSERVE_PAGES_PER_ITER=1 to
+# fall back to the untiled kernel if the tiled one misbehaves.
+PAGES_PER_ITER = int(os.environ.get("LATENTSERVE_PAGES_PER_ITER", "4"))
+NUM_STAGES = int(os.environ.get("LATENTSERVE_NUM_STAGES", "3"))
+NUM_WARPS = int(os.environ.get("LATENTSERVE_NUM_WARPS", "4"))
 
 
 # ----------------------------------------------------------------------
@@ -407,6 +419,120 @@ def _scratch(key, shape, dtype, device, fill=None):
     return buf
 
 
+if HAS_TRITON:  # pragma: no cover - requires a GPU
+
+    @triton.jit
+    def _paged_decode_tiled(
+        Q, K_pool, V_pool, K_scale, V_scale, K_zero, V_zero,
+        BlockTables, SeqLens, PartialOut, PartialM, PartialL,
+        stride_qb, stride_qh, stride_qm, stride_qd,
+        stride_kb, stride_kp, stride_kh, stride_kd,
+        stride_ksb, stride_ksh, stride_ksd,
+        stride_vsb, stride_vsp, stride_vsh,
+        stride_btb, stride_btp,
+        stride_ob, stride_oh, stride_os, stride_om, stride_od,
+        stride_mb, stride_mh, stride_ms, stride_mm,
+        softmax_scale, num_splits,
+        N_REP: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
+        PAGE: tl.constexpr, PPI: tl.constexpr,
+        IS_INT8: tl.constexpr, ASYM: tl.constexpr,
+    ):
+        """Same algorithm, PPI pages per iteration.
+
+        Pages are scattered, so a run of logical pages is not contiguous
+        in memory and each one has to be addressed through its own block
+        id. The load is therefore 3D — [PPI, PAGE, D] — and reshaped to a
+        [PPI*PAGE, D] tile so `tl.dot` sees a 64-token N dimension
+        instead of 16.
+        """
+        b = tl.program_id(0)
+        split = tl.program_id(1)
+        h = tl.program_id(2)
+
+        offs_m = tl.arange(0, BLOCK_M)
+        offs_d = tl.arange(0, BLOCK_D)
+        offs_p = tl.arange(0, PAGE)
+        offs_i = tl.arange(0, PPI)
+        row_valid = offs_m < N_REP
+
+        q = tl.load(
+            Q + b * stride_qb + h * stride_qh
+            + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd,
+            mask=row_valid[:, None], other=0.0,
+        )
+
+        seq_len = tl.load(SeqLens + b)
+        num_pages = tl.cdiv(seq_len, PAGE)
+        pages_per_split = tl.cdiv(num_pages, num_splits)
+        lo = split * pages_per_split
+        hi = tl.minimum(lo + pages_per_split, num_pages)
+
+        m_i = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
+        l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+
+        for p0 in range(lo, hi, PPI):
+            pages = p0 + offs_i
+            page_ok = pages < hi
+            blk = tl.load(BlockTables + b * stride_btb + pages * stride_btp,
+                          mask=page_ok, other=0)
+
+            k = tl.load(
+                K_pool + blk[:, None, None] * stride_kb
+                + offs_p[None, :, None] * stride_kp + h * stride_kh
+                + offs_d[None, None, :] * stride_kd
+            )
+            v = tl.load(
+                V_pool + blk[:, None, None] * stride_kb
+                + offs_p[None, :, None] * stride_kp + h * stride_kh
+                + offs_d[None, None, :] * stride_kd
+            )
+
+            if IS_INT8:
+                ks = tl.load(K_scale + blk[:, None] * stride_ksb + h * stride_ksh
+                             + offs_d[None, :] * stride_ksd)
+                vs = tl.load(V_scale + blk[:, None] * stride_vsb
+                             + offs_p[None, :] * stride_vsp + h * stride_vsh)
+                k = k.to(tl.float32) * ks[:, None, :]
+                v = v.to(tl.float32) * vs[:, :, None]
+                if ASYM:
+                    kz = tl.load(K_zero + blk[:, None] * stride_ksb + h * stride_ksh
+                                 + offs_d[None, :] * stride_ksd)
+                    vz = tl.load(V_zero + blk[:, None] * stride_vsb
+                                 + offs_p[None, :] * stride_vsp + h * stride_vsh)
+                    k = k + kz[:, None, :]
+                    v = v + vz[:, :, None]
+
+            k = tl.reshape(k, (PPI * PAGE, BLOCK_D)).to(q.dtype)
+            v = tl.reshape(v, (PPI * PAGE, BLOCK_D)).to(q.dtype)
+
+            tokens = tl.reshape(pages[:, None] * PAGE + offs_p[None, :], (PPI * PAGE,))
+            valid = tl.reshape(
+                page_ok[:, None] & (offs_p[None, :] >= 0), (PPI * PAGE,)
+            ) & (tokens < seq_len)
+
+            qk = tl.dot(q, tl.trans(k)) * softmax_scale
+            qk = tl.where(valid[None, :] & row_valid[:, None], qk, float("-inf"))
+
+            m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+            alpha = tl.where(m_new == float("-inf"), 0.0, tl.exp(m_i - m_new))
+            pw = tl.exp(qk - m_new[:, None])
+            pw = tl.where(valid[None, :], pw, 0.0)
+            l_i = l_i * alpha + tl.sum(pw, axis=1)
+            acc = acc * alpha[:, None] + tl.dot(pw.to(v.dtype), v)
+            m_i = m_new
+
+        tl.store(
+            PartialOut + b * stride_ob + h * stride_oh + split * stride_os
+            + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od,
+            acc, mask=row_valid[:, None],
+        )
+        tl.store(PartialM + b * stride_mb + h * stride_mh + split * stride_ms
+                 + offs_m * stride_mm, m_i, mask=row_valid)
+        tl.store(PartialL + b * stride_mb + h * stride_mh + split * stride_ms
+                 + offs_m * stride_mm, l_i, mask=row_valid)
+
+
 def combine_splits(
     partial_acc: torch.Tensor, partial_m: torch.Tensor, partial_l: torch.Tensor,
     out_dtype: torch.dtype,
@@ -489,7 +615,9 @@ def paged_decode_attention(
     out = _scratch("out", (b, h_kv, 16, d), q.dtype, q.device)
 
     dummy = torch.empty(1, device=q.device)
-    _paged_decode_kernel[(b, num_splits, h_kv)](
+    kernel = _paged_decode_tiled if PAGES_PER_ITER > 1 else _paged_decode_kernel
+    extra = {"PPI": PAGES_PER_ITER} if PAGES_PER_ITER > 1 else {}
+    kernel[(b, num_splits, h_kv)](
         q, k_pool, v_pool,
         k_scale if k_scale is not None else dummy,
         v_scale if v_scale is not None else dummy,
@@ -502,7 +630,8 @@ def paged_decode_attention(
         *block_tables.stride(), *partial_acc.stride(), *partial_m.stride(),
         scale, num_splits,
         N_REP=n_rep, BLOCK_M=16, BLOCK_D=d, PAGE=page,
-        IS_INT8=is_int8, ASYM=asym,
+        IS_INT8=is_int8, ASYM=asym, **extra,
+        num_warps=NUM_WARPS, num_stages=NUM_STAGES,
     )
     _combine_kernel[(b, h_kv)](
         partial_acc, partial_m, partial_l, out,
