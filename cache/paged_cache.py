@@ -103,38 +103,6 @@ class PagedKVCache:
         self._active: list[int] = list(range(spec.max_batch_size))
         self.gather_calls = 0
 
-        # ------------------------------------------------------------------
-        # Persistent step buffers (Phase 13 — CUDA graph prerequisite).
-        #
-        # `advance()` used to allocate `_write_slots`/`_read_slots`/
-        # `_block_tables`/`_seq_lens_tensor` fresh every call. That's fine
-        # eagerly, but a captured graph holds pointers to whatever address
-        # was live at capture time — if `advance()` hands the kernel a new
-        # tensor next step, the graph replays against stale or freed
-        # memory. So these are allocated once, at worst-case size, and
-        # every `advance()` call writes into them via `copy_`/slicing
-        # instead of reassigning the attribute. `_write_slots`,
-        # `_read_slots`, `_block_tables`, `_seq_lens_tensor` become VIEWS
-        # into these buffers (`buf[:b, :width]`), not the buffers
-        # themselves — a view's base address is fixed as long as the
-        # slice always starts at row/col 0, which it does here. Bucketed
-        # graph capture (picking a fixed (batch, page-bucket) shape and
-        # reusing the same view shape across replays) builds directly on
-        # top of this.
-        max_pages = -(-spec.max_seq_len // block_size)
-        self._write_slots_buf = torch.zeros(
-            (spec.max_batch_size, spec.max_seq_len), dtype=torch.long, device=self.device
-        )
-        self._read_slots_buf = torch.zeros(
-            (spec.max_batch_size, spec.max_seq_len), dtype=torch.long, device=self.device
-        )
-        self._block_tables_buf = torch.zeros(
-            (spec.max_batch_size, max_pages), dtype=torch.int32, device=self.device
-        )
-        self._seq_lens_buf = torch.zeros(
-            (spec.max_batch_size,), dtype=torch.int32, device=self.device
-        )
-
     # ------------------------------------------------------------------
     # State
     # ------------------------------------------------------------------
@@ -222,14 +190,7 @@ class PagedKVCache:
             self.tables[i].append(n)
 
         dev = self.device
-        b = len(active)
-
-        # Build the new write-slot rows as a small transient tensor, then
-        # `copy_` into the persistent buffer. The transient source here
-        # is fine — it never gets read by anything downstream — what has
-        # to stay stable is the *destination* address the kernel and any
-        # captured graph read from, which is `self._write_slots_buf`.
-        write_src = torch.tensor(
+        self._write_slots = torch.tensor(
             [
                 [self.tables[i].slot(p) for p in range(start, start + n)]
                 for i, start in zip(active, starts)
@@ -237,31 +198,19 @@ class PagedKVCache:
             dtype=torch.long,
             device=dev,
         )
-        self._write_slots_buf[:b, :n].copy_(write_src)
-        self._write_slots = self._write_slots_buf[:b, :n]
-
+        b = len(active)
         max_len = self.max_len
         # Pad short sequences with slot 0. Padded positions must be
         # masked out by the caller (`padding_mask` below); block 0 is
         # never left unwritten in practice, so an unmasked pad would
         # silently attend to another sequence's tokens.
-        #
-        # The read-slot buffer isn't append-only — it's fully rebuilt
-        # from position 0 every step (row `i` may need fewer slots than
-        # last step if bucketed, or a shorter row may sit next to a
-        # longer one) — so the region beyond each row's real length must
-        # be explicitly zeroed rather than assumed zero, since the
-        # buffer is reused across steps and may hold longer, non-zero
-        # rows from a previous call.
-        view = self._read_slots_buf[:b, :max_len]
-        view.zero_()
+        self._read_slots = torch.zeros((b, max_len), dtype=torch.long, device=dev)
         for row, i in enumerate(active):
             seq_slots = self.tables[i].slots()
             if seq_slots:
-                view[row, : len(seq_slots)] = torch.tensor(
+                self._read_slots[row, : len(seq_slots)] = torch.tensor(
                     seq_slots, dtype=torch.long, device=dev
                 )
-        self._read_slots = view
         self._rebuild_kernel_inputs()
 
     def _rebuild_kernel_inputs(self) -> None:
@@ -275,32 +224,20 @@ class PagedKVCache:
         rebuilds and 28 H2D transfers — which is more than the gather
         this kernel exists to remove. The docstring above `_read_slots`
         warned about precisely this; the kernel path did it anyway.
-
-        Writes into `_block_tables_buf`/`_seq_lens_buf` (persistent) via
-        slicing + `copy_`, same reasoning as `advance()` above: whatever
-        the Phase 11 kernel (and eventually a captured graph) reads from
-        must be a stable address across steps, not a fresh tensor.
         """
         active = self._active
-        b = len(active)
         max_pages = max((len(self.tables[i].blocks) for i in active), default=0)
-        max_pages = max(1, max_pages)
-
-        table_view = self._block_tables_buf[:b, :max_pages]
-        table_view.zero_()
+        table = torch.zeros((len(active), max(1, max_pages)), dtype=torch.int32,
+                            device=self.device)
         for r, i in enumerate(active):
             blocks = self.tables[i].blocks
             if blocks:
-                table_view[r, : len(blocks)] = torch.tensor(
-                    blocks, dtype=torch.int32, device=self.device
-                )
-        self._block_tables = table_view
-
-        lens_src = torch.tensor(
+                table[r, : len(blocks)] = torch.tensor(blocks, dtype=torch.int32,
+                                                       device=self.device)
+        self._block_tables = table
+        self._seq_lens_tensor = torch.tensor(
             [self.tables[i].length for i in active], dtype=torch.int32, device=self.device
         )
-        self._seq_lens_buf[:b].copy_(lens_src)
-        self._seq_lens_tensor = self._seq_lens_buf[:b]
 
     def block_tables_tensor(self, batch_size: Optional[int] = None) -> torch.Tensor:
         """[B, max_pages] of physical block ids, for the Phase 11 kernel.
