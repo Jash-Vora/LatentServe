@@ -209,6 +209,10 @@ def main() -> int:
     p.add_argument("--random-tokens", action="store_true",
                    help="control run on out-of-distribution ids; not a valid measurement")
     p.add_argument("--device", default=None)
+    p.add_argument("--gram-device", default="cpu", choices=["cpu", "cuda"],
+                   help="where the d x d accumulators live. cpu keeps VRAM free for the "
+                   "fp32 model (~6.2 GB) at the cost of a small transfer per chunk; "
+                   "cuda is faster but adds ~125 MB and competes with the forward pass")
     p.add_argument("--results-dir", default="results/raw")
     p.add_argument("--figures-dir", default="results/figures")
     args = p.parse_args()
@@ -235,7 +239,9 @@ def main() -> int:
           f"{'random ids' if args.random_tokens else (args.text_file or 'embedded passages')}")
 
     rope = RotaryEmbedding.from_hf_config(ref.model.config, max_seq_len=ids.shape[1], device=device)
-    capture = KVCapture(ref.model, shape, rope, device="cpu")
+    gram_device = device if args.gram_device == "cuda" else "cpu"
+    capture = KVCapture(ref.model, shape, rope, device=gram_device)
+    print(f"accumulating Gram matrices on {gram_device}")
     with torch.no_grad():
         for start in range(0, ids.shape[1], args.chunk_size):
             ref.model(input_ids=ids[:, start : start + args.chunk_size], use_cache=False)

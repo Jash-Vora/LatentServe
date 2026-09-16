@@ -78,8 +78,14 @@ class SpectrumAccumulator:
         self.count = 0
 
     def update(self, x: torch.Tensor) -> None:
-        """x: [..., dim]. Flattened over every leading axis."""
-        flat = x.reshape(-1, self.dim).to(torch.float64)
+        """x: [..., dim]. Flattened over every leading axis.
+
+        Moved to the accumulator's own device and dtype rather than
+        assuming the caller matched them: activations arrive wherever the
+        model lives, while the Gram may be held on CPU to keep VRAM free
+        for the model itself.
+        """
+        flat = x.reshape(-1, self.dim).to(device=self.device, dtype=torch.float64)
         self.gram += flat.T @ flat
         self.count += flat.shape[0]
 
