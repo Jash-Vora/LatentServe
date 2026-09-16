@@ -276,3 +276,251 @@ def test_int8_paged_survives_churn_and_stays_coherent(tiny_model, tiny_shape):
         out = ls.forward_logits_all(ids)
     assert torch.isfinite(out).all()
     assert ls.cache.allocator.num_used == ls.cache.allocator.blocks_for_tokens(20)
+
+
+# ----------------------------------------------------------------------
+# Regressions — each of these failed against the first version of
+# Int8PagedKVCache, and none of them showed up as a crash. The quality
+# and capacity tests above all passed while the cache was gathering
+# through FP32 temporaries and synchronizing with the device once per
+# written token, which is why they are pinned separately here.
+# ----------------------------------------------------------------------
+
+
+def _reference_roundtrip(k, v, block_size, heads, dim, seq_len):
+    """What the cache is *supposed* to return, built from the offline
+    simulation this phase's numbers came from: K quantized block-locally
+    (compression/truncation.py's `quantize_dequantize_block_local`, the
+    realizable scale fit 7.2b measured), V per-token, and the sequence's
+    still-filling tail left exact because it has not been quantized yet.
+    """
+    from compression.truncation import (
+        quantize_dequantize,
+        quantize_dequantize_block_local,
+    )
+
+    n = k.shape[2]
+    flat = k.permute(0, 2, 1, 3).reshape(1, n, heads * dim)
+    k_ref = (
+        quantize_dequantize_block_local(flat, heads, dim, block_size)
+        .reshape(1, n, heads, dim)
+        .permute(0, 2, 1, 3)
+        .clone()
+    )
+    tail = seq_len % block_size
+    if tail:
+        k_ref[:, :, seq_len - tail : seq_len] = k[:, :, seq_len - tail : seq_len]
+    flat_v = v.permute(0, 2, 1, 3).reshape(1, n, heads * dim)
+    v_ref = (
+        quantize_dequantize(flat_v, "per_token", heads, dim)
+        .reshape(1, n, heads, dim)
+        .permute(0, 2, 1, 3)
+    )
+    return k_ref, v_ref
+
+
+@pytest.mark.parametrize("block_size", [2, 4, 8, 16])
+@pytest.mark.parametrize("total", [1, 7, 16, 17, 33, 65])
+@pytest.mark.parametrize("chunk", [None, 1, 3, 5])
+def test_matches_the_offline_reference_under_any_chunking(block_size, total, chunk):
+    """The head/middle/tail split in `write()` must be invisible: the
+    same tokens must land on the same INT8 values whether they arrive as
+    one prefill, as single decode steps, or as chunks that never line up
+    with a block boundary. This is the property the whole residual
+    mechanism exists to provide, and the one a vectorized write path is
+    most likely to break — a chunk crossing a boundary has to finalize
+    exactly the blocks it completed and no others.
+    """
+    torch.manual_seed(total * 100 + block_size)
+    heads, dim = 2, 8
+    spec = tiny_spec(batch=1, max_seq=256, heads=heads, dim=dim)
+    cache = Int8PagedKVCache(spec, block_size=block_size)
+
+    k = torch.randn(1, heads, total, dim)
+    v = torch.randn(1, heads, total, dim)
+    sizes = [total] if chunk is None else [chunk] * (total // chunk) + (
+        [total % chunk] if total % chunk else []
+    )
+    pos = 0
+    for n in sizes:
+        cache.advance(n, batch_size=1)
+        cache.write(0, k[:, :, pos : pos + n], v[:, :, pos : pos + n])
+        pos += n
+
+    k_out, v_out = cache.read(0, batch_size=1)
+    k_ref, v_ref = _reference_roundtrip(k, v, block_size, heads, dim, total)
+    torch.testing.assert_close(k_out, k_ref, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(v_out, v_ref, rtol=1e-5, atol=1e-5)
+
+
+def test_read_with_length_puts_the_residual_where_it_belongs():
+    """`read(length=L)` returns a prefix of the sequence, but the
+    residual holds the tail of the *whole* sequence. Locating the splice
+    at `L % block_size` therefore wrote the newest tokens over positions
+    that belong to an already-finalized block: a truncated read
+    disagreed with the full read on tokens both of them cover.
+
+    Nothing on the decode path passes `length` today (`GQAAttention`
+    calls `read(layer, b)`), so this was silent — and would have stayed
+    silent right up until the first caller that wanted a prefix.
+    """
+    torch.manual_seed(0)
+    spec = tiny_spec(batch=1, max_seq=128, heads=2, dim=8)
+    cache = Int8PagedKVCache(spec, block_size=16)
+    cache.advance(40, batch_size=1)
+    cache.write(0, torch.randn(1, 2, 40, 8), torch.randn(1, 2, 40, 8))
+
+    k_full, v_full = cache.read(0, batch_size=1)
+    k_prefix, v_prefix = cache.read(0, batch_size=1, length=20)
+    torch.testing.assert_close(k_prefix, k_full[:, :, :20], rtol=0, atol=0)
+    torch.testing.assert_close(v_prefix, v_full[:, :, :20], rtol=0, atol=0)
+
+
+def test_write_never_reads_a_device_tensor_back_to_the_host():
+    """Every index `write()` needs is derivable from the block tables,
+    which are plain Python (cache/block_allocator.py is deliberately
+    tensor-free). Pulling them out of the slot *tensor* instead cost one
+    device synchronization per token per layer — ~129,000 per 4096-token
+    prefill chunk on a 28-layer model — which is a stall the size of the
+    prefill itself and was most of the INT8 TTFT regression.
+
+    On CPU a `.item()`/`int()` is cheap enough to hide, so this asserts
+    on the count rather than on a timing, and therefore catches the
+    regression on the machine the tests actually run on.
+    """
+    spec = tiny_spec(batch=2, max_seq=256, heads=2, dim=8)
+    cache = Int8PagedKVCache(spec, block_size=16)
+    cache.advance(64, batch_size=2)
+
+    readbacks = {"n": 0}
+    patched = ("__int__", "__float__", "item", "tolist")
+    originals = {name: getattr(torch.Tensor, name) for name in patched}
+
+    def make_counter(original):
+        def counted(self, *args, **kwargs):
+            readbacks["n"] += 1
+            return original(self, *args, **kwargs)
+
+        return counted
+
+    for name, original in originals.items():
+        setattr(torch.Tensor, name, make_counter(original))
+    try:
+        cache.write(0, torch.randn(2, 2, 64, 8), torch.randn(2, 2, 64, 8))
+    finally:
+        for name, original in originals.items():
+            setattr(torch.Tensor, name, original)
+
+    assert readbacks["n"] == 0, (
+        f"write() synchronized with the device {readbacks['n']} times; "
+        "the block tables already hold every index it needs"
+    )
+
+
+def test_fp16_zero_block_does_not_divide_by_a_vanished_epsilon():
+    """`clamp_min(1e-8)` is not a floor in FP16: the smallest subnormal
+    is ~6e-8, so the constant rounds to zero and an all-zero channel
+    divides its own absmax by zero. The NaN that produced only failed to
+    show because NaN-to-int8 is undefined and happened to land on a
+    value the (also zero) scale multiplied away.
+
+    Fitting the scale in FP32 makes the floor real. The check is run in
+    FP16 specifically — `tiny_spec` is FP32 everywhere else in this
+    file, which is exactly why the original slipped through.
+    """
+    spec = KVCacheSpec(
+        num_layers=1, num_kv_heads=2, head_dim=8, max_batch_size=1,
+        max_seq_len=64, dtype=torch.float16, device="cpu",
+    )
+    cache = Int8PagedKVCache(spec, block_size=8)
+    cache.advance(8, batch_size=1)
+    zeros = torch.zeros(1, 2, 8, 8, dtype=torch.float16)
+    cache.write(0, zeros, zeros)
+
+    k_out, v_out = cache.read(0, batch_size=1)
+    assert torch.isfinite(k_out).all() and torch.isfinite(v_out).all()
+    assert (k_out == 0).all() and (v_out == 0).all()
+
+
+def test_gather_traffic_counts_the_dequantized_buffer():
+    """The gather does not hand SDPA the bytes it read: it reads INT8,
+    writes an INT8 buffer, reads that back, and writes an FP16 one.
+    Reporting `2 * INT8 bytes` described a fused kernel that does not
+    exist yet (Phase 11) and made the headline gather figure ~2.4x
+    smaller than the traffic actually moved — which inverted the sign of
+    the comparison against FP16 paged in the benchmark output.
+    """
+    from cache.paged_cache import PagedKVCache
+
+    spec = KVCacheSpec(
+        num_layers=28, num_kv_heads=2, head_dim=128, max_batch_size=1,
+        max_seq_len=4096, dtype=torch.float16, device="cpu",
+    )
+    int8 = Int8PagedKVCache(spec, block_size=16)
+    fp16 = PagedKVCache(spec, block_size=16)
+    for cache in (int8, fp16):
+        cache.advance(1024, batch_size=1)
+
+    int8_gather = int8.gather_bytes_per_decode_step(1)
+    fp16_gather = fp16.gather_bytes_per_decode_step(1)
+    # Storage really is about half...
+    assert 0.45 < int8.bytes_per_token / spec.bytes_per_token < 0.6
+    # ...and traffic really is somewhat more, not less.
+    assert int8_gather > fp16_gather, (
+        "INT8 gather+dequantize moves more bytes than an FP16 gather; a "
+        "reported reduction means the dequantized buffer is uncounted"
+    )
+    assert 1.1 < int8_gather / fp16_gather < 1.5
+
+
+def test_sub_8_bit_settings_do_not_claim_storage_they_do_not_have():
+    """`k_bits`/`v_bits` change quantization resolution, not layout —
+    the pools are INT8-backed and nothing is packed. `bytes_per_token`
+    reporting the same figure for 4-bit as for 8-bit is correct; the bug
+    was that there was no way to tell, so a `--k-bits 4` storage sweep
+    printed an unchanged number with no indication of why.
+    """
+    spec = tiny_spec(batch=1, max_seq=256, heads=2, dim=128, layers=28)
+    eight = Int8PagedKVCache(spec, block_size=16, k_bits=8, v_bits=8)
+    four = Int8PagedKVCache(spec, block_size=16, k_bits=4, v_bits=4)
+
+    assert four.bytes_per_token == eight.bytes_per_token
+    assert four.packed_bytes_per_token < eight.packed_bytes_per_token
+    assert four.stats()["storage_bits_per_element"] == 8
+    with pytest.raises(ValueError):
+        Int8PagedKVCache(spec, block_size=16, k_bits=16)
+
+
+def test_ragged_batch_reads_agree_with_per_sequence_replay():
+    """Continuous batching drives `advance(slots=...)` with different
+    sequences at different lengths, so every row has its own head/tail
+    split. Grouping rows by start position is what keeps that one set of
+    tensor ops in the common uniform case; this checks the grouping
+    against sequences replayed independently.
+    """
+    torch.manual_seed(7)
+    heads, dim, block = 2, 8, 4
+    spec = tiny_spec(batch=3, max_seq=256, heads=heads, dim=dim)
+    cache = Int8PagedKVCache(spec, block_size=block)
+
+    history = {s: [] for s in range(3)}
+    for step, (slots, n) in enumerate([([0, 1, 2], 5), ([0, 2], 3), ([1], 6), ([0, 1, 2], 1)]):
+        k = torch.randn(len(slots), heads, n, dim)
+        v = torch.randn(len(slots), heads, n, dim)
+        cache.advance(n, slots=slots)
+        cache.write(0, k, v)
+        for row, s in enumerate(slots):
+            history[s].append((k[row : row + 1], v[row : row + 1]))
+
+        k_out, v_out = cache.read(0, batch_size=len(slots))
+        for row, s in enumerate(slots):
+            k_seq = torch.cat([x[0] for x in history[s]], dim=2)
+            v_seq = torch.cat([x[1] for x in history[s]], dim=2)
+            length = k_seq.shape[2]
+            k_ref, v_ref = _reference_roundtrip(k_seq, v_seq, block, heads, dim, length)
+            torch.testing.assert_close(
+                k_out[row : row + 1, :, :length], k_ref, rtol=1e-5, atol=1e-5
+            )
+            torch.testing.assert_close(
+                v_out[row : row + 1, :, :length], v_ref, rtol=1e-5, atol=1e-5
+            )

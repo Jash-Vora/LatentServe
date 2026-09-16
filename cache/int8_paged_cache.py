@@ -25,7 +25,7 @@ buffer, and only quantize+scatter it into the INT8 pool the instant it
 reaches `block_size` tokens. `read()` then splices two sources per
 sequence: INT8 pool (dequantized) for every finalized block, and the
 FP16 residual directly for the still-filling tail. The tail is
-therefore always exact — never quantized — which is a free, not a
+therefore always exact — never quantized — which is a free, not an
 approximated, floor: it is *waiting* to be quantized, not a permanent
 higher-precision allowance.
 
@@ -35,27 +35,62 @@ it is written (`compression/truncation.py`'s note on `per_token` says
 the same thing about the *simulated* version of this). V is quantized
 and scattered directly in `write()`, no residual, no look-ahead.
 
+## Scale convention
+
+Both scale pools hold the **dequantization step** — `absmax / qmax`,
+the multiplier that turns a stored integer back into a value — not the
+absmax itself. That is the standard meaning of "scale" in symmetric
+quantization (`x ~= q * scale`), and it keeps the read path to a single
+broadcast multiply instead of a multiply and a divide. The pools stay
+FP32: fitting a step is a reduction over up to `block_size` tokens, and
+a step that underflows is a whole channel silently zeroed.
+
 ## The traffic arithmetic this does *not* fix
 
-Storing INT8 does not by itself halve decode memory traffic. Today's
-gather still (a) reads the pool, INT8 or not, (b) dequantizes into an
-FP16 buffer, and (c) hands that FP16 buffer to SDPA, which reads it
-again. Call the resident KV size 1 unit (FP16). Storage drops to 0.5,
-but the traffic is 0.5 (read) + 1 (write the FP16 dequant buffer) + 1
-(SDPA reads it) = 2.5, against a resident-FP16 paged cache's gather
-cost of 1 (read) + 1 (write the FP16 copy) + 1 (SDPA reads it) = 3 —
-roughly a 17% reduction in bytes moved, not 50%. The full 2x needs
-attention to consume INT8 directly without a dequantized intermediate,
-which means a custom kernel (Phase 11). What *is* real here, and
-measurable without a kernel, is storage: half the resident bytes, and
-therefore up to ~2x the tokens or concurrent sequences at the same
-memory budget — the Phase 7.5 capacity experiment this module exists
-to feed.
+Storing INT8 does not by itself reduce decode memory traffic, and an
+earlier version of this docstring claimed a reduction the code could
+not deliver. In units of the resident FP16 KV size, per layer per step,
+what eager PyTorch actually moves is:
+
+    gather whole blocks out of the INT8 pool   0.5 read + 0.5 write
+    dequantize that buffer into FP16           0.5 read + 1.0 write
+    SDPA reads the FP16 buffer                 1.0 read
+                                               ---------------------
+                                               3.5
+
+against a resident-FP16 paged cache's 1.0 (gather read) + 1.0 (gather
+write) + 1.0 (SDPA read) = 3.0. INT8 storage therefore costs roughly
+17% *more* bytes moved per decode step, not less: the pool is half the
+size, but it is read, expanded, and read again, and the expansion is
+the largest single term. Getting under 3.0 needs the gather and the
+dequantize fused into one pass — i.e. attention consuming INT8
+directly, which means a custom kernel (Phase 11).
+
+`gather_bytes_per_decode_step()` reports that number rather than the
+0.5-read-plus-1.0-write an ideal fused kernel would move, so the
+benchmark's printed gather figure matches what the hardware sees.
+
+What *is* real here, and measurable without a kernel, is storage: half
+the resident bytes, and therefore up to ~2x the tokens or concurrent
+sequences at the same memory budget — the Phase 7.5 capacity experiment
+this module exists to feed.
+
+## Cost model for the write path
+
+Everything structural on the write path is per-`advance()`, not
+per-layer. Which block ids a write will finalize, the head/middle/tail
+split of the chunk, and the row/sequence index tensors depend only on
+the block tables, so they are computed once in `advance()` and replayed
+by all 28 `write()` calls. Nothing on this path reads a device tensor
+back to the host: doing so once per token (as an earlier version did)
+cost ~129,000 device synchronizations per 4096-token prefill chunk and
+dominated TTFT completely.
 """
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from dataclasses import dataclass
+from typing import Optional, Sequence, Union
 
 import torch
 
@@ -63,6 +98,46 @@ from cache.block_allocator import BlockAllocator, BlockTable
 from cache.kv_cache import KVCacheSpec
 
 _EPS = 1e-8
+
+# Either a basic slice (a view, no gather) or a LongTensor of ids.
+# Consecutive ids are by far the common case — a plain `range(B)` batch —
+# and taking the slice keeps the write path off PyTorch's advanced
+# indexing machinery entirely.
+Rows = Union[slice, torch.Tensor]
+
+
+@dataclass
+class _KWriteGroup:
+    """The K-side plan for a set of rows that share a start position.
+
+    A write of `n` tokens starting at logical position `start` splits
+    into at most three pieces:
+
+      * `head`   — tokens landing in the block already partly filled
+                   (`start % block_size != 0`). They go to the residual;
+                   if they reach the block boundary, `head_ids` names the
+                   physical block to finalize.
+      * `middle` — `full` whole blocks contained entirely in this write.
+                   They never touch the residual: their scale is known
+                   from the chunk itself, so they are quantized straight
+                   into the pool. `mid_ids` names them, row-major.
+      * `tail`   — the leftover that leaves the next block partly filled.
+                   Straight to the residual, nothing finalized.
+
+    Rows are grouped by `start` so the uniform case — every active
+    sequence at the same length, which is every prefill and every
+    non-ragged decode — is one group, and therefore one set of tensor
+    ops for the whole batch.
+    """
+
+    rows: Rows
+    seqs: Rows
+    off0: int
+    head: int
+    full: int
+    tail: int
+    head_ids: Optional[torch.Tensor]
+    mid_ids: Optional[torch.Tensor]
 
 
 class Int8PagedKVCache:
@@ -91,6 +166,8 @@ class Int8PagedKVCache:
         self.spec = spec
         self.block_size = block_size
         self.device = torch.device(spec.device)
+        if not 2 <= k_bits <= 8 or not 2 <= v_bits <= 8:
+            raise ValueError("k_bits/v_bits must be in [2, 8]: the pool is INT8-backed")
         self.k_bits = k_bits
         self.v_bits = v_bits
         self.k_qmax = 2 ** (k_bits - 1) - 1
@@ -118,13 +195,13 @@ class Int8PagedKVCache:
         kv_shape = (num_blocks, block_size, spec.num_kv_heads, spec.head_dim)
         self.k_pool: list[torch.Tensor] = []
         self.v_pool: list[torch.Tensor] = []
-        # K scale: one value per (block, head, channel) — shared by every
+        # K scale: one step per (block, head, channel) — shared by every
         # token in the block, which is the whole memory saving over a
         # per-token scale and the thing that makes it non-streaming-safe
         # without the residual buffer below.
         self.k_scale_pool: list[torch.Tensor] = []
-        # V scale: one value per (block*block_size flattened == token,
-        # head) — no sharing across tokens, no residual needed.
+        # V scale: one step per (block, offset == token, head) — no
+        # sharing across tokens, no residual needed.
         self.v_scale_pool: list[torch.Tensor] = []
         for _ in range(spec.num_layers):
             self.k_pool.append(torch.zeros(kv_shape, dtype=torch.int8, device=self.device))
@@ -138,7 +215,6 @@ class Int8PagedKVCache:
                            dtype=torch.float32, device=self.device)
             )
 
-        self._flat_k = [t.view(-1, spec.num_kv_heads, spec.head_dim) for t in self.k_pool]
         self._flat_v = [t.view(-1, spec.num_kv_heads, spec.head_dim) for t in self.v_pool]
         self._flat_v_scale = [t.view(-1, spec.num_kv_heads) for t in self.v_scale_pool]
 
@@ -155,6 +231,11 @@ class Int8PagedKVCache:
 
         self._read_slots: Optional[torch.Tensor] = None
         self._write_slots: Optional[torch.Tensor] = None
+        # Logical position each active row sat at *before* the current
+        # advance() — the one thing the K write plan needs that the slot
+        # tensor cannot supply without a device readback.
+        self._write_starts: list[int] = []
+        self._write_plan: Optional[tuple[tuple[int, int], list[_KWriteGroup]]] = None
         self._active: list[int] = list(range(spec.max_batch_size))
         self.gather_calls = 0
 
@@ -194,6 +275,8 @@ class Int8PagedKVCache:
         self.allocator.reset()
         self.tables = [BlockTable(self.allocator) for _ in range(self.spec.max_batch_size)]
         self._read_slots = self._write_slots = None
+        self._write_starts = []
+        self._write_plan = None
         self._active = list(range(self.spec.max_batch_size))
         self.gather_calls = 0
         # Not strictly required for correctness (every finalized block
@@ -210,9 +293,17 @@ class Int8PagedKVCache:
     def free_sequence(self, index: int) -> None:
         self.tables[index].free()
         self._read_slots = None
+        self._write_plan = None
 
     # ------------------------------------------------------------------
-    # Allocation — identical to PagedKVCache.
+    # Allocation — identical to PagedKVCache, plus the K write plan.
+    #
+    # The slot tensors are deliberately built exactly the way
+    # PagedKVCache builds them, including the O(length) Python
+    # `table.slots()` walk. That walk is slow for both caches, but
+    # making it faster *here only* would show up as an INT8 latency win
+    # that has nothing to do with INT8, and would quietly corrupt the
+    # fp16-vs-int8 comparison this module exists to support.
     # ------------------------------------------------------------------
 
     def advance(
@@ -239,6 +330,8 @@ class Int8PagedKVCache:
             dtype=torch.long,
             device=dev,
         )
+        self._write_starts = starts
+        self._write_plan = None
         b = len(active)
         max_len = self.max_len
         self._read_slots = torch.zeros((b, max_len), dtype=torch.long, device=dev)
@@ -259,20 +352,99 @@ class Int8PagedKVCache:
         return keep[:, None, None, :]
 
     # ------------------------------------------------------------------
+    # Write-plan construction — host-side, once per advance()
+    # ------------------------------------------------------------------
+
+    def _rows(self, ids: list[int]) -> Rows:
+        """A basic slice when `ids` are consecutive, else a LongTensor."""
+        if ids and ids == list(range(ids[0], ids[0] + len(ids))):
+            return slice(ids[0], ids[0] + len(ids))
+        return self._ids(ids)
+
+    def _ids(self, ids: list[int]) -> torch.Tensor:
+        return torch.tensor(ids, dtype=torch.long, device=self.device)
+
+    def _build_write_plan(self, b: int, n: int) -> list[_KWriteGroup]:
+        bs = self.block_size
+        groups: dict[int, list[int]] = {}
+        for row in range(b):
+            groups.setdefault(self._write_starts[row], []).append(row)
+
+        plan: list[_KWriteGroup] = []
+        for start, rows in groups.items():
+            off0 = start % bs
+            # Tokens that extend (and maybe finish) the block in flight.
+            head = min(bs - off0, n) if off0 else 0
+            # Whole blocks wholly contained in this write. `start + head`
+            # is block-aligned whenever head > 0 reached the boundary, and
+            # when head == 0 `start` already was.
+            full = (n - head) // bs
+            tail = n - head - full * bs
+            seqs = [self._active[r] for r in rows]
+
+            head_ids = None
+            if head and off0 + head == bs:
+                head_ids = self._ids([self.tables[s].blocks[start // bs] for s in seqs])
+            mid_ids = None
+            if full:
+                base = (start + head) // bs
+                mid_ids = self._ids(
+                    [self.tables[s].blocks[base + j] for s in seqs for j in range(full)]
+                )
+
+            plan.append(
+                _KWriteGroup(
+                    rows=self._rows(rows), seqs=self._rows(seqs), off0=off0,
+                    head=head, full=full, tail=tail,
+                    head_ids=head_ids, mid_ids=mid_ids,
+                )
+            )
+        return plan
+
+    def _get_write_plan(self, b: int, n: int) -> list[_KWriteGroup]:
+        cached = self._write_plan
+        if cached is not None and cached[0] == (b, n):
+            return cached[1]
+        plan = self._build_write_plan(b, n)
+        self._write_plan = ((b, n), plan)
+        return plan
+
+    # ------------------------------------------------------------------
     # Read/write path — this is the part that differs from PagedKVCache.
     # ------------------------------------------------------------------
+
+    def _finalize_blocks(
+        self, layer_idx: int, data: torch.Tensor, ids: torch.Tensor
+    ) -> None:
+        """Quantize `data` [N, block_size, heads, dim] into the N physical
+        blocks named by `ids`, fitting one step per (block, head, channel).
+
+        The fit runs in FP32 whatever the cache's dtype. In FP16 the
+        `_EPS` floor rounds to zero — FP16's smallest subnormal is ~6e-8
+        — so an all-zero channel divided by its own absmax produced NaN,
+        which only survived because NaN-to-int8 happens to land on a
+        value the zero step then multiplies away. That is undefined
+        behaviour standing in for a guard.
+        """
+        f = data.to(torch.float32)
+        step = f.abs().amax(dim=1).clamp_min(_EPS) / self.k_qmax  # [N, heads, dim]
+        q = torch.clamp(
+            torch.round(f / step.unsqueeze(1)), -self.k_qmax, self.k_qmax
+        ).to(torch.int8)
+        self.k_pool[layer_idx].index_copy_(0, ids, q)
+        self.k_scale_pool[layer_idx].index_copy_(0, ids, step)
 
     def write(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor, start_pos: int = 0) -> None:
         """Quantize and scatter [B, kv_heads, n, head_dim] into the pool.
 
         V is quantized and scattered unconditionally — its scale never
-        depends on anything but the token being written. K is buffered
-        into the FP16 residual for whatever block(s) this write touches,
-        and only quantized into the INT8 pool for a block the instant
-        this write completes it. A single call can complete zero, one,
-        or several blocks: n=1 on the decode path completes at most one
-        (the block it happens to fill), while a prefill chunk can span
-        many.
+        depends on anything but the token being written. K follows the
+        head/middle/tail plan built by `advance()`: only the pieces that
+        straddle a block boundary touch the residual, and whole blocks
+        contained in the write are quantized straight into the pool.
+
+        No device tensor is read back to the host here. Every index this
+        needs comes from the block tables, which are plain Python.
         """
         b, h, n, d = k.shape
         slots = self._write_slots
@@ -283,54 +455,77 @@ class Int8PagedKVCache:
         v_tok = v.permute(0, 2, 1, 3)
 
         # --- V: per-token scale, no look-ahead, quantize+scatter now. ---
-        v_scale = v_tok.abs().amax(dim=-1, keepdim=True).clamp_min(_EPS)  # [B, n, h, 1]
+        # The fit is FP32 for the same reason K's is (see
+        # _finalize_blocks): an FP16 `_EPS` floor is no floor at all.
+        v_f = v_tok.to(torch.float32)
+        v_step = v_f.abs().amax(dim=-1, keepdim=True).clamp_min(_EPS) / self.v_qmax
         v_q = torch.clamp(
-            torch.round(v_tok / v_scale * self.v_qmax), -self.v_qmax, self.v_qmax
+            torch.round(v_f / v_step), -self.v_qmax, self.v_qmax
         ).to(torch.int8)
         flat = slots[:b].reshape(-1)
         self._flat_v[layer_idx].index_copy_(0, flat, v_q.reshape(-1, h, d))
-        # Scale pools are float32 (accumulation precision for the scale
-        # itself, independent of the cache's activation dtype), while
-        # v_scale inherits v's dtype (fp16 on GPU). index_copy_, unlike
-        # plain indexed assignment, requires matching dtypes.
-        v_scale_flat = v_scale.reshape(-1, h).to(self._flat_v_scale[layer_idx].dtype)
-        self._flat_v_scale[layer_idx].index_copy_(0, flat, v_scale_flat)
+        self._flat_v_scale[layer_idx].index_copy_(0, flat, v_step.reshape(-1, h))
 
-        # --- K: buffer into the residual, finalize any block this write
-        # completes. `slots` gives the flat physical slot for every
-        # (row, new-token) pair; flat slot // block_size is the physical
-        # block id and flat slot % block_size is the offset within it,
-        # by construction of the pool's [num_blocks, block_size, ...]
-        # layout (same identity PagedKVCache.read() relies on). ---
-        block_ids = slots[:b] // self.block_size  # [B, n]
-        block_offs = slots[:b] % self.block_size  # [B, n]
+        # --- K: replay the plan. ---
+        bs = self.block_size
         residual = self._k_residual[layer_idx]
-        k_pool = self.k_pool[layer_idx]
-        k_scale_pool = self.k_scale_pool[layer_idx]
+        for g in self._get_write_plan(b, n):
+            if g.head:
+                residual[g.seqs, g.off0 : g.off0 + g.head] = k_tok[g.rows, : g.head]
+                if g.head_ids is not None:
+                    # The block just reached block_size. Everything before
+                    # g.off0 was buffered by earlier write() calls, which
+                    # is precisely what the residual is for.
+                    self._finalize_blocks(layer_idx, residual[g.seqs], g.head_ids)
+            if g.full:
+                mid = k_tok[g.rows, g.head : g.head + g.full * bs].reshape(-1, bs, h, d)
+                self._finalize_blocks(layer_idx, mid, g.mid_ids)
+            if g.tail:
+                residual[g.seqs, : g.tail] = k_tok[g.rows, n - g.tail :]
 
-        for row in range(b):
-            seq_idx = self._active[row]
-            t = 0
-            while t < n:
-                blk = int(block_ids[row, t])
-                off0 = int(block_offs[row, t])
-                # A write's tokens land at consecutive offsets within a
-                # sequence, so the run of tokens sharing this physical
-                # block is contiguous — find how far it extends.
-                run = 1
-                while t + run < n and int(block_ids[row, t + run]) == blk:
-                    run += 1
-                residual[seq_idx, off0 : off0 + run] = k_tok[row, t : t + run]
-                if off0 + run == self.block_size:
-                    block_data = residual[seq_idx]  # [block_size, h, d], now complete
-                    scale = block_data.abs().amax(dim=0).clamp_min(_EPS)  # [h, d]
-                    q = torch.clamp(
-                        torch.round(block_data / scale * self.k_qmax),
-                        -self.k_qmax, self.k_qmax,
-                    ).to(torch.int8)
-                    k_pool[blk] = q
-                    k_scale_pool[blk] = scale
-                t += run
+    def _splice_residual(
+        self, layer_idx: int, k: torch.Tensor, active: list[int], view_len: int
+    ) -> None:
+        """Overwrite each row's still-filling tail with its exact FP16
+        values.
+
+        The tail is located from the sequence's *true* length, not from
+        the length of the view being read. When `read(length=L)` returns
+        a prefix shorter than the sequence, the residual holds the tail
+        of the whole sequence, which is not the tail of that prefix —
+        splicing at `L % block_size` wrote the newest tokens over
+        positions belonging to an already-finalized block.
+        """
+        if not active:
+            return
+        bs = self.block_size
+        residual = self._k_residual[layer_idx]
+        lens = [self.tables[i].length for i in active]
+
+        def span(true_len: int) -> Optional[tuple[int, int]]:
+            tail = true_len % bs
+            if not tail:
+                return None
+            start = true_len - tail
+            visible = min(true_len, view_len) - start
+            return (start, visible) if visible > 0 else None
+
+        if len(set(lens)) == 1:
+            found = span(lens[0])
+            if found is None:
+                return
+            start, visible = found
+            k[:, start : start + visible] = residual[
+                self._rows(list(active)), :visible
+            ].to(k.dtype)
+            return
+
+        for row, seq_idx in enumerate(active):
+            found = span(lens[row])
+            if found is None:
+                continue
+            start, visible = found
+            k[row, start : start + visible] = residual[seq_idx, :visible].to(k.dtype)
 
     def read(
         self, layer_idx: int, batch_size: int, length: Optional[int] = None
@@ -339,48 +534,50 @@ class Int8PagedKVCache:
         `out_dtype` (fp16 by default) — the same shape and dtype
         `PagedKVCache.read()` returns, so attention needs no changes.
 
-        Per docs/paged_cache.py's own framing: this is still "gather
-        into a contiguous buffer" (option (a), Phase 3's motivation for
-        a Phase 11 kernel that reads the pool directly), just gathering
-        from a smaller, INT8 pool instead of an FP16 one. See this
-        module's docstring for the traffic consequence of that.
+        The gather is per *block*, not per token. Logical positions
+        `[j*block_size, (j+1)*block_size)` of a sequence always live in
+        one physical block at consecutive offsets — that is what
+        `BlockTable.slot` computes — so one block id per 16 positions
+        addresses the same bytes as 16 slot ids. More to the point, K's
+        step table is indexed by block, so gathering it per token
+        materialized a [B, L, heads, dim] FP32 tensor `block_size` times
+        larger than the information in it.
+
+        Dequantization is a single broadcast multiply straight into
+        `out_dtype`. Going through FP32 cost three full-size FP32
+        temporaries per layer per step — at B=1, ctx=16K that was ~63 MB
+        of K traffic against the FP16 paged cache's ~17 MB, which is the
+        opposite of the point of the exercise.
         """
         slots = self._read_slots
         if slots is None:
             raise RuntimeError("call advance() before read()")
         active = self._active[:batch_size]
         idx = slots[:batch_size] if length is None else slots[:batch_size, :length]
-        max_len = idx.shape[1]
+        b, view_len = idx.shape
+        bs = self.block_size
+        h, d = self.spec.num_kv_heads, self.spec.head_dim
         self.gather_calls += 1
 
-        # V: every gathered slot has a real scale (V has no residual
-        # state), so this is a uniform gather + dequant, same recipe
-        # regardless of whether the token is old or brand new.
-        v_q = self._flat_v[layer_idx][idx]  # [B, L, h, d]
-        v_scale = self._flat_v_scale[layer_idx][idx]  # [B, L, h]
-        v = v_q.to(torch.float32) * (v_scale.unsqueeze(-1) / self.v_qmax)
+        # One physical block id per block_size logical positions. Rows
+        # padded out to max_len land on block 0, exactly as PagedKVCache's
+        # pad-with-slot-0 does; `padding_mask()` is what makes either safe.
+        blk = idx[:, ::bs] // bs  # [B, nblk]
+        nblk = blk.shape[1]
 
-        # K: dequantize everything as if it were finalized...
-        k_q = self._flat_k[layer_idx][idx]  # [B, L, h, d]
-        blk_id = idx // self.block_size  # [B, L] — see write()'s note on this identity
-        k_scale = self.k_scale_pool[layer_idx][blk_id]  # [B, L, h, d]
-        k = k_q.to(torch.float32) * (k_scale.to(torch.float32) / self.k_qmax)
+        # int8 * out_dtype promotes to out_dtype in one pass: the pool is
+        # read once and the FP16 buffer written once, no intermediate.
+        k_q = self.k_pool[layer_idx][blk]  # [B, nblk, bs, h, d]
+        k_step = self.k_scale_pool[layer_idx][blk].to(self.out_dtype)  # [B, nblk, h, d]
+        k = (k_q * k_step.unsqueeze(2)).reshape(b, nblk * bs, h, d)[:, :view_len]
 
-        # ...then splice in each row's true FP16 values for its
-        # currently-filling tail block, which has no scale yet (the
-        # dequant above used whatever scale happened to be sitting in
-        # that not-yet-written pool slot — garbage that this overwrites).
-        residual = self._k_residual[layer_idx]
-        for row, seq_idx in enumerate(active):
-            seq_len = min(self.tables[seq_idx].length, max_len)
-            tail_len = seq_len % self.block_size
-            if tail_len:
-                tail_start = seq_len - tail_len
-                k[row, tail_start:seq_len] = residual[seq_idx, :tail_len].to(torch.float32)
+        v_q = self.v_pool[layer_idx][blk]  # [B, nblk, bs, h, d]
+        v_step = self.v_scale_pool[layer_idx][blk].to(self.out_dtype)  # [B, nblk, bs, h]
+        v = (v_q * v_step.unsqueeze(-1)).reshape(b, nblk * bs, h, d)[:, :view_len]
 
-        k = k.to(self.out_dtype).permute(0, 2, 1, 3)  # [B, h, L, D]
-        v = v.to(self.out_dtype).permute(0, 2, 1, 3)
-        return k, v
+        self._splice_residual(layer_idx, k, active, view_len)
+
+        return k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3)  # [B, h, L, D]
 
     # ------------------------------------------------------------------
     # Accounting
@@ -406,8 +603,28 @@ class Int8PagedKVCache:
         """Summed over layers — the INT8-cache analogue of
         `KVCacheSpec.bytes_per_token`, used in place of it everywhere
         below so `stats()`/`used_bytes()`/etc. report the true INT8
-        footprint rather than the FP16 spec's."""
+        footprint rather than the FP16 spec's.
+
+        This is one byte per element whatever `k_bits`/`v_bits` say.
+        Sub-8-bit settings change the quantization *resolution* — they
+        exist so the real cache can reproduce 7.2's bit-width sweep —
+        but nothing is bit-packed, so a 4-bit run occupies exactly as
+        much memory as an 8-bit one. `packed_bytes_per_token` is what
+        packing would buy; `stats()` reports both, so a storage claim
+        cannot be read off the wrong one.
+        """
         return self.spec.num_layers * (self.k_bytes_per_token + self.v_bytes_per_token)
+
+    @property
+    def packed_bytes_per_token(self) -> int:
+        """Hypothetical footprint if the pools were bit-packed at
+        `k_bits`/`v_bits`. Not what this cache occupies — see
+        `bytes_per_token`. Reported so a `--k-bits 4` sweep shows the
+        storage it is *arguing for* next to the storage it has."""
+        elems = self.spec.num_kv_heads * self.spec.head_dim
+        k = (elems * self.k_bits + 7) // 8 + (elems * 4 + self.block_size - 1) // self.block_size
+        v = (elems * self.v_bits + 7) // 8 + self.spec.num_kv_heads * 4
+        return self.spec.num_layers * (k + v)
 
     @property
     def allocated_bytes(self) -> int:
@@ -447,19 +664,34 @@ class Int8PagedKVCache:
         return self.bytes_per_token * sum(self.tables[i].length for i in rows)
 
     def gather_bytes_per_decode_step(self, batch_size: int) -> int:
-        """Extra traffic the gather adds, in INT8-pool bytes — the
-        numerator for the "0.5 + 1 + 1 = 2.5x" arithmetic in this
-        module's docstring is this plus the FP16 dequant buffer's own
-        read+write, which is sized off `spec.bytes_per_token` (FP16),
-        not this. `benchmarks/runners` computes that comparison; this
-        method only reports the paging-specific half of it."""
-        return 2 * self.bytes_read_per_decode_step(batch_size)
+        """Extra traffic the gather adds, per decode step, summed over
+        layers — directly comparable to `PagedKVCache`'s version of this
+        method, which is `2 * (its FP16 bytes)` for a read and a write.
+
+        INT8 needs two more terms, because the buffer it gathers is not
+        the buffer attention consumes:
+
+            read the INT8 pool            1x INT8 bytes
+            write the INT8 gather buffer  1x INT8 bytes
+            read it back to dequantize    1x INT8 bytes
+            write the FP16 buffer         1x FP16 bytes
+
+        Reporting `2 * INT8 bytes` — as if the gather produced something
+        SDPA could read — understated the real figure by about 2.4x and
+        made INT8 look like a traffic reduction when it is a ~17%
+        increase. The reduction needs a fused gather+dequantize kernel
+        (Phase 11); see this module's docstring.
+        """
+        rows = list(self._active)[:batch_size]
+        tokens = sum(self.tables[i].length for i in rows)
+        return 3 * self.bytes_per_token * tokens + self.spec.bytes_per_token * tokens
 
     def stats(self, batch_size: Optional[int] = None) -> dict:
         b = len(self._active) if batch_size is None else batch_size
         return {
             "kv_bytes_per_token": self.bytes_per_token,
             "kv_bytes_per_token_fp16_equiv": self.spec.bytes_per_token,
+            "kv_bytes_per_token_if_packed": self.packed_bytes_per_token,
             "kv_allocated_mb": self.allocated_bytes / 1024 / 1024,
             "kv_used_mb": self.used_bytes(b) / 1024 / 1024,
             "kv_reserved_mb": self.reserved_bytes(b) / 1024 / 1024,
@@ -468,6 +700,7 @@ class Int8PagedKVCache:
             "block_size": self.block_size,
             "k_bits": self.k_bits,
             "v_bits": self.v_bits,
+            "storage_bits_per_element": 8,
             "gather_calls": self.gather_calls,
             **self.allocator.stats(),
         }
