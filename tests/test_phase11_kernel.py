@@ -301,3 +301,20 @@ def test_kernel_decode_matches_sdpa_end_to_end():
         return torch.cat([ls.decode_step(stream[:, t : t + 1]) for t in range(24)], dim=1)
 
     torch.testing.assert_close(run("triton_paged"), run("sdpa"), rtol=3e-2, atol=3e-2)
+
+
+def test_contiguous_cache_accepts_a_contiguous_slot_prefix():
+    """`decode_step_ragged` passes `slots` unconditionally, so every
+    cache has to accept it. A contiguous cache can represent
+    [0, 1, 2] — it means the same thing as batch_size 3 — and cannot
+    represent [0, 3, 7]. Silently treating the second as the first
+    would write sequence 3's KV into slot 1."""
+    from cache.kv_cache import ContiguousKVCache, KVCacheSpec
+
+    spec = KVCacheSpec(num_layers=1, num_kv_heads=2, head_dim=4, max_batch_size=3,
+                       max_seq_len=32, dtype=torch.float32, device="cpu")
+    cache = ContiguousKVCache(spec)
+    cache.advance(4, slots=[0, 1, 2])
+    assert cache.length == 4
+    with pytest.raises(NotImplementedError, match="non-contiguous slots"):
+        cache.advance(1, slots=[0, 3, 7])

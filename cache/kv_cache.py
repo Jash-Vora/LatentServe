@@ -50,7 +50,7 @@ you cannot retrain it — but you can change how many KV heads the
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Literal, Optional, Sequence
 
 import torch
 
@@ -157,11 +157,30 @@ class ContiguousKVCache:
         pays."""
         self._length = 0
 
-    def advance(self, n: int, batch_size: Optional[int] = None) -> None:
+    def advance(
+        self,
+        n: int,
+        batch_size: Optional[int] = None,
+        slots: Optional[Sequence[int]] = None,
+    ) -> None:
         """`batch_size` is accepted and ignored: a contiguous cache has
         one shared fill length. PagedKVCache needs it to build per-sequence
         block tables, and the two must be interchangeable from the
-        executor's point of view."""
+        executor's point of view.
+
+        `slots` is accepted for the same reason — `decode_step_ragged`
+        passes it unconditionally — but only a contiguous prefix range is
+        representable here. A contiguous cache has one fill length, so
+        slots [0, 1, 2] means the same thing as batch_size 3, while
+        slots [0, 3, 7] does not mean anything at all. Raising is the
+        honest response: silently treating the second as the first would
+        write sequence 3's KV into slot 1.
+        """
+        if slots is not None and list(slots) != list(range(len(slots))):
+            raise NotImplementedError(
+                f"ContiguousKVCache cannot represent non-contiguous slots {list(slots)}; "
+                "ragged or recycled slots require the paged cache (Phase 3)"
+            )
         if self._length + n > self.spec.max_seq_len:
             raise RuntimeError(
                 f"KV cache overflow: {self._length} + {n} > max_seq_len="
