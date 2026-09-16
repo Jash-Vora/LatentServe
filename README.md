@@ -8,7 +8,7 @@ DSA-inspired sparse attention → adaptive runtime), not the model. DSA is
 a core research axis alongside MLA, not an optional late-stage add-on.
 See `docs/methodology.md` for the full research plan.
 
-This README covers **Phases 0-6**: environment + experimental
+This README covers **Phases 0-6**, plus Phase 7.1: environment + experimental
 infrastructure, the Qwen2.5-1.5B-Instruct reference implementation and
 correctness harness, and LatentServe's own GQA + KV-cache execution
 path, the paged KV cache, and the continuous-batching serving runtime.
@@ -26,6 +26,8 @@ benchmarks/schema.py                   # BenchmarkResult schema + JSONL writer (
 benchmarks/harness.py                  # Phase 5: percentiles, CIs, stall-aware summaries, fairness guards
 benchmarks/runners/phase6_vllm.py      # Phase 6: LatentServe vs vLLM under asserted-matched conditions
 comparisons/vllm/runner.py             # Phase 6: offline vLLM engine with every control recorded
+compression/spectra.py                 # Phase 7.1: streaming KV spectra, rank metrics, break-even
+benchmarks/runners/phase7_spectra.py   # Phase 7.1: KV compressibility map
 benchmarks/runners/check_env.py        # Phase 0 gate: verifies CUDA/GPU/torch actually work
 benchmarks/runners/phase1_reference.py # Phase 1: context-length sweep -> results/raw/phase1_reference.jsonl
 benchmarks/runners/phase2_gqa.py       # Phase 2: GQA/KV sweep -> results/raw/phase2_gqa.jsonl
@@ -53,6 +55,7 @@ tests/test_phase2_gqa.py               # Gate 2: LatentServe's execution path vs
 tests/test_phase3_paged.py             # Gate 4: allocator behaviour + paged/contiguous equivalence
 tests/test_phase4_serving.py           # Gate 3: outputs identical under concurrency; scheduler policies
 tests/test_phase5_harness.py           # the harness's own failure modes (percentiles, bimodality, fairness)
+tests/test_phase7_spectra.py           # Phase 7.1: spectral arithmetic and the break-even calculation
 ```
 
 This is a **flat layout**: `model`, `cache`, `runtime`, etc. are top-level

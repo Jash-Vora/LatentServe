@@ -125,7 +125,11 @@ class VLLMRunner:
 
     def describe(self) -> dict:
         """Everything that must travel with the numbers."""
-        out = {"vllm_version": self.version, **{f"vllm_{k}": v for k, v in self.config.items()}}
+        out = {
+            "vllm_version": self.version,
+            "vllm_detokenize": False,
+            **{f"vllm_{k}": v for k, v in self.config.items()},
+        }
         try:
             cfg = self.llm.llm_engine.vllm_config
             sched = getattr(cfg, "scheduler_config", None)
@@ -168,6 +172,13 @@ class VLLMRunner:
                 min_tokens=n,       # forbid early stopping outright
                 ignore_eos=True,    # random synthetic prompts hit EOS constantly
                 temperature=0.0,    # greedy, matching LatentServe's argmax
+                # LatentServe produces token ids and stops; it never
+                # detokenizes. vLLM runs incremental detokenization per
+                # token per request by default — real CPU work inside the
+                # serving loop that the other system does not pay. Leaving
+                # it on charges vLLM for output this comparison never
+                # reads.
+                detokenize=False,
                 seed=None,
             )
             for n in counts
