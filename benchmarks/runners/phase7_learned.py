@@ -89,7 +89,9 @@ def main() -> int:
     p.add_argument("--ranks", type=int, nargs="+", default=[128, 192, 256])
     p.add_argument("--distill-steps", type=int, default=150)
     p.add_argument("--distill-seq-len", type=int, default=256)
-    p.add_argument("--distill-lr", type=float, default=1e-3)
+    p.add_argument("--distill-lr", type=float, default=0.02,
+                   help="fraction of each parameter's own RMS per step, not an absolute "
+                   "lr: these matrices have RMS ~1e-3 and an absolute 1e-3 destroys them")
     p.add_argument("--skip-distill", action="store_true",
                    help="run the closed-form comparison only; B1 is free, B2 is not")
     p.add_argument("--text-file", default=None)
@@ -166,7 +168,8 @@ def main() -> int:
             record("distilled (B2)", rank,
                    measure(ref, ids, args.chunk_size,
                            lambda a=trained: install_adapters(ref.model, a)),
-                   distill_steps=args.distill_steps, final_train_kl=history[-1]["kl"])
+                   distill_steps=args.distill_steps, best_train_kl=history[-1]["kl"],
+                   best_step=history[-1].get("best_step"))
 
     out_dir = Path(args.results_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
