@@ -41,6 +41,7 @@ import torch
 from compression.spectra import (
     SpectrumAccumulator,
     SpectrumReport,
+    block_reconstruction_error,
     compression_ratio,
     mla_break_even,
     rank_for_energy,
@@ -250,6 +251,27 @@ def main() -> int:
 
     rows = [r.summary() for r in capture.reports()]
 
+    # Retained energy is norm-weighted and this model has massive
+    # activations, so ask the question that actually matters: under a
+    # rank-r projection of the joint KV vector, how well is each of K and
+    # V reconstructed? Reported per rank, averaged over layers.
+    kv_dim = 2 * shape.num_key_value_heads * shape.head_dim
+    blocks = {"K": slice(0, kv_dim // 2), "V": slice(kv_dim // 2, kv_dim)}
+    ranks = [r for r in (48, 64, 96, 128, 192, 256, 384) if r < kv_dim]
+    recon: dict[int, list[dict]] = {r: [] for r in ranks}
+    for (layer, name), acc in capture.acc.items():
+        if name != "kv_joint":
+            continue
+        _, vecs = acc.eigendecomposition()
+        for r in ranks:
+            errs = block_reconstruction_error(acc.gram, vecs, r, blocks)
+            recon[r].append(errs)
+            rows.append({
+                "name": "kv_joint_reconstruction", "layer": layer, "dim": kv_dim,
+                "tokens": acc.count, "rank": r,
+                "k_rel_error": errs["K"], "v_rel_error": errs["V"],
+            })
+
     # Data-free weight spectra, for contrast.
     for idx, layer in enumerate(ref.model.model.layers):
         wk = layer.self_attn.k_proj.weight.detach().cpu()
@@ -269,7 +291,8 @@ def main() -> int:
             f.write(json.dumps({**row, "source": "random" if args.random_tokens else "text",
                                 "context_length": ids.shape[1]}) + "\n")
 
-    report(rows, gqa_numbers=2 * shape.num_key_value_heads * shape.head_dim)
+    report(rows, gqa_numbers=kv_dim)
+    report_reconstruction(recon, kv_dim)
     print(f"\nwrote {len(rows)} rows to {path}")
     plot(rows, capture.reports(), Path(args.figures_dir))
     return 0
@@ -326,6 +349,28 @@ def report(rows: list[dict], gqa_numbers: int, rope_dim: int = 64) -> None:
             "the smaller one. This is the measurement behind MLA's decoupled "
             "positional path."
         )
+
+
+def report_reconstruction(recon: dict, kv_dim: int) -> None:
+    """The honest version of the compressibility question."""
+    import statistics
+
+    print("\n=== relative reconstruction error under a rank-r joint projection ===")
+    print("(mean over layers; energy thresholds are norm-weighted and flatter here)")
+    print(f"{'rank':>6}{'cache ratio':>13}{'K rel.err':>12}{'V rel.err':>12}")
+    for rank in sorted(recon):
+        entries = recon[rank]
+        if not entries:
+            continue
+        k = statistics.mean(e["K"] for e in entries)
+        v = statistics.mean(e["V"] for e in entries)
+        ratio = compression_ratio(rank, 64, kv_dim)
+        print(f"{rank:>6}{ratio:>12.2f}x{k:>12.3f}{v:>12.3f}")
+    print(
+        "\nK and V share one latent, so the usable rank is set by whichever "
+        "reconstructs worse — not by the joint energy curve. Validate the chosen "
+        "rank against logit KL divergence (7.2) before trusting any of these."
+    )
 
 
 def plot(rows: list[dict], reports: list, figures_dir: Path) -> None:

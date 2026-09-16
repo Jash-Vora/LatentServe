@@ -89,6 +89,22 @@ class SpectrumAccumulator:
         self.gram += flat.T @ flat
         self.count += flat.shape[0]
 
+    def eigendecomposition(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Descending eigenvalues and matching eigenvectors (columns).
+
+        The eigenvectors are what turn a spectrum into an actual
+        projection, which is what `block_reconstruction_error` needs: the
+        energy curve alone cannot say whether a rank-r subspace serves K
+        and V equally, and on this model it does not.
+        """
+        if self.count == 0:
+            return torch.zeros(self.dim, dtype=torch.float64), torch.eye(
+                self.dim, dtype=torch.float64
+            )
+        vals, vecs = torch.linalg.eigh(self.gram)
+        order = torch.argsort(vals, descending=True)
+        return vals[order].clamp_min(0), vecs[:, order]
+
     def eigenvalues(self) -> torch.Tensor:
         """Descending eigenvalues of the Gram = squared singular values.
 
@@ -130,6 +146,37 @@ def effective_rank(eigenvalues: torch.Tensor) -> float:
     p = eigenvalues / total
     p = p[p > 0]
     return float(torch.exp(-(p * p.log()).sum()).item())
+
+
+def block_reconstruction_error(
+    gram: torch.Tensor, eigenvectors: torch.Tensor, rank: int, blocks: dict[str, slice]
+) -> dict[str, float]:
+    """Relative reconstruction error of each block under a rank-r
+    projection of the *joint* vector.
+
+    Why this and not retained energy: energy is norm-weighted, so a joint
+    spectrum is dominated by whichever block has the larger activations.
+    Qwen's pre-RoPE K has an effective rank near 6 against a 99%-energy
+    rank of 83 — a few enormous directions ("massive activations") carry
+    almost all the magnitude. A rank chosen to capture 99% of joint
+    energy can therefore reconstruct K beautifully and V badly, while the
+    single joint number reports success.
+
+    For A with Gram G and projection P_r = U_r U_r^T, the squared error on
+    the columns in `block` is tr(M_b^T G M_b) with M = I - P_r restricted
+    to those columns — computable from the Gram alone, no activations
+    retained.
+    """
+    d = gram.shape[0]
+    u = eigenvectors[:, :rank]
+    m = torch.eye(d, dtype=gram.dtype, device=gram.device) - u @ u.T
+    out = {}
+    for name, sl in blocks.items():
+        mb = m[:, sl]
+        err_sq = torch.einsum("ij,ik,kj->", mb, gram, mb)
+        total = torch.diagonal(gram)[sl].sum()
+        out[name] = float((err_sq / total).clamp_min(0).sqrt().item()) if total > 0 else 0.0
+    return out
 
 
 @dataclass
