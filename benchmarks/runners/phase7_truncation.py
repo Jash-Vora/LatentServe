@@ -117,6 +117,15 @@ def main() -> int:
     p.add_argument("--ranks", type=int, nargs="+", default=DEFAULT_RANKS)
     p.add_argument("--text-file", default=None)
     p.add_argument("--random-tokens", action="store_true")
+    p.add_argument("--quant-bits", type=int, nargs="+", default=None,
+                   help="bit-width sweep. INT8 costs 0.000%% of argmax decisions on real "
+                   "text, so the open question is where quantization actually breaks.")
+    p.add_argument("--block-size", type=int, default=16,
+                   help="block-local per-channel K scaling, as 7.3 measured. Scales computed "
+                   "over the whole sequence are not implementable in a streaming cache, so "
+                   "the sweep uses the buildable variant.")
+    p.add_argument("--skip-lowrank", action="store_true",
+                   help="low-rank loses to INT8 by ~480x in KL; skip re-measuring it")
     p.add_argument("--skip-separate", action="store_true",
                    help="skip the per-block low-rank control")
     p.add_argument("--device", default=None)
@@ -150,6 +159,7 @@ def main() -> int:
             f"  {label:<28}{ratio:>6.2f}x  KL {result['kl_mean_nats']:.5f} nats  "
             f"(max {result['kl_max_nats']:.3f})  top-1 flips "
             f"{result['top1_flip_rate'] * 100:5.2f}%"
+            + f"  base p={result.get('baseline_top1_prob', float('nan')):.3f}"
         )
 
     print("\n=== sanity: no modification ===")
@@ -168,6 +178,34 @@ def main() -> int:
             k_mode=k_mode, v_mode=v_mode,
         )
 
+    if args.quant_bits:
+        print(f"\n=== bit-width sweep, K per-channel (block={args.block_size}) / V per-token ===")
+        for bits in args.quant_bits:
+            for asym in (False, True):
+                record(
+                    f"int{bits}{' asym' if asym else '     '} block={args.block_size}",
+                    16 / bits,
+                    measure(ref, ids, args.chunk_size,
+                            lambda b=bits, a=asym: install_quantization(
+                                ref.model, "per_channel", "per_token", heads, head_dim,
+                                bits=b, asymmetric=a, k_block_size=args.block_size)),
+                    bits=bits, asymmetric=asym, block_size=args.block_size,
+                )
+
+        print("\n=== uneven K/V allocation (K is the sensitive side) ===")
+        for k_bits, v_bits in ((8, 4), (8, 3), (6, 4), (5, 3), (4, 8)):
+            record(
+                f"K{k_bits}/V{v_bits} bits", 2 * 16 / (k_bits + v_bits),
+                measure(ref, ids, args.chunk_size,
+                        lambda kb=k_bits, vb=v_bits: install_quantization(
+                            ref.model, "per_channel", "per_token", heads, head_dim,
+                            k_bits=kb, v_bits=vb, asymmetric=True,
+                            k_block_size=args.block_size)),
+                k_bits=k_bits, v_bits=v_bits,
+            )
+
+    if args.skip_lowrank:
+        args.ranks = []
     print("\n=== joint low-rank (the MLA representation) ===")
     for rank in args.ranks:
         if rank >= kv_dim:
@@ -180,7 +218,7 @@ def main() -> int:
             rank=rank,
         )
 
-    if not args.skip_separate:
+    if not args.skip_separate and args.ranks:
         print("\n=== separate K/V low-rank (control) ===")
         for rank in args.ranks:
             half = rank // 2

@@ -170,6 +170,7 @@ def quantize_dequantize_block_local(
     head_dim: int,
     block_size: int,
     bits: int = 8,
+    asymmetric: bool = False,
 ) -> torch.Tensor:
     """Per-channel INT8, but with the scale fit *within* each contiguous
     block of `block_size` tokens rather than over the whole sequence.
@@ -185,6 +186,14 @@ def quantize_dequantize_block_local(
     x is [..., seq, num_heads * head_dim] (batch dims before `seq` are
     fine; `seq` is assumed to be the second-to-last axis before the
     flattened head dim, matching how this module calls it elsewhere).
+
+    `asymmetric` fits [min, max] per block instead of assuming the range
+    is centred on zero. A symmetric fit spends half its levels on a sign
+    the data may rarely use — a whole bit, wasted exactly where bits are
+    scarce — so this matters far more at 4 bits than at 8. A real cache
+    stores a zero-point alongside the scale, doubling the per-block
+    scale overhead: 12.5% -> 25% at block 16, which is why the effective
+    ratio has to be quoted per configuration rather than as "2x".
     """
     shaped = x.reshape(*x.shape[:-1], num_heads, head_dim)  # [..., seq, H, D]
     seq_dim = shaped.dim() - 3
@@ -193,12 +202,21 @@ def quantize_dequantize_block_local(
 
     out = torch.empty_like(shaped)
     reduce_dims = tuple(d for d in range(shaped.dim() - 2) if d != seq_dim)
+    dims = reduce_dims + (seq_dim,)
+    levels = 2**bits - 1
     for start in range(0, seq_len, block_size):
         end = min(start + block_size, seq_len)
         block = shaped.narrow(seq_dim, start, end - start)
-        scale = block.abs().amax(dim=reduce_dims + (seq_dim,), keepdim=True).clamp_min(1e-8)
-        q = torch.clamp(torch.round(block / scale * qmax), -qmax, qmax)
-        out.narrow(seq_dim, start, end - start).copy_(q * scale / qmax)
+        if asymmetric:
+            lo = block.amin(dim=dims, keepdim=True)
+            hi = block.amax(dim=dims, keepdim=True)
+            scale = ((hi - lo) / levels).clamp_min(1e-8)
+            q = torch.clamp(torch.round((block - lo) / scale), 0, levels)
+            out.narrow(seq_dim, start, end - start).copy_(q * scale + lo)
+        else:
+            scale = block.abs().amax(dim=dims, keepdim=True).clamp_min(1e-8)
+            q = torch.clamp(torch.round(block / scale * qmax), -qmax, qmax)
+            out.narrow(seq_dim, start, end - start).copy_(q * scale / qmax)
     return out.reshape_as(x)
 
 
@@ -218,10 +236,9 @@ class QuantizingProjection(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.proj(x)
         if self.block_size is not None and self.mode == "per_channel":
-            if self.asymmetric:
-                raise NotImplementedError("block-local scaling is symmetric-only for now")
             return quantize_dequantize_block_local(
-                out, self.num_heads, self.head_dim, self.block_size, self.bits
+                out, self.num_heads, self.head_dim, self.block_size, self.bits,
+                asymmetric=self.asymmetric,
             )
         return quantize_dequantize(
             out, self.mode, self.num_heads, self.head_dim, self.bits, self.asymmetric
@@ -327,6 +344,14 @@ class DivergenceMeter:
         self.agree = 0
         self.tokens = 0
         self.max_kl = 0.0
+        # Baseline confidence, because top-1 flip rate cannot be read
+        # without it. On natural text this model sits at ~0.99 with a
+        # margin of ~0.99 and flips 0.000%; on random ids it sits at
+        # ~0.02 with a margin of ~0.01 and flips 2-4%. Same cache, same
+        # quantization — the difference was entirely how close the top
+        # two candidates were.
+        self.top1_prob_sum = 0.0
+        self.margin_sum = 0.0
 
     @torch.no_grad()
     def update(self, baseline_logits: torch.Tensor, modified_logits: torch.Tensor) -> None:
@@ -338,6 +363,9 @@ class DivergenceMeter:
         self.kl_sum += float(kl.sum().item())
         self.max_kl = max(self.max_kl, float(kl.max().item()))
         self.agree += int((base.argmax(-1) == mod.argmax(-1)).sum().item())
+        top2 = log_p.exp().topk(2, dim=-1).values
+        self.top1_prob_sum += float(top2[:, 0].sum().item())
+        self.margin_sum += float((top2[:, 0] - top2[:, 1]).sum().item())
         self.tokens += base.shape[0]
 
     def result(self) -> dict:
@@ -348,4 +376,6 @@ class DivergenceMeter:
             "top1_agreement": self.agree / n,
             "top1_flip_rate": 1 - self.agree / n,
             "tokens": self.tokens,
+            "baseline_top1_prob": self.top1_prob_sum / n,
+            "baseline_top1_margin": self.margin_sum / n,
         }
