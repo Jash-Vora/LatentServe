@@ -227,3 +227,77 @@ def test_triton_matches_reference_int8():
     got = paged_decode_attention(q, k_q, v_q, tables, lens,
                                  k_scale=k_scale, v_scale=v_scale, num_splits=4)
     torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-3)
+
+
+# ----------------------------------------------------------------------
+# End to end: the kernel path must produce the same tokens
+# ----------------------------------------------------------------------
+
+
+def _tiny_model():
+    pytest.importorskip("transformers")
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
+    torch.manual_seed(0)
+    cfg = dict(vocab_size=128, hidden_size=128, intermediate_size=256, num_hidden_layers=2,
+               num_attention_heads=8, num_key_value_heads=2, max_position_embeddings=1024)
+    return Qwen2ForCausalLM(Qwen2Config(**cfg)).eval(), cfg
+
+
+def test_block_tables_tensor_matches_the_block_tables():
+    """The kernel walks pages; the gather walked slots. A table that
+    disagrees with `BlockTable.blocks` sends the kernel to another
+    sequence's memory while looking entirely healthy."""
+    from cache.kv_cache import KVCacheSpec
+    from cache.paged_cache import PagedKVCache
+
+    spec = KVCacheSpec(num_layers=1, num_kv_heads=2, head_dim=8, max_batch_size=3,
+                       max_seq_len=128, dtype=torch.float32, device="cpu")
+    cache = PagedKVCache(spec, block_size=16)
+    cache.advance(40, batch_size=3)
+    table = cache.block_tables_tensor(3)
+    assert table.shape == (3, 3)
+    for row, i in enumerate(cache.active_slots):
+        assert table[row].tolist()[: len(cache.tables[i].blocks)] == cache.tables[i].blocks
+    assert cache.seq_lens_tensor(3).tolist() == [40, 40, 40]
+
+
+def test_block_tables_grow_with_each_decode_step():
+    """Rebuilt per advance, not cached: a stale table is a silent
+    correctness bug rather than a crash."""
+    from cache.kv_cache import KVCacheSpec
+    from cache.paged_cache import PagedKVCache
+
+    spec = KVCacheSpec(num_layers=1, num_kv_heads=2, head_dim=8, max_batch_size=1,
+                       max_seq_len=128, dtype=torch.float32, device="cpu")
+    cache = PagedKVCache(spec, block_size=16)
+    cache.advance(16, batch_size=1)
+    assert cache.block_tables_tensor(1).shape[1] == 1
+    cache.advance(1, batch_size=1)
+    assert cache.block_tables_tensor(1).shape[1] == 2
+    assert cache.seq_lens_tensor(1).tolist() == [17]
+
+
+@requires_gpu
+def test_kernel_decode_matches_sdpa_end_to_end():
+    """Gate 10: the kernel path must generate the same tokens as the
+    gather path. Everything else in Phase 11 is a latency claim, and a
+    latency claim about a different model is worth nothing."""
+    from model.latentserve_qwen import LatentServeQwen
+    from model.qwen import ModelShape
+
+    model, cfg = _tiny_model()
+    model = model.half().cuda()
+    shape = ModelShape(2, 8, 2, 16, 128, 128, 1024, "torch.float16")
+    prompt = torch.randint(0, 128, (1, 100)).cuda()
+    stream = torch.randint(0, 128, (1, 24)).cuda()
+
+    def run(impl):
+        ls = LatentServeQwen(hf_model=model, tokenizer=None, shape=shape, device="cuda",
+                             attn_impl=impl, max_seq_len_hint=256)
+        ls.allocate_cache(1, 256, paged=True, block_size=16)
+        ls.cache.reset()
+        ls.prefill(prompt)
+        return torch.cat([ls.decode_step(stream[:, t : t + 1]) for t in range(24)], dim=1)
+
+    torch.testing.assert_close(run("triton_paged"), run("sdpa"), rtol=3e-2, atol=3e-2)

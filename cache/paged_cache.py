@@ -208,6 +208,34 @@ class PagedKVCache:
                     seq_slots, dtype=torch.long, device=dev
                 )
 
+    def block_tables_tensor(self, batch_size: Optional[int] = None) -> torch.Tensor:
+        """[B, max_pages] of physical block ids, for the Phase 11 kernel.
+
+        The gather path never needed this: it flattened the block table
+        into per-token slot indices. A kernel that walks the table itself
+        needs the pages, not the slots — that difference is the whole
+        point, since the slot form is what forces the copy.
+
+        Rebuilt on `advance()` rather than cached across calls: block
+        tables grow every decode step, and a stale table reads another
+        sequence's blocks while looking entirely healthy.
+        """
+        rows = self._active if batch_size is None else list(self._active)[:batch_size]
+        max_pages = max((len(self.tables[i].blocks) for i in rows), default=0)
+        table = torch.zeros((len(rows), max(1, max_pages)), dtype=torch.int32,
+                            device=self.device)
+        for r, i in enumerate(rows):
+            blocks = self.tables[i].blocks
+            if blocks:
+                table[r, : len(blocks)] = torch.tensor(blocks, dtype=torch.int32,
+                                                       device=self.device)
+        return table
+
+    def seq_lens_tensor(self, batch_size: Optional[int] = None) -> torch.Tensor:
+        rows = self._active if batch_size is None else list(self._active)[:batch_size]
+        return torch.tensor([self.tables[i].length for i in rows], dtype=torch.int32,
+                            device=self.device)
+
     def padding_mask(self) -> Optional[torch.Tensor]:
         """Boolean keep-mask [B, 1, 1, max_len], or None when the batch is
         uniform and no masking is needed."""

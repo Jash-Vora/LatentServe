@@ -33,7 +33,7 @@ from torch import nn
 from cache.kv_cache import ContiguousKVCache, KVHeadsMode
 from model.rope import apply_rope
 
-AttnImpl = Literal["sdpa", "math"]
+AttnImpl = Literal["sdpa", "math", "triton_paged"]
 
 # How the KV heads get matched up to the query heads they serve.
 #
@@ -216,6 +216,40 @@ class GQAAttention(nn.Module):
 
         cached_kv_heads = k_all.shape[1]
         n_rep = self.num_attention_heads // cached_kv_heads
+
+        if (
+            s == 1
+            and self.attn_impl == "triton_paged"
+            and hasattr(cache, "block_tables_tensor")
+            and key_mask is None
+        ):
+            # Read the cache in place: no gather, no fp16 staging buffer.
+            # Phase 3 measured the gather at 2x resident KV per step
+            # (17.3 ms at 8K/batch 4); Phase 7.3 measured the INT8
+            # dequantize pass on top of it. This path pays neither.
+            #
+            # Ragged batches fall through to the gather for now: the
+            # kernel masks per sequence from `seq_lens`, but the padding
+            # mask above is built for the staged layout, and mixing the
+            # two would be a correctness risk for no measurement gain.
+            from kernels.gqa.paged_decode import paged_decode_attention
+
+            q_folded = q.reshape(b, cached_kv_heads, n_rep, self.head_dim)
+            out = paged_decode_attention(
+                q_folded,
+                cache.k_pool[self.layer_idx],
+                cache.v_pool[self.layer_idx],
+                cache.block_tables_tensor(b),
+                cache.seq_lens_tensor(b),
+                k_scale=getattr(cache, "k_scale_pool", [None] * 99)[self.layer_idx],
+                v_scale=getattr(cache, "v_scale_pool", [None] * 99)[self.layer_idx],
+                k_zero=(getattr(cache, "k_zero_pool", None) or [None] * 99)[self.layer_idx],
+                v_zero=(getattr(cache, "v_zero_pool", None) or [None] * 99)[self.layer_idx],
+                softmax_scale=self.scaling,
+            )
+            attn_out = out.reshape(b, self.num_attention_heads, 1, self.head_dim)
+            attn_out = attn_out.transpose(1, 2).contiguous().view(b, s, -1)
+            return self.o_proj(attn_out)
 
         if s == 1 and n_rep > 1 and self.kv_expansion == "fold":
             # Decode: no mask is needed (one query attends to everything),
