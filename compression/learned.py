@@ -53,6 +53,7 @@ comparison measures.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -311,9 +312,11 @@ def distill(
     ids: torch.Tensor,
     steps: int = 200,
     seq_len: int = 256,
-    lr: float = 1e-3,
+    lr: float = 0.02,
     log_every: int = 25,
     seed: int = 0,
+    warmup: int = 10,
+    patience: int = 40,
 ) -> list[dict]:
     """Train the adapters to reproduce the frozen model's distribution.
 
@@ -325,6 +328,24 @@ def distill(
     KL(base || latent) — the direction that asks how much probability
     mass the original places where the compressed model does not, which
     is the right question for a lossy approximation of a fixed model.
+
+    ## `lr` is relative, not absolute
+
+    Adam takes steps of roughly `lr` whatever the parameter's magnitude.
+    These parameters come from folding W_kv into an eigenbasis, so their
+    entries are small — RMS around 1e-3 — and an absolute lr of 1e-3
+    rewrites them completely on the first step. The first real run of
+    this did exactly that: KL went 0.395 -> 5.47, an order of magnitude
+    worse than the initialisation it started from.
+
+    So `lr` here is a *fraction of each parameter's own RMS*, set per
+    parameter group. 0.02 means "move each matrix by about 2% of its own
+    scale per step", which is meaningful whatever that scale happens to
+    be.
+
+    Two more guards, because a diverged run that still gets scored is
+    worse than no run: the best state is kept and restored at the end,
+    and training stops early if nothing improves for `patience` steps.
     """
     for p in model.parameters():
         p.requires_grad_(False)
@@ -332,13 +353,32 @@ def distill(
     params = [p for p in installed.parameters()]
     for p in params:
         p.requires_grad_(True)
-    opt = torch.optim.Adam(params, lr=lr)
+    # Per-parameter lr, proportional to that parameter's own RMS.
+    groups = []
+    for p_ in params:
+        rms = float(p_.detach().pow(2).mean().sqrt().item())
+        groups.append({"params": [p_], "lr": lr * max(rms, 1e-8)})
+    opt = torch.optim.Adam(groups)
+    base_lrs = [g["lr"] for g in opt.param_groups]
     gen = torch.Generator(device="cpu").manual_seed(seed)
     history = []
+    best = {"kl": float("inf"), "step": -1, "state": None}
+    since_best = 0
 
     try:
         total = ids.shape[1]
         for step in range(steps):
+            # Linear warmup then cosine decay. Warmup matters most here:
+            # the initialisation is already a good solution, so the first
+            # few full-size steps are exactly where it can be destroyed.
+            if step < warmup:
+                scale = (step + 1) / warmup
+            else:
+                progress = (step - warmup) / max(1, steps - warmup)
+                scale = 0.5 * (1 + math.cos(math.pi * progress))
+            for group, base in zip(opt.param_groups, base_lrs):
+                group["lr"] = base * scale
+
             start = int(torch.randint(0, max(1, total - seq_len), (1,), generator=gen).item())
             chunk = ids[:, start : start + seq_len]
 
@@ -356,14 +396,51 @@ def distill(
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step()
 
+            value = float(loss.item())
+            if value < best["kl"]:
+                best = {
+                    "kl": value, "step": step,
+                    "state": {k: v.detach().clone() for k, v in _adapter_state(adapters).items()},
+                }
+                since_best = 0
+            else:
+                since_best += 1
+
             if step % log_every == 0 or step == steps - 1:
-                history.append({"step": step, "kl": float(loss.item())})
-                print(f"    step {step:>4}  KL {loss.item():.5f}")
+                history.append({"step": step, "kl": value, "lr_scale": scale})
+                print(f"    step {step:>4}  KL {value:.5f}  (best {best['kl']:.5f})")
             del target, out, log_p, log_q, loss
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+            if since_best >= patience:
+                print(f"    no improvement for {patience} steps; stopping at {step}")
+                break
     finally:
         installed.remove()
         for p in params:
             p.requires_grad_(False)
+
+    # Restore the best state. Scoring whatever the last step happened to
+    # produce would report an optimisation accident as a property of the
+    # representation.
+    if best["state"] is not None:
+        _load_adapter_state(adapters, best["state"])
+        print(f"    restored best step {best['step']} (KL {best['kl']:.5f})")
+    history.append({"step": "best", "kl": best["kl"], "best_step": best["step"]})
     return history
+
+
+def _adapter_state(adapters: dict[int, LatentKVAdapter]) -> dict:
+    return {
+        f"{idx}.{name}": param
+        for idx, adapter in adapters.items()
+        for name, param in adapter.named_parameters()
+    }
+
+
+def _load_adapter_state(adapters: dict[int, LatentKVAdapter], state: dict) -> None:
+    with torch.no_grad():
+        for idx, adapter in adapters.items():
+            for name, param in adapter.named_parameters():
+                param.copy_(state[f"{idx}.{name}"].to(param.device))
