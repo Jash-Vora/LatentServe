@@ -633,6 +633,14 @@ def paged_decode_attention(
         IS_INT8=is_int8, ASYM=asym, **extra,
         num_warps=NUM_WARPS, num_stages=NUM_STAGES,
     )
+    if num_splits == 1:
+        # Nothing to merge: the single split's partial *is* the answer
+        # once normalised. Saves one of the two launches per layer, and
+        # at 28 layers the launches are a measurable share of the step.
+        return (
+            partial_acc[:, :, 0, :n_rep] / partial_l[:, :, 0, :n_rep].clamp_min(1e-20)[..., None]
+        ).to(q.dtype)
+
     _combine_kernel[(b, h_kv)](
         partial_acc, partial_m, partial_l, out,
         *partial_acc.stride(), *partial_m.stride(), *out.stride(),

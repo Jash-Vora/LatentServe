@@ -169,6 +169,18 @@ class GQAAttention(nn.Module):
 
     # ------------------------------------------------------------------
 
+    def _pool(self, cache, name: str):
+        """This layer's slice of an optional scale pool.
+
+        Written as a method because the inline `getattr(cache, name,
+        [None] * 99)[layer]` it replaces allocated a 99-element list four
+        times per layer — 112 throwaway lists per decode step. Small
+        individually, and this path is already dominated by per-layer
+        Python cost.
+        """
+        pool = getattr(cache, name, None)
+        return pool[self.layer_idx] if pool else None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -241,10 +253,10 @@ class GQAAttention(nn.Module):
                 cache.v_pool[self.layer_idx],
                 cache.block_tables_tensor(b),
                 cache.seq_lens_tensor(b),
-                k_scale=getattr(cache, "k_scale_pool", [None] * 99)[self.layer_idx],
-                v_scale=getattr(cache, "v_scale_pool", [None] * 99)[self.layer_idx],
-                k_zero=(getattr(cache, "k_zero_pool", None) or [None] * 99)[self.layer_idx],
-                v_zero=(getattr(cache, "v_zero_pool", None) or [None] * 99)[self.layer_idx],
+                k_scale=self._pool(cache, "k_scale_pool"),
+                v_scale=self._pool(cache, "v_scale_pool"),
+                k_zero=self._pool(cache, "k_zero_pool"),
+                v_zero=self._pool(cache, "v_zero_pool"),
                 softmax_scale=self.scaling,
                 max_seq_len=cache.max_len,
             )
