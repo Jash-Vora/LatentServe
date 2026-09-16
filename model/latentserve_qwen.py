@@ -54,6 +54,7 @@ from typing import Optional
 import torch
 from torch import nn
 
+from cache.int8_paged_cache import Int8PagedKVCache
 from cache.kv_cache import ContiguousKVCache, KVCacheSpec, KVHeadsMode, effective_kv_heads
 from cache.paged_cache import PagedKVCache
 from model.attention.gqa import AttnImpl, GQAAttention, KVExpansion
@@ -211,22 +212,42 @@ class LatentServeQwen:
         paged: bool = False,
         block_size: int = 16,
         num_blocks: Optional[int] = None,
+        kv_dtype: str = "fp16",
+        k_bits: int = 8,
+        v_bits: int = 8,
     ):
         """Allocate once, up front, for input + output tokens. Reused
         across trials via `reset()` so the benchmark measures steady
         state rather than the allocator.
 
-        `paged=True` swaps in Phase 3's block-paged cache. The attention
-        path is unchanged — that interchangeability is the point of
-        giving both caches the same read/write contract, and it is what
-        makes the contiguous-vs-paged comparison a controlled one.
+        `paged=True` swaps in Phase 3's block-paged cache. `kv_dtype`
+        additionally selects what that paged cache stores:
+
+          * ``"fp16"`` — Phase 3's `PagedKVCache`, unchanged.
+          * ``"int8"`` — Phase 7.3's `Int8PagedKVCache`. Requires
+            `paged=True`; there is no INT8 contiguous cache, since the
+            block-local K scale this relies on needs a paged cache's
+            block boundaries to mean anything (see
+            cache/int8_paged_cache.py).
+
+        The attention path (`model/attention/gqa.py`) is unchanged
+        either way — that interchangeability is the point of giving all
+        three caches the same read/write contract, and it is what makes
+        a fp16-vs-int8-paged comparison controlled rather than a
+        different code path wearing a different config flag.
         """
+        if kv_dtype == "int8" and not paged:
+            raise ValueError('kv_dtype="int8" requires paged=True')
         spec = self.cache_spec(batch_size, max_seq_len)
-        self.cache = (
-            PagedKVCache(spec, block_size=block_size, num_blocks=num_blocks)
-            if paged
-            else ContiguousKVCache(spec)
-        )
+        if kv_dtype == "int8":
+            self.cache = Int8PagedKVCache(
+                spec, block_size=block_size, num_blocks=num_blocks,
+                k_bits=k_bits, v_bits=v_bits,
+            )
+        elif paged:
+            self.cache = PagedKVCache(spec, block_size=block_size, num_blocks=num_blocks)
+        else:
+            self.cache = ContiguousKVCache(spec)
         return self.cache
 
     def _require_cache(self):
