@@ -67,6 +67,18 @@ from compression.spectra import SpectrumAccumulator
 # ----------------------------------------------------------------------
 
 
+def _cpu64(t: torch.Tensor) -> torch.Tensor:
+    """Everything in this module fits subspaces on CPU in float64.
+
+    Grams, metrics and bases are small (at most 512x512) and are solved
+    with eigendecompositions where fp32 rounding is not acceptable, while
+    the model itself lives on the GPU. Rather than have each call site
+    remember which side it is on — the mistake that broke the first real
+    run twice — every tensor entering the fitting path goes through here.
+    """
+    return t.detach().to(device="cpu", dtype=torch.float64)
+
+
 def output_metric_for_v(o_proj_weight: torch.Tensor, group: range, head_dim: int) -> torch.Tensor:
     """M_V = sum over the query heads in this group of W_O_h^T W_O_h.
 
@@ -76,7 +88,7 @@ def output_metric_for_v(o_proj_weight: torch.Tensor, group: range, head_dim: int
     sharing it.
     """
     m = torch.zeros(head_dim, head_dim, dtype=torch.float64)
-    w = o_proj_weight.detach().to(torch.float64)
+    w = _cpu64(o_proj_weight)
     for h in group:
         block = w[:, h * head_dim : (h + 1) * head_dim]
         m += block.T @ block
@@ -151,7 +163,7 @@ def _sqrt_and_inverse_sqrt(m: torch.Tensor, floor_ratio: float = 1e-6):
     directions to infinity, making the fit chase directions the model
     cannot see.
     """
-    vals, vecs = torch.linalg.eigh(m.to(torch.float64))
+    vals, vecs = torch.linalg.eigh(_cpu64(m))
     vals = vals.clamp_min(vals.max() * floor_ratio)
     root = vecs @ torch.diag(vals.sqrt()) @ vecs.T
     inv_root = vecs @ torch.diag(vals.rsqrt()) @ vecs.T
@@ -160,7 +172,7 @@ def _sqrt_and_inverse_sqrt(m: torch.Tensor, floor_ratio: float = 1e-6):
 
 def fit_metric_basis(
     gram: torch.Tensor, metric: torch.Tensor, rank: int
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:  # noqa: D401
     """Optimal rank-r compression of X under the metric M.
 
     Returns `(down, up)` with `c = x @ down` and `x_hat = c @ up`, so the
@@ -169,8 +181,8 @@ def fit_metric_basis(
     With metric = I this reduces exactly to the plain eigendecomposition
     7.2 used, which is the test that pins the generalisation down.
     """
-    root, inv_root = _sqrt_and_inverse_sqrt(metric)
-    whitened = root @ gram.to(torch.float64) @ root
+    root, inv_root = _sqrt_and_inverse_sqrt(_cpu64(metric))
+    whitened = root @ _cpu64(gram) @ root
     vals, vecs = torch.linalg.eigh(whitened)
     top = vecs[:, torch.argsort(vals, descending=True)[:rank]]
     return (root @ top).contiguous(), (top.T @ inv_root).contiguous()
@@ -219,15 +231,13 @@ class LatentKVAdapter(nn.Module):
         is both what MLA does architecturally and what makes the runtime
         version cheap.
         """
-        w = torch.cat(
-            [k_proj.weight.detach().to(torch.float64), v_proj.weight.detach().to(torch.float64)],
-            dim=0,
-        )  # [k_dim + v_dim, hidden]
-        down = w.T @ post_down
+        w = torch.cat([_cpu64(k_proj.weight), _cpu64(v_proj.weight)], dim=0)
+        post_down, up = _cpu64(post_down), _cpu64(up)
+        down = w.T @ post_down          # [hidden, rank]
         bias = []
         for proj in (k_proj, v_proj):
             if getattr(proj, "bias", None) is not None:
-                bias.append(proj.bias.detach().to(torch.float64))
+                bias.append(_cpu64(proj.bias))
             else:
                 bias.append(torch.zeros(proj.out_features, dtype=torch.float64))
         adapter = cls(down, up, k_proj.out_features)

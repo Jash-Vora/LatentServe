@@ -60,7 +60,7 @@ def fit_basis(gram: torch.Tensor, rank: int) -> torch.Tensor:
     truncating the weight matrix's own SVD, and 7.1 measured the gap:
     the weights need 433 of 512 dimensions, the activations 165.
     """
-    vals, vecs = torch.linalg.eigh(gram.to(torch.float64))
+    vals, vecs = torch.linalg.eigh(gram.detach().to(device="cpu", dtype=torch.float64))
     order = torch.argsort(vals, descending=True)
     return vecs[:, order[:rank]].contiguous()
 
@@ -109,7 +109,14 @@ class SeparateProjection(nn.Module):
 # ----------------------------------------------------------------------
 
 
-def quantize_dequantize(x: torch.Tensor, mode: QuantMode, num_heads: int, head_dim: int, bits: int = 8) -> torch.Tensor:
+def quantize_dequantize(
+    x: torch.Tensor,
+    mode: QuantMode,
+    num_heads: int,
+    head_dim: int,
+    bits: int = 8,
+    asymmetric: bool = False,
+) -> torch.Tensor:
     """Symmetric INT8 round-trip, at one of three granularities.
 
     x is [..., num_heads * head_dim].
@@ -127,19 +134,32 @@ def quantize_dequantize(x: torch.Tensor, mode: QuantMode, num_heads: int, head_d
     """
     if mode == "none":
         return x
-    qmax = 2 ** (bits - 1) - 1
     shaped = x.reshape(*x.shape[:-1], num_heads, head_dim)
 
     if mode == "per_tensor":
-        scale = shaped.abs().amax().clamp_min(1e-8)
+        dims = tuple(range(shaped.dim()))
     elif mode == "per_channel":
         dims = tuple(range(shaped.dim() - 2))
-        scale = shaped.abs().amax(dim=dims, keepdim=True).clamp_min(1e-8)
     elif mode == "per_token":
-        scale = shaped.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
+        dims = (shaped.dim() - 1,)
     else:
         raise ValueError(f"unknown quant mode {mode!r}")
 
+    if asymmetric:
+        # Affine: fit [min, max] rather than assuming symmetry about zero.
+        # Worth its extra zero-point because KV activations are skewed —
+        # a symmetric range spends half its levels on a sign the data
+        # rarely uses, which costs a full bit exactly where bits are
+        # scarce.
+        lo = shaped.amin(dim=dims, keepdim=True)
+        hi = shaped.amax(dim=dims, keepdim=True)
+        levels = 2**bits - 1
+        scale = ((hi - lo) / levels).clamp_min(1e-8)
+        q = torch.clamp(torch.round((shaped - lo) / scale), 0, levels)
+        return (q * scale + lo).reshape_as(x)
+
+    qmax = 2 ** (bits - 1) - 1
+    scale = shaped.abs().amax(dim=dims, keepdim=True).clamp_min(1e-8)
     q = torch.clamp(torch.round(shaped / scale * qmax), -qmax, qmax)
     return (q * scale / qmax).reshape_as(x)
 
@@ -147,14 +167,16 @@ def quantize_dequantize(x: torch.Tensor, mode: QuantMode, num_heads: int, head_d
 class QuantizingProjection(nn.Module):
     """Wraps a projection and round-trips its output through INT8."""
 
-    def __init__(self, proj: nn.Module, mode: QuantMode, num_heads: int, head_dim: int, bits: int = 8):
+    def __init__(self, proj: nn.Module, mode: QuantMode, num_heads: int, head_dim: int,
+                 bits: int = 8, asymmetric: bool = False):
         super().__init__()
         self.proj = proj
         self.mode, self.num_heads, self.head_dim, self.bits = mode, num_heads, head_dim, bits
+        self.asymmetric = asymmetric
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return quantize_dequantize(
-            self.proj(x), self.mode, self.num_heads, self.head_dim, self.bits
+            self.proj(x), self.mode, self.num_heads, self.head_dim, self.bits, self.asymmetric
         )
 
 
@@ -205,14 +227,26 @@ def install_separate_lowrank(
 
 
 def install_quantization(
-    model, k_mode: QuantMode, v_mode: QuantMode, num_heads: int, head_dim: int, bits: int = 8
+    model, k_mode: QuantMode, v_mode: QuantMode, num_heads: int, head_dim: int,
+    bits: int = 8, asymmetric: bool = False, k_bits: Optional[int] = None,
+    v_bits: Optional[int] = None,
 ) -> Installed:
+    """K and V may carry different bit-widths.
+
+    7.2 measured K as the sensitive one — its granularity changes KL by
+    35x while V's changes it by 2% — so spending bits asymmetrically is
+    the obvious thing to try, and the memory cost is the mean of the two.
+    """
     originals = []
     for layer in model.model.layers:
         k, v = layer.self_attn.k_proj, layer.self_attn.v_proj
         originals.append((layer, k, v))
-        layer.self_attn.k_proj = QuantizingProjection(k, k_mode, num_heads, head_dim, bits)
-        layer.self_attn.v_proj = QuantizingProjection(v, v_mode, num_heads, head_dim, bits)
+        layer.self_attn.k_proj = QuantizingProjection(
+            k, k_mode, num_heads, head_dim, k_bits or bits, asymmetric
+        )
+        layer.self_attn.v_proj = QuantizingProjection(
+            v, v_mode, num_heads, head_dim, v_bits or bits, asymmetric
+        )
     return Installed(originals)
 
 
