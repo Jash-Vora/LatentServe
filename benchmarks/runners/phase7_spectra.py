@@ -305,6 +305,11 @@ def report(rows: list[dict], gqa_numbers: int, rope_dim: int = 64) -> None:
     print(f"{'spectrum':<24}{'dim':>6}{'r99':>8}{'r99/dim':>10}{'eff. rank':>11}")
     by_name: dict[str, list[dict]] = {}
     for r in rows:
+        # The results file carries two row shapes: spectrum summaries and
+        # per-rank reconstruction errors. Only the former have rank_*
+        # fields, so select on the field rather than trusting the name.
+        if "rank_990" not in r:
+            continue
         by_name.setdefault(r["name"], []).append(r)
     for name in sorted(by_name):
         group = by_name[name]
@@ -389,6 +394,7 @@ def plot(rows: list[dict], reports: list, figures_dir: Path) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
 
     wanted = {"kv_joint", "k_pre_rope", "k_post_rope", "v"}
+    rows = [r for r in rows if "rank_990" in r]
     for name in sorted(wanted):
         curves = [energy_curve(r.eigenvalues) for r in reports if r.name == name]
         if not curves:
