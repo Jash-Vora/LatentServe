@@ -57,6 +57,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import statistics
 import sys
 from typing import Optional
@@ -84,7 +85,7 @@ KV_BYTES_PER_TOKEN_FP16 = 28_672
 @torch.no_grad()
 def run_quality(
     config_path: str, context_length: int, decode_steps: int, block_sizes: list,
-    seed: int, results_dir: str,
+    seed: int, results_dir: str, source: str = "default",
 ) -> list:
     from model.latentserve_qwen import LatentServeQwen
     from model.qwen import QwenReference
@@ -103,8 +104,14 @@ def run_quality(
     # tokens to decode against, so FP16 and INT8 walk through the exact
     # same positions and the only thing that differs is the cache.
     torch.manual_seed(seed)
-    prompt_ids = ref.synthesize_input_ids(context_length, seed=seed)
-    decode_ids = ref.synthesize_input_ids(decode_steps, seed=seed + 1)
+    # Prompt and decode stream come from one source. Real text for the
+    # prompt but random ids for the decode stream would put the model back
+    # into the flat-distribution regime for exactly the positions scored.
+    from benchmarks.runners.phase7_spectra import build_calibration_ids
+
+    full = build_calibration_ids(ref, context_length + decode_steps, source, seed).to(device)
+    prompt_ids = full[:, :context_length]
+    decode_ids = full[:, context_length : context_length + decode_steps]
 
     writer = ResultWriter(results_dir=results_dir)
     rows = []
@@ -138,9 +145,24 @@ def run_quality(
             meter.update(base, mod)
         result = meter.result()
 
+        # How confident the *baseline* is at these positions. Top-1 flip
+        # rate cannot be interpreted without it: a model choosing between
+        # two near-tied candidates flips under any perturbation, so a high
+        # flip rate against a low top-1 probability says more about the
+        # prompt than about the cache.
+        top2 = [torch.softmax(l[:, -1].float(), -1).topk(2, -1).values for l in fp16_logits]
+        result["baseline_top1_prob"] = float(torch.stack([t[:, 0] for t in top2]).mean())
+        result["baseline_top1_margin"] = float(
+            torch.stack([t[:, 0] - t[:, 1] for t in top2]).mean()
+        )
+        result["source"] = "random" if source == "random" else "text"
+
         print(
-            f"  block_size={block_size:>4}  kl_mean={result['kl_mean_nats']:.5f} nats  "
-            f"kl_max={result['kl_max_nats']:.5f}  top1_flip={result['top1_flip_rate']:.3%}"
+            f"  ctx={context_length:>6} block={block_size:>4}  "
+            f"kl_mean={result['kl_mean_nats']:.5f}  "
+            f"top1_flip={result['top1_flip_rate']:.3%}  "
+            f"baseline top1_p={result['baseline_top1_prob']:.3f} "
+            f"margin={result['baseline_top1_margin']:.3f}"
         )
         writer.write(
             BenchmarkResult(
@@ -150,6 +172,7 @@ def run_quality(
                 seed=seed,
                 extra={
                     "status": "ok", "experiment": "int8_quality", "block_size": block_size,
+                    "decode_steps": decode_steps,
                     **result,
                 },
             )
@@ -333,6 +356,17 @@ def main() -> int:
     # Experiment A
     p.add_argument("--context-length", type=int, default=4096)
     p.add_argument("--decode-steps", type=int, default=64)
+    p.add_argument("--quality-contexts", type=int, nargs="+", default=None,
+                   help="sweep the prompt length for experiment A. Quantization damage should "
+                   "grow with the number of cached keys competing in the softmax, and the "
+                   "offline simulation averaged that away by scoring every position including "
+                   "ones with almost no cache behind them.")
+    p.add_argument("--text-file", default=None,
+                   help="real text for the prompt and decode stream")
+    p.add_argument("--random-tokens", action="store_true",
+                   help="out-of-distribution ids instead (the original behaviour). Top-1 flip "
+                   "rate is a threshold metric, so a near-flat distribution inflates it: when "
+                   "the top two candidates sit a hair apart, any perturbation flips them.")
     # Experiment C
     p.add_argument("--context-lengths", type=int, nargs="+", default=[4096, 8192, 16384])
     p.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4])
@@ -344,8 +378,12 @@ def main() -> int:
     args = p.parse_args()
 
     if args.experiment in ("quality", "all"):
-        run_quality(args.config, args.context_length, args.decode_steps, args.block_sizes,
-                    args.seed, args.results_dir)
+        source = "random" if args.random_tokens else (
+            Path(args.text_file).read_text() if args.text_file else "default"
+        )
+        for ctx in (args.quality_contexts or [args.context_length]):
+            run_quality(args.config, ctx, args.decode_steps, args.block_sizes,
+                        args.seed, args.results_dir, source=source)
     if args.experiment in ("storage", "all"):
         run_storage(args.block_sizes, args.k_bits, args.v_bits, args.results_dir,
                     tag="phase7_int8_storage")
