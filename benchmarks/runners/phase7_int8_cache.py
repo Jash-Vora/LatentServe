@@ -1,359 +1,473 @@
 """
-Phase 7.3 — INT8 KV cache in the real paged decode path.
+Phase 7.3 — INT8 KV in the actual paged decode path.
 
-docs/phase7.md: 7.1 (spectra) said there was room, 7.2 (offline
-simulation) said INT8 K:per-channel / V:per-token barely moves the
-model's output, 7.2b (online-scaling check) said that number survives
-being fit block-local instead of globally. This is what turns that
-measurement into a running cache: `cache/int8_paged_cache.py`'s
-`Int8PagedKVCache`, wired into `model/latentserve_qwen.py` via
-`allocate_cache(paged=True, kv_dtype="int8")`.
+7.2 showed INT8 round-trip barely moves the model's output (KL 0.00061,
+1.37% top-1 flips) using per-channel K / per-token V scales fit over an
+entire offline sequence. The online-scaling check (`phase7_online_scaling`)
+showed the streaming-realizable version — K's scale fit block-local,
+within each 16-token page — is at least as good, and better at every
+block size tried. This module is what turns that measurement into
+storage: `Int8PagedKVCache` has the same read/write contract as
+`PagedKVCache` (cache/paged_cache.py), so `GQAAttention` cannot tell it
+apart from either paged cache, but the pool underneath is INT8.
 
-Unlike 7.1/7.2/7.2b this needs no simulation — the real cache exists and
-sits behind the same read/write contract as `PagedKVCache`, so it can be
-benchmarked exactly like Phase 3 benchmarked paged vs. contiguous.
+## Why K needs a residual buffer and V does not
 
-Three questions, three experiments:
+A `(block, head, channel)` scale for K can only be fixed once every
+token in that block is known — exactly the online-scaling experiment's
+"cannot look ahead" constraint. But tokens arrive one at a time on the
+decode path (`write()` is called with n=1 per step), so a block is
+*filling* for `block_size - 1` steps before it is fully known.
 
-  **A — quality (any machine with the model; GPU recommended).**
-  Same prompt, same incremental decode, FP16 paged vs. INT8 paged.
-  Scored by logit KL divergence and top-1 flip rate (`DivergenceMeter`,
-  the same metric 7.2/7.2b used), so the offline simulation's numbers
-  and the real cache's numbers are directly comparable.
+The fix is the standard streaming-quantization move: keep each
+sequence's current, not-yet-full block in a small FP16 "residual"
+buffer, and only quantize+scatter it into the INT8 pool the instant it
+reaches `block_size` tokens. `read()` then splices two sources per
+sequence: INT8 pool (dequantized) for every finalized block, and the
+FP16 residual directly for the still-filling tail. The tail is
+therefore always exact — never quantized — which is a free, not a
+approximated, floor: it is *waiting* to be quantized, not a permanent
+higher-precision allowance.
 
-  **B — storage (CPU, no model, seconds).**
-  Bytes/token, the thing this phase is *for*. No forward pass needed —
-  the cache's own accounting settles it, same as `int8.bytes_per_token`
-  in `tests/test_phase7_int8_cache.py`.
+V needs none of this. Its scale is per `(token, head)` — one token's
+own values, nothing else — so it is already streaming-safe the moment
+it is written (`compression/truncation.py`'s note on `per_token` says
+the same thing about the *simulated* version of this). V is quantized
+and scattered directly in `write()`, no residual, no look-ahead.
 
-  **C — latency (GPU, real model).**
-  What the residual-buffer bookkeeping and the dequantize-on-read costs
-  in TPOT, against FP16 paged at the same block size. `int8_paged_cache.py`
-  itself predicts this: storage halves, but traffic only drops ~17%
-  (0.5 read + 1 dequant-write + 1 SDPA-read = 2.5, vs. FP16 paged's
-  1 + 1 + 1 = 3) because attention still consumes a dequantized FP16
-  buffer, not INT8 directly — the full 2x needs a Phase 11 kernel. A
-  latency win here would be a bigger surprise than a small regression.
+## The traffic arithmetic this does *not* fix
 
-Run:
-
-    export PYTHONPATH=$(pwd):$PYTHONPATH
-
-    # A — quality, needs the real model (GPU recommended, CPU works but slow)
-    python -m benchmarks.runners.phase7_int8_cache --experiment quality \\
-        --context-length 4096 --decode-steps 64
-
-    # B — storage, no GPU, no download
-    python -m benchmarks.runners.phase7_int8_cache --experiment storage
-
-    # C — latency, on the T4
-    python -m benchmarks.runners.phase7_int8_cache --experiment latency \\
-        --context-lengths 4096 8192 16384 --batch-sizes 1 4
-
-    # everything
-    python -m benchmarks.runners.phase7_int8_cache --experiment all
+Storing INT8 does not by itself halve decode memory traffic. Today's
+gather still (a) reads the pool, INT8 or not, (b) dequantizes into an
+FP16 buffer, and (c) hands that FP16 buffer to SDPA, which reads it
+again. Call the resident KV size 1 unit (FP16). Storage drops to 0.5,
+but the traffic is 0.5 (read) + 1 (write the FP16 dequant buffer) + 1
+(SDPA reads it) = 2.5, against a resident-FP16 paged cache's gather
+cost of 1 (read) + 1 (write the FP16 copy) + 1 (SDPA reads it) = 3 —
+roughly a 17% reduction in bytes moved, not 50%. The full 2x needs
+attention to consume INT8 directly without a dequantized intermediate,
+which means a custom kernel (Phase 11). What *is* real here, and
+measurable without a kernel, is storage: half the resident bytes, and
+therefore up to ~2x the tokens or concurrent sequences at the same
+memory budget — the Phase 7.5 capacity experiment this module exists
+to feed.
 """
 
 from __future__ import annotations
 
-import argparse
-import statistics
-import sys
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 
-from benchmarks.schema import BenchmarkResult, ResultWriter
+from cache.block_allocator import BlockAllocator, BlockTable
 from cache.kv_cache import KVCacheSpec
-from cache.paged_cache import PagedKVCache
-from cache.int8_paged_cache import Int8PagedKVCache
-from compression.truncation import DivergenceMeter
-from config import load_config
 
-DEFAULT_BLOCK_SIZE = 16
-# Qwen2.5-1.5B-Instruct, native GQA — 2 kv heads x 128 dims, 28 layers.
-# Same constant Phase 3's runner uses for the fp16 byte count.
-KV_BYTES_PER_TOKEN_FP16 = 28_672
+_EPS = 1e-8
 
 
-# ----------------------------------------------------------------------
-# Experiment A — quality: FP16 paged vs. INT8 paged, same decode
-# ----------------------------------------------------------------------
+class Int8PagedKVCache:
+    """Block-paged KV storage with K/V held as INT8, same read/write
+    contract as `PagedKVCache` (and therefore `ContiguousKVCache`), so
+    `GQAAttention` cannot tell any of the three apart.
 
+    K: one scale per `(physical block, kv head, channel)`, fixed the
+    moment its block fills — matching the paged cache's own page size
+    by default (`block_size=16`), which is exactly what the
+    online-scaling check measured as both realizable and quality-best.
 
-@torch.no_grad()
-def run_quality(
-    config_path: str, context_length: int, decode_steps: int, block_sizes: list,
-    seed: int, results_dir: str,
-) -> list:
-    from model.latentserve_qwen import LatentServeQwen
-    from model.qwen import QwenReference
+    V: one scale per `(token, kv head)`, fixed the instant that token
+    is written. No look-ahead, no residual.
+    """
 
-    cfg = load_config(config_path)
-    device = f"cuda:{cfg.hardware.devices[0]}" if torch.cuda.is_available() else "cpu"
-    if device == "cpu":
-        print("[WARN] no CUDA device — this will be slow but is correct.", file=sys.stderr)
+    def __init__(
+        self,
+        spec: KVCacheSpec,
+        block_size: int = 16,
+        num_blocks: Optional[int] = None,
+        k_bits: int = 8,
+        v_bits: int = 8,
+        out_dtype: Optional[torch.dtype] = None,
+    ):
+        self.spec = spec
+        self.block_size = block_size
+        self.device = torch.device(spec.device)
+        self.k_bits = k_bits
+        self.v_bits = v_bits
+        self.k_qmax = 2 ** (k_bits - 1) - 1
+        self.v_qmax = 2 ** (v_bits - 1) - 1
+        # dtype `read()` hands back to attention. Defaults to the cache
+        # spec's own dtype (fp16 in practice) so SDPA sees exactly what
+        # it would from a non-quantized paged cache.
+        self.out_dtype = out_dtype or spec.dtype
 
-    ref = QwenReference(
-        model_name=cfg.model.name, dtype=cfg.model.dtype, device=device,
-        revision=cfg.model.revision, trust_remote_code=cfg.model.trust_remote_code,
-    ).load()
+        if num_blocks is None:
+            # Same convention as PagedKVCache: default to the contiguous
+            # cache's total capacity, so a capacity comparison starts
+            # from an equal memory *budget*, not an equal block count —
+            # doubly important here, since the whole point of Phase 7.5
+            # is to show INT8 buys more capacity from that budget.
+            per_seq = (spec.max_seq_len + block_size - 1) // block_size
+            num_blocks = per_seq * spec.max_batch_size
+        self.num_blocks = num_blocks
 
-    # One fixed prompt + a fixed, model-independent stream of "arriving"
-    # tokens to decode against, so FP16 and INT8 walk through the exact
-    # same positions and the only thing that differs is the cache.
-    torch.manual_seed(seed)
-    prompt_ids = ref.synthesize_input_ids(context_length, seed=seed)
-    decode_ids = ref.synthesize_input_ids(decode_steps, seed=seed + 1)
-
-    writer = ResultWriter(results_dir=results_dir)
-    rows = []
-    print(f"\n=== quality | context={context_length} decode_steps={decode_steps} ===")
-
-    for block_size in block_sizes:
-        fp16 = LatentServeQwen.from_reference(ref, max_seq_len_hint=context_length + decode_steps)
-        fp16.allocate_cache(1, context_length + decode_steps, paged=True, block_size=block_size)
-        fp16.cache.reset()
-        fp16.prefill(prompt_ids, chunk_size=min(4096, context_length))
-        fp16_logits = [
-            fp16.decode_step(decode_ids[:, t : t + 1]) for t in range(decode_steps)
+        self.allocator = BlockAllocator(num_blocks=num_blocks, block_size=block_size)
+        self.tables: list[BlockTable] = [
+            BlockTable(self.allocator) for _ in range(spec.max_batch_size)
         ]
-        fp16.cache = None
 
-        int8 = LatentServeQwen.from_reference(ref, max_seq_len_hint=context_length + decode_steps)
-        int8.allocate_cache(
-            1, context_length + decode_steps, paged=True, block_size=block_size, kv_dtype="int8",
-        )
-        int8.cache.reset()
-        int8.prefill(prompt_ids, chunk_size=min(4096, context_length))
-        int8_logits = [
-            int8.decode_step(decode_ids[:, t : t + 1]) for t in range(decode_steps)
-        ]
-        int8.cache = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        meter = DivergenceMeter()
-        for base, mod in zip(fp16_logits, int8_logits):
-            meter.update(base, mod)
-        result = meter.result()
-
-        print(
-            f"  block_size={block_size:>4}  kl_mean={result['kl_mean_nats']:.5f} nats  "
-            f"kl_max={result['kl_max_nats']:.5f}  top1_flip={result['top1_flip_rate']:.3%}"
-        )
-        writer.write(
-            BenchmarkResult(
-                system="latentserve_int8_paged", tag="phase7_int8_quality", attention="gqa",
-                model=cfg.model.name, batch_size=1, context_length=context_length,
-                output_length=decode_steps, num_gpus=1 if torch.cuda.is_available() else 0,
-                seed=seed,
-                extra={
-                    "status": "ok", "experiment": "int8_quality", "block_size": block_size,
-                    **result,
-                },
+        kv_shape = (num_blocks, block_size, spec.num_kv_heads, spec.head_dim)
+        self.k_pool: list[torch.Tensor] = []
+        self.v_pool: list[torch.Tensor] = []
+        # K scale: one value per (block, head, channel) — shared by every
+        # token in the block, which is the whole memory saving over a
+        # per-token scale and the thing that makes it non-streaming-safe
+        # without the residual buffer below.
+        self.k_scale_pool: list[torch.Tensor] = []
+        # V scale: one value per (block*block_size flattened == token,
+        # head) — no sharing across tokens, no residual needed.
+        self.v_scale_pool: list[torch.Tensor] = []
+        for _ in range(spec.num_layers):
+            self.k_pool.append(torch.zeros(kv_shape, dtype=torch.int8, device=self.device))
+            self.v_pool.append(torch.zeros(kv_shape, dtype=torch.int8, device=self.device))
+            self.k_scale_pool.append(
+                torch.ones(num_blocks, spec.num_kv_heads, spec.head_dim,
+                           dtype=torch.float32, device=self.device)
             )
+            self.v_scale_pool.append(
+                torch.ones(num_blocks, block_size, spec.num_kv_heads,
+                           dtype=torch.float32, device=self.device)
+            )
+
+        self._flat_k = [t.view(-1, spec.num_kv_heads, spec.head_dim) for t in self.k_pool]
+        self._flat_v = [t.view(-1, spec.num_kv_heads, spec.head_dim) for t in self.v_pool]
+        self._flat_v_scale = [t.view(-1, spec.num_kv_heads) for t in self.v_scale_pool]
+
+        # K's not-yet-full tail block per sequence slot, held in the
+        # cache's native dtype (fp16) until it fills. Sized
+        # [max_batch_size, block_size, kv_heads, head_dim] per layer —
+        # a fixed, small cost (one page per sequence per layer), not one
+        # that grows with context length the way the pool does.
+        self._k_residual: list[torch.Tensor] = [
+            torch.zeros(spec.max_batch_size, block_size, spec.num_kv_heads, spec.head_dim,
+                        dtype=spec.dtype, device=self.device)
+            for _ in range(spec.num_layers)
+        ]
+
+        self._read_slots: Optional[torch.Tensor] = None
+        self._write_slots: Optional[torch.Tensor] = None
+        self._active: list[int] = list(range(spec.max_batch_size))
+        self.gather_calls = 0
+
+    # ------------------------------------------------------------------
+    # State — identical to PagedKVCache; duplicated rather than shared
+    # by inheritance, since the two classes' storage is different enough
+    # (int8 pools + scale tables + residual vs. one fp16 pool) that
+    # sharing would mean overriding most of __init__ anyway.
+    # ------------------------------------------------------------------
+
+    @property
+    def length(self) -> int:
+        lengths = {self.tables[i].length for i in self._active}
+        if len(lengths) > 1:
+            raise RuntimeError(f"cache is ragged ({sorted(lengths)}); use seq_lens")
+        return lengths.pop() if lengths else 0
+
+    @property
+    def seq_lens(self) -> list[int]:
+        return [self.tables[i].length for i in self._active]
+
+    @property
+    def active_slots(self) -> list[int]:
+        return list(self._active)
+
+    def set_active(self, slots: Sequence[int]) -> None:
+        self._active = list(slots)
+
+    @property
+    def max_len(self) -> int:
+        return max((self.tables[i].length for i in self._active), default=0)
+
+    def reset(self) -> None:
+        for t in self.tables:
+            if t.blocks:
+                t.free()
+        self.allocator.reset()
+        self.tables = [BlockTable(self.allocator) for _ in range(self.spec.max_batch_size)]
+        self._read_slots = self._write_slots = None
+        self._active = list(range(self.spec.max_batch_size))
+        self.gather_calls = 0
+        # Not strictly required for correctness (every finalized block
+        # belongs to a freed sequence and will be overwritten before it
+        # is ever read again, same as the int8 pool itself), but zeroing
+        # avoids a stale residual masquerading as real data if a bug
+        # elsewhere ever reads before writing.
+        for r in self._k_residual:
+            r.zero_()
+
+    def can_admit(self, num_tokens: int) -> bool:
+        return self.allocator.blocks_for_tokens(num_tokens) <= self.allocator.num_free
+
+    def free_sequence(self, index: int) -> None:
+        self.tables[index].free()
+        self._read_slots = None
+
+    # ------------------------------------------------------------------
+    # Allocation — identical to PagedKVCache.
+    # ------------------------------------------------------------------
+
+    def advance(
+        self,
+        n: int,
+        batch_size: Optional[int] = None,
+        slots: Optional[Sequence[int]] = None,
+    ) -> None:
+        if slots is not None:
+            self.set_active(slots)
+        elif batch_size is not None:
+            self.set_active(range(batch_size))
+        active = self._active
+        starts = [self.tables[i].length for i in active]
+        for i in active:
+            self.tables[i].append(n)
+
+        dev = self.device
+        self._write_slots = torch.tensor(
+            [
+                [self.tables[i].slot(p) for p in range(start, start + n)]
+                for i, start in zip(active, starts)
+            ],
+            dtype=torch.long,
+            device=dev,
         )
-        rows.append(result)
-    return rows
+        b = len(active)
+        max_len = self.max_len
+        self._read_slots = torch.zeros((b, max_len), dtype=torch.long, device=dev)
+        for row, i in enumerate(active):
+            seq_slots = self.tables[i].slots()
+            if seq_slots:
+                self._read_slots[row, : len(seq_slots)] = torch.tensor(
+                    seq_slots, dtype=torch.long, device=dev
+                )
 
+    def padding_mask(self) -> Optional[torch.Tensor]:
+        lens = self.seq_lens
+        if len(set(lens)) <= 1:
+            return None
+        max_len = max(lens)
+        pos = torch.arange(max_len, device=self.device)[None, :]
+        keep = pos < torch.tensor(lens, device=self.device)[:, None]
+        return keep[:, None, None, :]
 
-# ----------------------------------------------------------------------
-# Experiment B — storage: bytes/token, no model, no GPU
-# ----------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Read/write path — this is the part that differs from PagedKVCache.
+    # ------------------------------------------------------------------
 
+    def write(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor, start_pos: int = 0) -> None:
+        """Quantize and scatter [B, kv_heads, n, head_dim] into the pool.
 
-def run_storage(
-    block_sizes: list, k_bits: int, v_bits: int, results_dir: str, tag: str,
-) -> list:
-    # Qwen2.5-1.5B's real shape — the regime this phase's claim is made
-    # for (see test_int8_cache_uses_roughly_half_the_bytes_of_fp16_paged's
-    # docstring on why a toy head_dim distorts the ratio).
-    spec = KVCacheSpec(
-        num_layers=28, num_kv_heads=2, head_dim=128,
-        max_batch_size=1, max_seq_len=256, dtype=torch.float16, device="cpu",
-    )
-    writer = ResultWriter(results_dir=results_dir)
-    rows = []
-    print("\n=== storage | Qwen2.5-1.5B shape (28 layers, 2 kv heads, head_dim=128) ===")
-    fp16_bytes = KV_BYTES_PER_TOKEN_FP16
-    for block_size in block_sizes:
-        int8 = Int8PagedKVCache(spec, block_size=block_size, k_bits=k_bits, v_bits=v_bits)
-        int8_bytes = int8.bytes_per_token
-        ratio = int8_bytes / fp16_bytes
-        print(
-            f"  block_size={block_size:>4}  int8={int8_bytes:>7,d} B/token  "
-            f"fp16={fp16_bytes:>7,d} B/token  ratio={ratio:.3f}  "
-            f"({1 / ratio:.2f}x capacity at fixed budget)"
-        )
-        row = {
-            "block_size": block_size, "k_bits": k_bits, "v_bits": v_bits,
-            "int8_bytes_per_token": int8_bytes, "fp16_bytes_per_token": fp16_bytes,
-            "ratio": ratio, "capacity_multiplier": 1 / ratio,
+        V is quantized and scattered unconditionally — its scale never
+        depends on anything but the token being written. K is buffered
+        into the FP16 residual for whatever block(s) this write touches,
+        and only quantized into the INT8 pool for a block the instant
+        this write completes it. A single call can complete zero, one,
+        or several blocks: n=1 on the decode path completes at most one
+        (the block it happens to fill), while a prefill chunk can span
+        many.
+        """
+        b, h, n, d = k.shape
+        slots = self._write_slots
+        if slots is None or slots.shape[0] < b or slots.shape[1] != n:
+            raise RuntimeError("call advance(n, batch_size) before write()")
+
+        k_tok = k.permute(0, 2, 1, 3)  # [B, n, h, d]
+        v_tok = v.permute(0, 2, 1, 3)
+
+        # --- V: per-token scale, no look-ahead, quantize+scatter now. ---
+        v_scale = v_tok.abs().amax(dim=-1, keepdim=True).clamp_min(_EPS)  # [B, n, h, 1]
+        v_q = torch.clamp(
+            torch.round(v_tok / v_scale * self.v_qmax), -self.v_qmax, self.v_qmax
+        ).to(torch.int8)
+        flat = slots[:b].reshape(-1)
+        self._flat_v[layer_idx].index_copy_(0, flat, v_q.reshape(-1, h, d))
+        # Scale pools are float32 (accumulation precision for the scale
+        # itself, independent of the cache's activation dtype), while
+        # v_scale inherits v's dtype (fp16 on GPU). index_copy_, unlike
+        # plain indexed assignment, requires matching dtypes.
+        v_scale_flat = v_scale.reshape(-1, h).to(self._flat_v_scale[layer_idx].dtype)
+        self._flat_v_scale[layer_idx].index_copy_(0, flat, v_scale_flat)
+
+        # --- K: buffer into the residual, finalize any block this write
+        # completes. `slots` gives the flat physical slot for every
+        # (row, new-token) pair; flat slot // block_size is the physical
+        # block id and flat slot % block_size is the offset within it,
+        # by construction of the pool's [num_blocks, block_size, ...]
+        # layout (same identity PagedKVCache.read() relies on). ---
+        block_ids = slots[:b] // self.block_size  # [B, n]
+        block_offs = slots[:b] % self.block_size  # [B, n]
+        residual = self._k_residual[layer_idx]
+        k_pool = self.k_pool[layer_idx]
+        k_scale_pool = self.k_scale_pool[layer_idx]
+
+        for row in range(b):
+            seq_idx = self._active[row]
+            t = 0
+            while t < n:
+                blk = int(block_ids[row, t])
+                off0 = int(block_offs[row, t])
+                # A write's tokens land at consecutive offsets within a
+                # sequence, so the run of tokens sharing this physical
+                # block is contiguous — find how far it extends.
+                run = 1
+                while t + run < n and int(block_ids[row, t + run]) == blk:
+                    run += 1
+                residual[seq_idx, off0 : off0 + run] = k_tok[row, t : t + run]
+                if off0 + run == self.block_size:
+                    block_data = residual[seq_idx]  # [block_size, h, d], now complete
+                    scale = block_data.abs().amax(dim=0).clamp_min(_EPS)  # [h, d]
+                    q = torch.clamp(
+                        torch.round(block_data / scale * self.k_qmax),
+                        -self.k_qmax, self.k_qmax,
+                    ).to(torch.int8)
+                    k_pool[blk] = q
+                    k_scale_pool[blk] = scale
+                t += run
+
+    def read(
+        self, layer_idx: int, batch_size: int, length: Optional[int] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather + dequantize into [B, kv_heads, L, head_dim], in
+        `out_dtype` (fp16 by default) — the same shape and dtype
+        `PagedKVCache.read()` returns, so attention needs no changes.
+
+        Per docs/paged_cache.py's own framing: this is still "gather
+        into a contiguous buffer" (option (a), Phase 3's motivation for
+        a Phase 11 kernel that reads the pool directly), just gathering
+        from a smaller, INT8 pool instead of an FP16 one. See this
+        module's docstring for the traffic consequence of that.
+        """
+        slots = self._read_slots
+        if slots is None:
+            raise RuntimeError("call advance() before read()")
+        active = self._active[:batch_size]
+        idx = slots[:batch_size] if length is None else slots[:batch_size, :length]
+        max_len = idx.shape[1]
+        self.gather_calls += 1
+
+        # V: every gathered slot has a real scale (V has no residual
+        # state), so this is a uniform gather + dequant, same recipe
+        # regardless of whether the token is old or brand new.
+        v_q = self._flat_v[layer_idx][idx]  # [B, L, h, d]
+        v_scale = self._flat_v_scale[layer_idx][idx]  # [B, L, h]
+        v = v_q.to(torch.float32) * (v_scale.unsqueeze(-1) / self.v_qmax)
+
+        # K: dequantize everything as if it were finalized...
+        k_q = self._flat_k[layer_idx][idx]  # [B, L, h, d]
+        blk_id = idx // self.block_size  # [B, L] — see write()'s note on this identity
+        k_scale = self.k_scale_pool[layer_idx][blk_id]  # [B, L, h, d]
+        k = k_q.to(torch.float32) * (k_scale.to(torch.float32) / self.k_qmax)
+
+        # ...then splice in each row's true FP16 values for its
+        # currently-filling tail block, which has no scale yet (the
+        # dequant above used whatever scale happened to be sitting in
+        # that not-yet-written pool slot — garbage that this overwrites).
+        residual = self._k_residual[layer_idx]
+        for row, seq_idx in enumerate(active):
+            seq_len = min(self.tables[seq_idx].length, max_len)
+            tail_len = seq_len % self.block_size
+            if tail_len:
+                tail_start = seq_len - tail_len
+                k[row, tail_start:seq_len] = residual[seq_idx, :tail_len].to(torch.float32)
+
+        k = k.to(self.out_dtype).permute(0, 2, 1, 3)  # [B, h, L, D]
+        v = v.to(self.out_dtype).permute(0, 2, 1, 3)
+        return k, v
+
+    # ------------------------------------------------------------------
+    # Accounting
+    # ------------------------------------------------------------------
+
+    @property
+    def k_bytes_per_token(self) -> int:
+        """1 byte/element plus this token's share of its block's FP32
+        scale, amortized over `block_size` tokens — the number that
+        makes a capacity comparison against PagedKVCache honest (see
+        Phase 7.5)."""
+        elems = self.spec.num_kv_heads * self.spec.head_dim
+        return elems + (elems * 4 + self.block_size - 1) // self.block_size
+
+    @property
+    def v_bytes_per_token(self) -> int:
+        """1 byte/element plus its own FP32 per-token, per-head scale —
+        not amortized, since V's scale is not shared across tokens."""
+        return self.spec.num_kv_heads * self.spec.head_dim + self.spec.num_kv_heads * 4
+
+    @property
+    def bytes_per_token(self) -> int:
+        """Summed over layers — the INT8-cache analogue of
+        `KVCacheSpec.bytes_per_token`, used in place of it everywhere
+        below so `stats()`/`used_bytes()`/etc. report the true INT8
+        footprint rather than the FP16 spec's."""
+        return self.spec.num_layers * (self.k_bytes_per_token + self.v_bytes_per_token)
+
+    @property
+    def allocated_bytes(self) -> int:
+        """Whole pool, computed from the actual tensors rather than
+        `bytes_per_token * capacity` — that product would double-count
+        the way scale bytes get amortized above. Includes the residual
+        buffers: real GPU memory, fixed in size (bounded by
+        `max_batch_size * block_size`, not by context length), so it is
+        a one-time cost that matters less the longer a sequence runs."""
+        total = 0
+        for layer in range(self.spec.num_layers):
+            total += self.k_pool[layer].numel() * self.k_pool[layer].element_size()
+            total += self.k_scale_pool[layer].numel() * self.k_scale_pool[layer].element_size()
+            total += self.v_pool[layer].numel() * self.v_pool[layer].element_size()
+            total += self.v_scale_pool[layer].numel() * self.v_scale_pool[layer].element_size()
+            total += self._k_residual[layer].numel() * self._k_residual[layer].element_size()
+        return total
+
+    def used_bytes(self, batch_size: Optional[int] = None) -> int:
+        rows = self._active if batch_size is None else list(self._active)[:batch_size]
+        return self.bytes_per_token * sum(self.tables[i].length for i in rows)
+
+    def reserved_bytes(self, batch_size: Optional[int] = None) -> int:
+        rows = self._active if batch_size is None else list(self._active)[:batch_size]
+        return self.bytes_per_token * sum(self.tables[i].capacity for i in rows)
+
+    def fragmentation(self, batch_size: Optional[int] = None) -> float:
+        reserved = self.reserved_bytes(batch_size)
+        return 0.0 if reserved == 0 else 1 - self.used_bytes(batch_size) / reserved
+
+    def utilization(self, batch_size: Optional[int] = None) -> float:
+        alloc = self.allocated_bytes
+        return 0.0 if alloc == 0 else self.used_bytes(batch_size) / alloc
+
+    def bytes_read_per_decode_step(self, batch_size: int) -> int:
+        rows = list(self._active)[:batch_size]
+        return self.bytes_per_token * sum(self.tables[i].length for i in rows)
+
+    def gather_bytes_per_decode_step(self, batch_size: int) -> int:
+        """Extra traffic the gather adds, in INT8-pool bytes — the
+        numerator for the "0.5 + 1 + 1 = 2.5x" arithmetic in this
+        module's docstring is this plus the FP16 dequant buffer's own
+        read+write, which is sized off `spec.bytes_per_token` (FP16),
+        not this. `benchmarks/runners` computes that comparison; this
+        method only reports the paging-specific half of it."""
+        return 2 * self.bytes_read_per_decode_step(batch_size)
+
+    def stats(self, batch_size: Optional[int] = None) -> dict:
+        b = len(self._active) if batch_size is None else batch_size
+        return {
+            "kv_bytes_per_token": self.bytes_per_token,
+            "kv_bytes_per_token_fp16_equiv": self.spec.bytes_per_token,
+            "kv_allocated_mb": self.allocated_bytes / 1024 / 1024,
+            "kv_used_mb": self.used_bytes(b) / 1024 / 1024,
+            "kv_reserved_mb": self.reserved_bytes(b) / 1024 / 1024,
+            "kv_utilization": self.utilization(b),
+            "internal_fragmentation": self.fragmentation(b),
+            "block_size": self.block_size,
+            "k_bits": self.k_bits,
+            "v_bits": self.v_bits,
+            "gather_calls": self.gather_calls,
+            **self.allocator.stats(),
         }
-        writer.write(
-            BenchmarkResult(
-                system="latentserve_int8_paged", tag=tag, attention="gqa",
-                model="Qwen/Qwen2.5-1.5B-Instruct", batch_size=1, context_length=0,
-                output_length=0, num_gpus=0,
-                extra={"status": "ok", "experiment": "int8_storage", **row},
-            )
-        )
-        rows.append(row)
-    return rows
-
-
-# ----------------------------------------------------------------------
-# Experiment C — latency: TPOT, FP16 paged vs. INT8 paged, same block size
-# ----------------------------------------------------------------------
-
-
-def run_latency(
-    config_path: str, context_lengths: list, batch_sizes: list, output_tokens: int,
-    repeats: int, warmup: int, block_sizes: list, results_dir: str,
-) -> list:
-    from model.latentserve_qwen import LatentServeQwen
-    from model.qwen import QwenReference
-
-    cfg = load_config(config_path)
-    device = f"cuda:{cfg.hardware.devices[0]}" if torch.cuda.is_available() else "cpu"
-    if device == "cpu":
-        print("[WARN] no CUDA device — latency numbers meaningless.", file=sys.stderr)
-
-    ref = QwenReference(
-        model_name=cfg.model.name, dtype=cfg.model.dtype, device=device,
-        revision=cfg.model.revision, trust_remote_code=cfg.model.trust_remote_code,
-    ).load()
-    engine = LatentServeQwen.from_reference(
-        ref, max_seq_len_hint=max(context_lengths) + output_tokens
-    )
-    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
-    writer = ResultWriter(results_dir=results_dir)
-    rows = []
-
-    print(f"\n=== latency | block_sizes={block_sizes} output_tokens={output_tokens} ===")
-    for batch_size in batch_sizes:
-        for ctx_len in context_lengths:
-            max_seq_len = ctx_len + output_tokens
-            base_ids = ref.synthesize_input_ids(ctx_len, seed=cfg.generation.seed)
-            input_ids = base_ids.expand(batch_size, -1).contiguous()
-            baseline_tpot = None
-
-            for block_size in block_sizes:
-                for kv_dtype in ("fp16", "int8"):
-                    engine.allocate_cache(
-                        batch_size, max_seq_len, paged=True, block_size=block_size,
-                        kv_dtype=kv_dtype,
-                    )
-                    trials = []
-                    try:
-                        for trial in range(warmup + repeats):
-                            r = engine.generate_with_timing(
-                                input_ids=input_ids, max_new_tokens=output_tokens,
-                                chunk_size=min(4096, ctx_len),
-                            )
-                            if trial >= warmup:
-                                trials.append(r)
-                    except torch.cuda.OutOfMemoryError as e:
-                        engine.cache = None
-                        torch.cuda.empty_cache()
-                        print(f"  [OOM] {kv_dtype} bs={block_size} B={batch_size} ctx={ctx_len}")
-                        writer.write(
-                            BenchmarkResult(
-                                system=f"latentserve_paged_{kv_dtype}", tag="phase7_int8_latency",
-                                attention="gqa", model=cfg.model.name, batch_size=batch_size,
-                                context_length=ctx_len, output_length=output_tokens,
-                                num_gpus=1, seed=cfg.generation.seed,
-                                extra={"status": "oom", "error": str(e).split("\n")[0]},
-                            )
-                        )
-                        continue
-
-                    tpot = statistics.median([t.tpot_ms for t in trials])
-                    if kv_dtype == "fp16":
-                        baseline_tpot = tpot
-                    cache = engine.cache
-                    gather_mb = cache.gather_bytes_per_decode_step(batch_size) / 1024 / 1024
-                    label = f"{kv_dtype}(bs={block_size})"
-                    print(
-                        f"  B={batch_size} ctx={ctx_len:>6} {label:<16} "
-                        f"ttft={statistics.median([t.ttft_ms for t in trials]):8.1f}ms "
-                        f"tpot={tpot:6.2f}ms "
-                        + (f"({tpot / baseline_tpot - 1:+.1%} vs fp16 paged) "
-                           if baseline_tpot and kv_dtype == "int8" else "")
-                        + f"gather={gather_mb:.0f}MB/step "
-                        f"kv_used={cache.used_bytes(batch_size) / 1024 / 1024:.0f}MB"
-                    )
-                    writer.write(
-                        BenchmarkResult(
-                            system=f"latentserve_paged_{kv_dtype}", tag="phase7_int8_latency",
-                            attention="gqa",
-                            model=cfg.model.name, batch_size=batch_size, context_length=ctx_len,
-                            output_length=output_tokens, num_gpus=1,
-                            ttft_ms=statistics.median([t.ttft_ms for t in trials]),
-                            tpot_ms=tpot,
-                            e2e_latency_ms=statistics.median([t.e2e_latency_ms for t in trials]),
-                            throughput_tokens_sec=statistics.median(
-                                [t.throughput_tokens_sec * batch_size for t in trials]
-                            ),
-                            peak_vram_mb=max(t.peak_vram_mb for t in trials),
-                            kv_cache_mb=statistics.median([t.kv_cache_mb for t in trials]),
-                            seed=cfg.generation.seed,
-                            extra={
-                                "status": "ok", "experiment": "int8_latency", "kv_dtype": kv_dtype,
-                                "block_size": block_size,
-                                "gather_mb_per_step": gather_mb,
-                                "int8_overhead_pct": (
-                                    (tpot / baseline_tpot - 1) * 100
-                                    if baseline_tpot and kv_dtype == "int8" else None
-                                ),
-                                "gpu_name": gpu_name,
-                                "block_stats": cache.stats(batch_size),
-                            },
-                        )
-                    )
-                    rows.append(tpot)
-            engine.cache = None
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-    return rows
-
-
-# ----------------------------------------------------------------------
-
-
-def main() -> int:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--experiment", choices=["quality", "storage", "latency", "all"],
-                   default="storage")
-    p.add_argument("--config", default="configs/phase2_gqa.yaml")
-    p.add_argument("--block-sizes", type=int, nargs="+", default=[DEFAULT_BLOCK_SIZE])
-    p.add_argument("--k-bits", type=int, default=8)
-    p.add_argument("--v-bits", type=int, default=8)
-    # Experiment A
-    p.add_argument("--context-length", type=int, default=4096)
-    p.add_argument("--decode-steps", type=int, default=64)
-    # Experiment C
-    p.add_argument("--context-lengths", type=int, nargs="+", default=[4096, 8192, 16384])
-    p.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4])
-    p.add_argument("--output-tokens", type=int, default=128)
-    p.add_argument("--repeats", type=int, default=3)
-    p.add_argument("--warmup", type=int, default=1)
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--results-dir", default="results/raw")
-    args = p.parse_args()
-
-    if args.experiment in ("quality", "all"):
-        run_quality(args.config, args.context_length, args.decode_steps, args.block_sizes,
-                    args.seed, args.results_dir)
-    if args.experiment in ("storage", "all"):
-        run_storage(args.block_sizes, args.k_bits, args.v_bits, args.results_dir,
-                    tag="phase7_int8_storage")
-    if args.experiment in ("latency", "all"):
-        run_latency(args.config, args.context_lengths, args.batch_sizes, args.output_tokens,
-                    args.repeats, args.warmup, args.block_sizes, args.results_dir)
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
