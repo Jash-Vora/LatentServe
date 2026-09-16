@@ -289,7 +289,12 @@ class Int8PagedKVCache:
         ).to(torch.int8)
         flat = slots[:b].reshape(-1)
         self._flat_v[layer_idx].index_copy_(0, flat, v_q.reshape(-1, h, d))
-        self._flat_v_scale[layer_idx].index_copy_(0, flat, v_scale.reshape(-1, h))
+        # Scale pools are float32 (accumulation precision for the scale
+        # itself, independent of the cache's activation dtype), while
+        # v_scale inherits v's dtype (fp16 on GPU). index_copy_, unlike
+        # plain indexed assignment, requires matching dtypes.
+        v_scale_flat = v_scale.reshape(-1, h).to(self._flat_v_scale[layer_idx].dtype)
+        self._flat_v_scale[layer_idx].index_copy_(0, flat, v_scale_flat)
 
         # --- K: buffer into the residual, finalize any block this write
         # completes. `slots` gives the flat physical slot for every
