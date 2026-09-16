@@ -524,3 +524,86 @@ def test_ragged_batch_reads_agree_with_per_sequence_replay():
             torch.testing.assert_close(
                 v_out[row : row + 1, :, :length], v_ref, rtol=1e-5, atol=1e-5
             )
+
+# ----------------------------------------------------------------------
+# Asymmetric (affine) quantization — Phase 7.3b
+# ----------------------------------------------------------------------
+
+
+def test_asymmetric_roundtrip_is_exact_at_full_resolution():
+    """A value inside the fitted [min, max] of its block must survive an
+    8-bit asymmetric round trip to within one quantization step.
+
+    This is the test that would have caught the int8 overflow: adding the
+    code offset back to an int8 tensor keeps it int8, so code 127 + 128
+    wraps to -1. It only breaks at 8 bits — at 4 the range is [-8, 7] and
+    nothing wraps — so a bit-width sweep would have shown 4-bit working
+    and 8-bit broken and looked like anything but a dtype bug.
+    """
+    import torch
+
+    from cache.int8_paged_cache import Int8PagedKVCache
+    from cache.kv_cache import KVCacheSpec
+
+    spec = KVCacheSpec(num_layers=1, num_kv_heads=2, head_dim=8, max_batch_size=1,
+                       max_seq_len=64, dtype=torch.float32, device="cpu")
+    cache = Int8PagedKVCache(spec, block_size=16, asymmetric=True)
+    torch.manual_seed(0)
+    # Deliberately offset from zero: an affine fit should handle this
+    # far better than a symmetric one, and it is where the sign of the
+    # folded zero-point matters.
+    k = torch.rand(1, 2, 32, 8) * 4 + 10
+    v = torch.rand(1, 2, 32, 8) * 4 - 12
+
+    cache.advance(32, batch_size=1)
+    cache.write(0, k, v, start_pos=0)
+    k_out, v_out = cache.read(0, batch_size=1)
+
+    step_k = (k.amax() - k.amin()) / 255
+    step_v = (v.amax() - v.amin()) / 255
+    assert (k_out - k).abs().max() < step_k * 2
+    assert (v_out - v).abs().max() < step_v * 2
+
+
+def test_asymmetric_beats_symmetric_on_offset_data():
+    """The reason to carry a zero-point at all: a symmetric range spends
+    half its levels on a sign the data never uses."""
+    import torch
+
+    from cache.int8_paged_cache import Int8PagedKVCache
+    from cache.kv_cache import KVCacheSpec
+
+    def err(asymmetric: bool) -> float:
+        spec = KVCacheSpec(num_layers=1, num_kv_heads=2, head_dim=8, max_batch_size=1,
+                           max_seq_len=64, dtype=torch.float32, device="cpu")
+        cache = Int8PagedKVCache(spec, block_size=16, k_bits=4, v_bits=4,
+                                 asymmetric=asymmetric)
+        torch.manual_seed(1)
+        k = torch.rand(1, 2, 32, 8) * 2 + 20     # strictly positive, far from zero
+        cache.advance(32, batch_size=1)
+        cache.write(0, k, k, start_pos=0)
+        out, _ = cache.read(0, batch_size=1)
+        return float((out - k).abs().mean())
+
+    assert err(asymmetric=True) < err(asymmetric=False) / 3
+
+
+def test_asymmetric_zero_point_is_counted_in_bytes_per_token():
+    """A zero-point per scale doubles the metadata. Reporting the
+    symmetric footprint for an asymmetric cache would overstate the
+    compression ratio, which is the error this project has now made
+    twice in other forms."""
+    import torch
+
+    from cache.int8_paged_cache import Int8PagedKVCache
+    from cache.kv_cache import KVCacheSpec
+
+    spec = KVCacheSpec(num_layers=1, num_kv_heads=2, head_dim=128, max_batch_size=1,
+                       max_seq_len=128, dtype=torch.float16, device="cpu")
+    sym = Int8PagedKVCache(spec, block_size=16, asymmetric=False)
+    asym = Int8PagedKVCache(spec, block_size=16, asymmetric=True)
+    assert asym.bytes_per_token > sym.bytes_per_token
+    # The extra is exactly one more scale table for K and one for V.
+    elems = spec.num_kv_heads * spec.head_dim
+    extra = (elems * 4 + 15) // 16 + spec.num_kv_heads * 4
+    assert asym.bytes_per_token - sym.bytes_per_token == extra

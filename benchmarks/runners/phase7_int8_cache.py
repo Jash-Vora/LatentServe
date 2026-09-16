@@ -182,6 +182,164 @@ def run_quality(
 
 
 # ----------------------------------------------------------------------
+# Experiment D — capacity: what the memory saving actually buys
+# ----------------------------------------------------------------------
+
+
+def _decode_fits(model, batch: int, ctx: int, block_size: int, kv_dtype: str,
+                 asymmetric: bool, k_bits: int, v_bits: int) -> bool:
+    """Can this runtime hold `batch` sequences of `ctx` tokens and take a
+    decode step?
+
+    The cache is advanced to `ctx` without a real prefill. That is
+    deliberate: prefill peak is an *activation* question, already bounded
+    by chunking (Phase 2), and running it would make this sweep hours
+    instead of minutes. What is being measured is the steady-state decode
+    ceiling — the pool, the gather buffer and attention — which is what
+    decides how many sequences a server can hold.
+    """
+    import torch
+
+    cache = None
+    try:
+        cache = model.allocate_cache(
+            batch, ctx + 8, paged=True, block_size=block_size, kv_dtype=kv_dtype,
+            k_bits=k_bits, v_bits=v_bits,
+            **({"asymmetric": asymmetric} if kv_dtype == "int8" else {}),
+        )
+        cache.reset()
+        cache.advance(ctx, batch_size=batch)
+        ids = torch.zeros(batch, 1, dtype=torch.long, device=model.device)
+        positions = torch.full((batch, 1), ctx - 1, dtype=torch.long, device=model.device)
+        model.decode_step_ragged(ids, positions, list(range(batch)))
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        return True
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+        if "out of memory" not in str(e).lower():
+            raise
+        return False
+    finally:
+        model.cache = None
+        del cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def _largest_that_fits(probe, lo: int, hi: int) -> int:
+    """Doubling search then bisection. `probe(n) -> bool`, monotone."""
+    if not probe(lo):
+        return 0
+    best = lo
+    n = lo
+    while n * 2 <= hi and probe(n * 2):
+        best = n = n * 2
+    low, high = best, min(best * 2, hi)
+    while low + 1 < high:
+        mid = (low + high) // 2
+        if probe(mid):
+            low = mid
+        else:
+            high = mid
+    return low
+
+
+def run_capacity(
+    config_path: str, contexts: list, batch_sizes: list, block_sizes: list,
+    k_bits: int, v_bits: int, max_batch: int, max_context: int,
+    results_dir: str,
+) -> list:
+    """FP16 paged vs INT8 paged: how much more actually fits.
+
+    Two directions, because a server runs out of room in both:
+      * fixed context, raise concurrency until it will not fit;
+      * fixed concurrency, raise context until it will not fit.
+
+    Reported against the analytic bytes/token ratio, which is the
+    prediction. A measured ratio well below it means something other
+    than the KV cache is binding — weights, activations, the gather
+    buffer — and that is worth knowing before claiming the saving.
+    """
+    import torch
+
+    from model.latentserve_qwen import LatentServeQwen
+    from model.qwen import QwenReference
+
+    cfg = load_config(config_path)
+    device = f"cuda:{cfg.hardware.devices[0]}" if torch.cuda.is_available() else "cpu"
+    if not torch.cuda.is_available():
+        print("[WARN] capacity is a VRAM question; on CPU this measures nothing.",
+              file=sys.stderr)
+
+    ref = QwenReference(
+        model_name=cfg.model.name, dtype=cfg.model.dtype, device=device,
+        revision=cfg.model.revision, trust_remote_code=cfg.model.trust_remote_code,
+    ).load()
+    model = LatentServeQwen.from_reference(ref, max_seq_len_hint=max_context)
+    writer = ResultWriter(results_dir=results_dir)
+    rows = []
+
+    if torch.cuda.is_available():
+        free, total = torch.cuda.mem_get_info()
+        print(f"\n=== capacity | {free / 1024**3:.2f} GiB free of "
+              f"{total / 1024**3:.2f} GiB after weights ===")
+
+    variants = [("fp16", False)] + [("int8", a) for a in (False, True)]
+
+    for block_size in block_sizes:
+        for ctx in contexts:
+            print(f"\n-- max concurrency at ctx={ctx}, block={block_size} --")
+            baseline = None
+            for kv_dtype, asym in variants:
+                label = kv_dtype + (" asym" if asym else "")
+                n = _largest_that_fits(
+                    lambda b: _decode_fits(model, b, ctx, block_size, kv_dtype, asym,
+                                           k_bits, v_bits),
+                    lo=1, hi=max_batch,
+                )
+                if baseline is None:
+                    baseline = n
+                print(f"   {label:<10} max batch {n:>4}"
+                      + (f"   ({n / baseline:.2f}x fp16)" if baseline else ""))
+                row = {"experiment": "capacity_concurrency", "kv_dtype": kv_dtype,
+                       "asymmetric": asym, "block_size": block_size, "context_length": ctx,
+                       "max_batch": n, "vs_fp16": n / baseline if baseline else None,
+                       "k_bits": k_bits, "v_bits": v_bits, "status": "ok"}
+                rows.append(row)
+                writer.write(BenchmarkResult(
+                    system=f"latentserve_{kv_dtype}_paged", tag="phase7_capacity",
+                    attention="gqa", model=cfg.model.name, batch_size=n,
+                    context_length=ctx, output_length=0, num_gpus=1, seed=0, extra=row,
+                ))
+
+        for batch in batch_sizes:
+            print(f"\n-- max context at batch={batch}, block={block_size} --")
+            baseline = None
+            for kv_dtype, asym in variants:
+                label = kv_dtype + (" asym" if asym else "")
+                n = _largest_that_fits(
+                    lambda c: _decode_fits(model, batch, c, block_size, kv_dtype, asym,
+                                           k_bits, v_bits),
+                    lo=512, hi=max_context,
+                )
+                if baseline is None:
+                    baseline = n
+                print(f"   {label:<10} max context {n:>7}"
+                      + (f"   ({n / baseline:.2f}x fp16)" if baseline else ""))
+                row = {"experiment": "capacity_context", "kv_dtype": kv_dtype,
+                       "asymmetric": asym, "block_size": block_size, "batch_size": batch,
+                       "max_context": n, "vs_fp16": n / baseline if baseline else None,
+                       "k_bits": k_bits, "v_bits": v_bits, "status": "ok"}
+                rows.append(row)
+                writer.write(BenchmarkResult(
+                    system=f"latentserve_{kv_dtype}_paged", tag="phase7_capacity",
+                    attention="gqa", model=cfg.model.name, batch_size=batch,
+                    context_length=n, output_length=0, num_gpus=1, seed=0, extra=row,
+                ))
+    return rows
+
+
+# ----------------------------------------------------------------------
 # Experiment B — storage: bytes/token, no model, no GPU
 # ----------------------------------------------------------------------
 
@@ -347,8 +505,16 @@ def run_latency(
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--experiment", choices=["quality", "storage", "latency", "all"],
+    p.add_argument("--experiment",
+                   choices=["quality", "storage", "latency", "capacity", "all"],
                    default="storage")
+    p.add_argument("--asymmetric", action="store_true",
+                   help="affine quantization: fits [min, max] per group instead of assuming "
+                   "symmetry about zero. Measured 6.5x better in KL at 8 bits and "
+                   "categorically better below (symmetric int6 reaches max-KL 8.2 nats). "
+                   "Costs a zero-point per scale, which bytes_per_token counts.")
+    p.add_argument("--max-batch", type=int, default=256)
+    p.add_argument("--max-context", type=int, default=131072)
     p.add_argument("--config", default="configs/phase2_gqa.yaml")
     p.add_argument("--block-sizes", type=int, nargs="+", default=[DEFAULT_BLOCK_SIZE])
     p.add_argument("--k-bits", type=int, default=8)
@@ -384,6 +550,10 @@ def main() -> int:
         for ctx in (args.quality_contexts or [args.context_length]):
             run_quality(args.config, ctx, args.decode_steps, args.block_sizes,
                         args.seed, args.results_dir, source=source)
+    if args.experiment in ("capacity", "all"):
+        run_capacity(args.config, args.context_lengths, args.batch_sizes, args.block_sizes,
+                     args.k_bits, args.v_bits, args.max_batch, args.max_context,
+                     args.results_dir)
     if args.experiment in ("storage", "all"):
         run_storage(args.block_sizes, args.k_bits, args.v_bits, args.results_dir,
                     tag="phase7_int8_storage")

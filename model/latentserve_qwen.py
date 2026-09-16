@@ -215,6 +215,7 @@ class LatentServeQwen:
         kv_dtype: str = "fp16",
         k_bits: int = 8,
         v_bits: int = 8,
+        asymmetric: bool = False,
     ):
         """Allocate once, up front, for input + output tokens. Reused
         across trials via `reset()` so the benchmark measures steady
@@ -242,7 +243,7 @@ class LatentServeQwen:
         if kv_dtype == "int8":
             self.cache = Int8PagedKVCache(
                 spec, block_size=block_size, num_blocks=num_blocks,
-                k_bits=k_bits, v_bits=v_bits,
+                k_bits=k_bits, v_bits=v_bits, asymmetric=asymmetric,
             )
         elif paged:
             self.cache = PagedKVCache(spec, block_size=block_size, num_blocks=num_blocks)

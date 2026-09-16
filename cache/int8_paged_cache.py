@@ -161,6 +161,7 @@ class Int8PagedKVCache:
         num_blocks: Optional[int] = None,
         k_bits: int = 8,
         v_bits: int = 8,
+        asymmetric: bool = False,
         out_dtype: Optional[torch.dtype] = None,
     ):
         self.spec = spec
@@ -172,6 +173,35 @@ class Int8PagedKVCache:
         self.v_bits = v_bits
         self.k_qmax = 2 ** (k_bits - 1) - 1
         self.v_qmax = 2 ** (v_bits - 1) - 1
+        # Asymmetric (affine) quantization fits [min, max] per group
+        # instead of assuming the range is centred on zero. Measured on
+        # Qwen2.5-1.5B it is 6.5x better than symmetric at 8 bits
+        # (KL 0.00006 vs 0.00039) and categorically better below that:
+        # symmetric int6 produces max-KL of 8.2 nats — individual
+        # positions destroyed — against 0.022 asymmetric. K's channels
+        # carry a DC offset, and a symmetric range spends half its levels
+        # on a sign those channels barely use.
+        #
+        # The cost is a zero-point stored alongside every scale, doubling
+        # the scale metadata: 25% of the int8 K payload at block 16, 6%
+        # at block 64. `k_bytes_per_token` counts it.
+        self.asymmetric = asymmetric
+        self.k_levels = 2**k_bits - 1
+        self.v_levels = 2**v_bits - 1
+        # Stored codes stay in int8 range by shifting the unsigned code
+        # down by half the range: q_s = q_u - 2^(bits-1). The shift is
+        # folded into the stored zero-point at write time
+        # (zero' = lo + offset * step, since
+        #  q_s*step + zero' = (q_u - offset)*step + lo + offset*step = q_u*step + lo)
+        # so the read path is
+        # `q_s * step + zero'` — one multiply-add, identical in shape to
+        # the symmetric path, and with nothing added back to an int8
+        # tensor. Adding it back at read time instead silently overflows:
+        # int8 + 128 stays int8, so code 127 wraps to -1. That only shows
+        # up at 8 bits — at 4 the range is [-8, 7] and nothing wraps —
+        # which made it look like a bit-width bug rather than a dtype one.
+        self.k_offset = 2 ** (k_bits - 1)
+        self.v_offset = 2 ** (v_bits - 1)
         # dtype `read()` hands back to attention. Defaults to the cache
         # spec's own dtype (fp16 in practice) so SDPA sees exactly what
         # it would from a non-quantized paged cache.
@@ -214,9 +244,20 @@ class Int8PagedKVCache:
                 torch.ones(num_blocks, block_size, spec.num_kv_heads,
                            dtype=torch.float32, device=self.device)
             )
+        # Zero-point pools mirror the scale pools exactly, and are only
+        # allocated when asymmetric — a symmetric cache pays nothing.
+        self.k_zero_pool: list[torch.Tensor] = (
+            [torch.zeros_like(t) for t in self.k_scale_pool] if asymmetric else []
+        )
+        self.v_zero_pool: list[torch.Tensor] = (
+            [torch.zeros_like(t) for t in self.v_scale_pool] if asymmetric else []
+        )
 
         self._flat_v = [t.view(-1, spec.num_kv_heads, spec.head_dim) for t in self.v_pool]
         self._flat_v_scale = [t.view(-1, spec.num_kv_heads) for t in self.v_scale_pool]
+        self._flat_v_zero = (
+            [t.view(-1, spec.num_kv_heads) for t in self.v_zero_pool] if asymmetric else []
+        )
 
         # K's not-yet-full tail block per sequence slot, held in the
         # cache's native dtype (fp16) until it fills. Sized
@@ -427,10 +468,20 @@ class Int8PagedKVCache:
         behaviour standing in for a guard.
         """
         f = data.to(torch.float32)
-        step = f.abs().amax(dim=1).clamp_min(_EPS) / self.k_qmax  # [N, heads, dim]
-        q = torch.clamp(
-            torch.round(f / step.unsqueeze(1)), -self.k_qmax, self.k_qmax
-        ).to(torch.int8)
+        if self.asymmetric:
+            lo = f.amin(dim=1)                                    # [N, heads, dim]
+            hi = f.amax(dim=1)
+            step = ((hi - lo) / self.k_levels).clamp_min(_EPS)
+            q_u = torch.clamp(
+                torch.round((f - lo.unsqueeze(1)) / step.unsqueeze(1)), 0, self.k_levels
+            )
+            q = (q_u - self.k_offset).to(torch.int8)
+            self.k_zero_pool[layer_idx].index_copy_(0, ids, lo + self.k_offset * step)
+        else:
+            step = f.abs().amax(dim=1).clamp_min(_EPS) / self.k_qmax  # [N, heads, dim]
+            q = torch.clamp(
+                torch.round(f / step.unsqueeze(1)), -self.k_qmax, self.k_qmax
+            ).to(torch.int8)
         self.k_pool[layer_idx].index_copy_(0, ids, q)
         self.k_scale_pool[layer_idx].index_copy_(0, ids, step)
 
@@ -458,13 +509,23 @@ class Int8PagedKVCache:
         # The fit is FP32 for the same reason K's is (see
         # _finalize_blocks): an FP16 `_EPS` floor is no floor at all.
         v_f = v_tok.to(torch.float32)
-        v_step = v_f.abs().amax(dim=-1, keepdim=True).clamp_min(_EPS) / self.v_qmax
-        v_q = torch.clamp(
-            torch.round(v_f / v_step), -self.v_qmax, self.v_qmax
-        ).to(torch.int8)
         flat = slots[:b].reshape(-1)
+        if self.asymmetric:
+            v_lo = v_f.amin(dim=-1, keepdim=True)
+            v_hi = v_f.amax(dim=-1, keepdim=True)
+            v_step = ((v_hi - v_lo) / self.v_levels).clamp_min(_EPS)
+            v_u = torch.clamp(torch.round((v_f - v_lo) / v_step), 0, self.v_levels)
+            v_q = (v_u - self.v_offset).to(torch.int8)
+            self._flat_v_zero[layer_idx].index_copy_(
+                0, flat, (v_lo + self.v_offset * v_step).squeeze(-1).reshape(-1, h)
+            )
+        else:
+            v_step = v_f.abs().amax(dim=-1, keepdim=True).clamp_min(_EPS) / self.v_qmax
+            v_q = torch.clamp(
+                torch.round(v_f / v_step), -self.v_qmax, self.v_qmax
+            ).to(torch.int8)
         self._flat_v[layer_idx].index_copy_(0, flat, v_q.reshape(-1, h, d))
-        self._flat_v_scale[layer_idx].index_copy_(0, flat, v_step.reshape(-1, h))
+        self._flat_v_scale[layer_idx].index_copy_(0, flat, v_step.squeeze(-1).reshape(-1, h))
 
         # --- K: replay the plan. ---
         bs = self.block_size
@@ -569,11 +630,22 @@ class Int8PagedKVCache:
         # read once and the FP16 buffer written once, no intermediate.
         k_q = self.k_pool[layer_idx][blk]  # [B, nblk, bs, h, d]
         k_step = self.k_scale_pool[layer_idx][blk].to(self.out_dtype)  # [B, nblk, h, d]
-        k = (k_q * k_step.unsqueeze(2)).reshape(b, nblk * bs, h, d)[:, :view_len]
-
         v_q = self.v_pool[layer_idx][blk]  # [B, nblk, bs, h, d]
         v_step = self.v_scale_pool[layer_idx][blk].to(self.out_dtype)  # [B, nblk, bs, h]
-        v = (v_q * v_step.unsqueeze(-1)).reshape(b, nblk * bs, h, d)[:, :view_len]
+
+        if self.asymmetric:
+            # x = q_s * step + zero', with the code shift already folded
+            # into zero' at write time. Same multiply-add as symmetric,
+            # and nothing is added to an int8 tensor.
+            k_zero = self.k_zero_pool[layer_idx][blk].to(self.out_dtype)
+            k = k_q * k_step.unsqueeze(2) + k_zero.unsqueeze(2)
+            v_zero = self.v_zero_pool[layer_idx][blk].to(self.out_dtype)
+            v = v_q * v_step.unsqueeze(-1) + v_zero.unsqueeze(-1)
+        else:
+            k = k_q * k_step.unsqueeze(2)
+            v = v_q * v_step.unsqueeze(-1)
+        k = k.reshape(b, nblk * bs, h, d)[:, :view_len]
+        v = v.reshape(b, nblk * bs, h, d)[:, :view_len]
 
         self._splice_residual(layer_idx, k, active, view_len)
 
@@ -590,13 +662,16 @@ class Int8PagedKVCache:
         makes a capacity comparison against PagedKVCache honest (see
         Phase 7.5)."""
         elems = self.spec.num_kv_heads * self.spec.head_dim
-        return elems + (elems * 4 + self.block_size - 1) // self.block_size
+        params = 2 if self.asymmetric else 1          # scale, plus zero-point
+        return elems + (elems * 4 * params + self.block_size - 1) // self.block_size
 
     @property
     def v_bytes_per_token(self) -> int:
         """1 byte/element plus its own FP32 per-token, per-head scale —
         not amortized, since V's scale is not shared across tokens."""
-        return self.spec.num_kv_heads * self.spec.head_dim + self.spec.num_kv_heads * 4
+        params = 2 if self.asymmetric else 1
+        return (self.spec.num_kv_heads * self.spec.head_dim
+                + self.spec.num_kv_heads * 4 * params)
 
     @property
     def bytes_per_token(self) -> int:
@@ -622,8 +697,10 @@ class Int8PagedKVCache:
         `bytes_per_token`. Reported so a `--k-bits 4` sweep shows the
         storage it is *arguing for* next to the storage it has."""
         elems = self.spec.num_kv_heads * self.spec.head_dim
-        k = (elems * self.k_bits + 7) // 8 + (elems * 4 + self.block_size - 1) // self.block_size
-        v = (elems * self.v_bits + 7) // 8 + self.spec.num_kv_heads * 4
+        params = 2 if self.asymmetric else 1
+        k = ((elems * self.k_bits + 7) // 8
+             + (elems * 4 * params + self.block_size - 1) // self.block_size)
+        v = (elems * self.v_bits + 7) // 8 + self.spec.num_kv_heads * 4 * params
         return self.spec.num_layers * (k + v)
 
     @property
@@ -689,6 +766,7 @@ class Int8PagedKVCache:
     def stats(self, batch_size: Optional[int] = None) -> dict:
         b = len(self._active) if batch_size is None else batch_size
         return {
+            "asymmetric": self.asymmetric,
             "kv_bytes_per_token": self.bytes_per_token,
             "kv_bytes_per_token_fp16_equiv": self.spec.bytes_per_token,
             "kv_bytes_per_token_if_packed": self.packed_bytes_per_token,
