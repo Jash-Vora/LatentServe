@@ -567,6 +567,9 @@ def paged_decode_attention(
     softmax_scale: Optional[float] = None,
     max_seq_len: Optional[int] = None,
     force_reference: bool = False,
+    pages_per_iter: Optional[int] = None,
+    num_warps: Optional[int] = None,
+    num_stages: Optional[int] = None,
 ) -> torch.Tensor:
     """Dispatch to Triton when possible, else the reference.
 
@@ -615,8 +618,13 @@ def paged_decode_attention(
     out = _scratch("out", (b, h_kv, 16, d), q.dtype, q.device)
 
     dummy = torch.empty(1, device=q.device)
-    kernel = _paged_decode_tiled if PAGES_PER_ITER > 1 else _paged_decode_kernel
-    extra = {"PPI": PAGES_PER_ITER} if PAGES_PER_ITER > 1 else {}
+    # Tunables are per-call so Phase 12 can sweep them without reimporting
+    # the module; the env-derived constants are the defaults.
+    ppi = PAGES_PER_ITER if pages_per_iter is None else pages_per_iter
+    warps = NUM_WARPS if num_warps is None else num_warps
+    stages = NUM_STAGES if num_stages is None else num_stages
+    kernel = _paged_decode_tiled if ppi > 1 else _paged_decode_kernel
+    extra = {"PPI": ppi} if ppi > 1 else {}
     kernel[(b, num_splits, h_kv)](
         q, k_pool, v_pool,
         k_scale if k_scale is not None else dummy,
@@ -631,7 +639,7 @@ def paged_decode_attention(
         scale, num_splits,
         N_REP=n_rep, BLOCK_M=16, BLOCK_D=d, PAGE=page,
         IS_INT8=is_int8, ASYM=asym, **extra,
-        num_warps=NUM_WARPS, num_stages=NUM_STAGES,
+        num_warps=warps, num_stages=stages,
     )
     if num_splits == 1:
         # Nothing to merge: the single split's partial *is* the answer

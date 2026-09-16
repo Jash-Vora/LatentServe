@@ -406,3 +406,21 @@ def test_scratch_fill_clears_stale_state():
     buf[0, 0] = 5.0
     again = _scratch("f", (2, 2), torch.float32, torch.device("cpu"), fill=float("-inf"))
     assert torch.isinf(again).all()
+
+
+def test_tunables_are_per_call_not_module_level():
+    """Phase 12 sweeps the design space, so the knobs must be arguments.
+
+    Reading them from module constants would mean re-importing between
+    configurations — which also loses Triton's compilation cache, so
+    every point would pay a recompile and the timings would measure the
+    compiler.
+    """
+    import inspect
+
+    from kernels.gqa.paged_decode import paged_decode_attention
+
+    params = inspect.signature(paged_decode_attention).parameters
+    for name in ("pages_per_iter", "num_warps", "num_stages", "num_splits"):
+        assert name in params, f"{name} must be tunable per call"
+        assert params[name].default is None, f"{name} should default to the module setting"
