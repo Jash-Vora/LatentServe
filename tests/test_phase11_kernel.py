@@ -358,3 +358,51 @@ def test_contiguous_cache_accepts_a_contiguous_slot_prefix():
     assert cache.length == 4
     with pytest.raises(NotImplementedError, match="non-contiguous slots"):
         cache.advance(1, slots=[0, 3, 7])
+
+
+def test_split_count_bounds_the_serial_chain_not_just_the_sm_count():
+    """Two constraints on `num_splits`, not one.
+
+    Filling the SMs is necessary (Phase 2: achieved bandwidth tracks
+    batch x kv_heads) but not sufficient: at batch 4 / 16K the SM rule
+    alone gave 5 programs each walking 204 pages through a *serial*
+    online-softmax chain, and that row cost 54 ms of unexplained time
+    against ~22 ms everywhere else.
+    """
+    from kernels.gqa.paged_decode import TARGET_PAGES_PER_SPLIT
+
+    def splits(batch, ctx, kv_heads=2, sms=40, page=16):
+        pages = ctx // page
+        by_sms = -(-sms // (batch * kv_heads))
+        by_chain = -(-pages // TARGET_PAGES_PER_SPLIT)
+        return max(1, min(pages, max(by_sms, by_chain)))
+
+    # The pathological row: the chain bound must take over.
+    assert splits(4, 16384) > -(-40 // 8)
+    for batch, ctx in ((1, 4096), (1, 16384), (4, 4096), (4, 8192), (4, 16384)):
+        pages_each = (ctx // 16) / splits(batch, ctx)
+        assert pages_each <= TARGET_PAGES_PER_SPLIT + 1
+
+
+def test_scratch_buffers_are_reused_across_calls():
+    """28 layers a step means 28 allocation triples otherwise. Same
+    shape must hand back the same storage."""
+    from kernels.gqa.paged_decode import _scratch
+
+    a = _scratch("t", (2, 3), torch.float32, torch.device("cpu"))
+    b = _scratch("t", (2, 3), torch.float32, torch.device("cpu"))
+    assert a.data_ptr() == b.data_ptr()
+    c = _scratch("t", (4, 3), torch.float32, torch.device("cpu"))
+    assert c.shape == (4, 3)
+
+
+def test_scratch_fill_clears_stale_state():
+    """The partial-softmax buffers carry -inf / 0 sentinels. Reusing
+    them without clearing would merge the previous layer's splits into
+    this one's result."""
+    from kernels.gqa.paged_decode import _scratch
+
+    buf = _scratch("f", (2, 2), torch.float32, torch.device("cpu"), fill=float("-inf"))
+    buf[0, 0] = 5.0
+    again = _scratch("f", (2, 2), torch.float32, torch.device("cpu"), fill=float("-inf"))
+    assert torch.isinf(again).all()

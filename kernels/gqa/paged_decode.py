@@ -70,6 +70,10 @@ try:  # pragma: no cover - availability is environmental
 except ImportError:  # pragma: no cover
     HAS_TRITON = False
 
+# Pages per program, bounding the length of the serial online-softmax
+# chain. 32 pages at block 16 is 512 tokens per program.
+TARGET_PAGES_PER_SPLIT = 32
+
 
 # ----------------------------------------------------------------------
 # Reference: the algorithm, in PyTorch
@@ -332,6 +336,77 @@ if HAS_TRITON:  # pragma: no cover - requires a GPU
         )
 
 
+if HAS_TRITON:  # pragma: no cover - requires a GPU
+
+    @triton.jit
+    def _combine_kernel(
+        PartialOut, PartialM, PartialL, Out,
+        stride_ob, stride_oh, stride_os, stride_om, stride_od,
+        stride_mb, stride_mh, stride_ms, stride_mm,
+        stride_yb, stride_yh, stride_ym, stride_yd,
+        num_splits,
+        N_REP: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        """Merge per-split partial softmaxes in one launch.
+
+        The PyTorch version is a dozen elementwise ops on tiny tensors —
+        about 12 kernel launches per layer, 336 per decode step across 28
+        layers, which measured as most of a flat ~22 ms that scaled with
+        nothing. The tensors are small; the launches were the cost.
+        """
+        b = tl.program_id(0)
+        h = tl.program_id(1)
+        offs_m = tl.arange(0, BLOCK_M)
+        offs_d = tl.arange(0, BLOCK_D)
+        row_valid = offs_m < N_REP
+
+        m_base = PartialM + b * stride_mb + h * stride_mh
+        m_g = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
+        for s in range(num_splits):
+            m = tl.load(m_base + s * stride_ms + offs_m * stride_mm,
+                        mask=row_valid, other=float("-inf"))
+            m_g = tl.maximum(m_g, m)
+
+        l_t = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+        for s in range(num_splits):
+            m = tl.load(m_base + s * stride_ms + offs_m * stride_mm,
+                        mask=row_valid, other=float("-inf"))
+            l = tl.load(PartialL + b * stride_mb + h * stride_mh + s * stride_ms
+                        + offs_m * stride_mm, mask=row_valid, other=0.0)
+            a = tl.load(
+                PartialOut + b * stride_ob + h * stride_oh + s * stride_os
+                + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od,
+                mask=row_valid[:, None], other=0.0,
+            )
+            w = tl.where(m_g == float("-inf"), 0.0, tl.exp(m - m_g))
+            l_t += l * w
+            acc += a * w[:, None]
+
+        out = acc / tl.maximum(l_t, 1e-20)[:, None]
+        tl.store(
+            Out + b * stride_yb + h * stride_yh
+            + offs_m[:, None] * stride_ym + offs_d[None, :] * stride_yd,
+            out, mask=row_valid[:, None],
+        )
+
+
+# Per-layer scratch is reallocated 28 times a step otherwise. Keyed by
+# shape so a changing batch or split count just gets a new entry.
+_SCRATCH: dict = {}
+_SM_COUNT: dict = {}
+
+
+def _scratch(key, shape, dtype, device, fill=None):
+    buf = _SCRATCH.get(key)
+    if buf is None or buf.shape != shape or buf.device != device:
+        buf = torch.empty(shape, dtype=dtype, device=device)
+        _SCRATCH[key] = buf
+    if fill is not None:
+        buf.fill_(fill)
+    return buf
+
+
 def combine_splits(
     partial_acc: torch.Tensor, partial_m: torch.Tensor, partial_l: torch.Tensor,
     out_dtype: torch.dtype,
@@ -389,17 +464,29 @@ def paged_decode_attention(
         max_seq_len = int(seq_lens.max().item())
     num_pages = (max_seq_len + page - 1) // page
     if num_splits is None:
-        sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-        num_splits = max(1, min(num_pages, -(-sms // max(1, b * h_kv))))
+        # Two constraints, not one. Enough programs to fill the SMs
+        # (Phase 2: achieved bandwidth tracks batch x kv_heads), *and*
+        # few enough pages per program that the online-softmax chain
+        # stays short. The second was missing: at batch 4 / 16K the SM
+        # rule alone gave 5 splits and 204 sequential iterations per
+        # program, and that row cost 54 ms of unexplained time against
+        # ~22 ms everywhere else.
+        dev = q.device.index or 0
+        if dev not in _SM_COUNT:
+            _SM_COUNT[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
+        by_sms = -(-_SM_COUNT[dev] // max(1, b * h_kv))
+        by_chain = -(-num_pages // TARGET_PAGES_PER_SPLIT)
+        num_splits = max(1, min(num_pages, max(by_sms, by_chain)))
 
     scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(d)
     is_int8 = k_pool.dtype == torch.int8
     asym = k_zero is not None
 
-    partial_acc = torch.empty(b, h_kv, num_splits, 16, d, dtype=torch.float32, device=q.device)
-    partial_m = torch.full((b, h_kv, num_splits, 16), float("-inf"),
-                           dtype=torch.float32, device=q.device)
-    partial_l = torch.zeros(b, h_kv, num_splits, 16, dtype=torch.float32, device=q.device)
+    partial_acc = _scratch("acc", (b, h_kv, num_splits, 16, d), torch.float32, q.device)
+    partial_m = _scratch("m", (b, h_kv, num_splits, 16), torch.float32, q.device,
+                         fill=float("-inf"))
+    partial_l = _scratch("l", (b, h_kv, num_splits, 16), torch.float32, q.device, fill=0.0)
+    out = _scratch("out", (b, h_kv, 16, d), q.dtype, q.device)
 
     dummy = torch.empty(1, device=q.device)
     _paged_decode_kernel[(b, num_splits, h_kv)](
@@ -417,4 +504,9 @@ def paged_decode_attention(
         N_REP=n_rep, BLOCK_M=16, BLOCK_D=d, PAGE=page,
         IS_INT8=is_int8, ASYM=asym,
     )
-    return combine_splits(partial_acc, partial_m, partial_l, q.dtype)[:, :, :n_rep]
+    _combine_kernel[(b, h_kv)](
+        partial_acc, partial_m, partial_l, out,
+        *partial_acc.stride(), *partial_m.stride(), *out.stride(),
+        num_splits, N_REP=n_rep, BLOCK_M=16, BLOCK_D=d,
+    )
+    return out[:, :, :n_rep]
