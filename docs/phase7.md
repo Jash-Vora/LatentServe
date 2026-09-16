@@ -30,7 +30,8 @@ on roughly 96 / 128 / 192 / 256 / 384.
     7.1 spectral analysis          <- decides whether the rest is worth building
     7.7 INT8 control               <- moved early: it is the bar to clear
     7.2 uniform low-rank
-    7.3 layer-adaptive rank
+    7.2b online-scaling check      <- decides whether 7.3 can build the config 7.2 measured
+    7.3 layer-adaptive rank / INT8 in the decode path
     7.4 MLA-inspired latent KV
         offline token-selective probe (runtime support is Phase 14)
     7.8 regime map
@@ -251,6 +252,47 @@ and random ids, so the generalisation gap should be small, but
 "should be" is not "measured". A held-out calibration set is the honest
 version and is one flag away.
 
+## 7.2b — online-scaling check (run before 7.3 builds anything)
+
+`compression/truncation.py::quantize_dequantize_block_local`,
+`benchmarks/runners/phase7_online_scaling.py`.
+
+```bash
+python -m benchmarks.runners.phase7_online_scaling --context-length 4096
+```
+
+7.2's headline number — `int8 K:channel V:token`, KL 0.00061, top-1
+flips 1.37% — fit K's per-channel scale over **all 16,384 tokens at
+once**: `quantize_dequantize(mode="per_channel")` reduces over batch and
+the entire sequence together. A streaming, paged cache cannot do that —
+token 500's scale cannot depend on token 9,000's, and this project's own
+paged cache (`block_size: 16`) writes a block once, as it fills.
+
+So before 7.3 wires INT8 into the actual decode path, this checks
+whether the number 7.2 reported describes a configuration that can
+exist at all: K's per-channel scale fit **locally, within each 16-token
+block**, instead of globally. `V`'s `per_token` granularity needs no
+such check — it is already local to one token, hence already
+streaming-safe.
+
+Reads as: global (non-realizable, 7.2's number) vs. block-local at a
+sweep of block sizes, same KL/flip metrics, same calibration tokens.
+`quantize_dequantize_block_local` is unit-tested (`test_phase7_truncation.py`)
+for three properties: it collapses to the global scale when the block
+spans the whole sequence, it is causal (a later block's contents cannot
+change an earlier block's dequantized values), and an outlier token
+contaminates only its own block rather than the whole sequence.
+
+**Decision rule:** if block=16 KL is within a small constant factor of
+the global number, 7.3 proceeds exactly as planned — one INT8 scale per
+`(block, head, channel)`, which is also the natural unit to store
+alongside a paged cache's existing per-block bookkeeping. If block=16 is
+much worse, check the larger block sizes in the sweep before assuming
+INT8-for-K is dead: a bigger scale-fitting window (at the cost of some
+staleness for the first few tokens of a block) or falling back to
+per-token for K as well are both cheaper fixes than abandoning the
+result.
+
 ## Measurement protocol for 7.2 onward
 
 From Phase 6's decode decomposition at 8K / batch 4: weights 28.1 ms,
@@ -278,5 +320,7 @@ halves.
       control, with the gap reported
 - [ ] per-layer compressibility map produced (the 7.3 budget)
 - [ ] pre- vs post-RoPE K gap quantified
+- [ ] online-scaling check run: block-local K scale vs 7.2's global
+      number, at the paged cache's own block size (16) at minimum
 - [ ] break-even stated explicitly against the 512-number GQA baseline
 - [ ] go/no-go on 7.2-7.4 recorded in writing, with the number behind it

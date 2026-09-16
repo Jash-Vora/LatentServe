@@ -164,19 +164,67 @@ def quantize_dequantize(
     return (q * scale / qmax).reshape_as(x)
 
 
+def quantize_dequantize_block_local(
+    x: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    block_size: int,
+    bits: int = 8,
+) -> torch.Tensor:
+    """Per-channel INT8, but with the scale fit *within* each contiguous
+    block of `block_size` tokens rather than over the whole sequence.
+
+    `quantize_dequantize(mode="per_channel")` reduces over every leading
+    dim at once — batch *and* the entire sequence — which means token
+    500's scale is computed knowing about token 9,000. A paged, streaming
+    cache cannot do that: a block is written once as it fills and its
+    scale has to be fixed from only the tokens inside it. This is the
+    realizable version of per-channel K quantization, matching the
+    project's `block_size: 16` paged-cache page.
+
+    x is [..., seq, num_heads * head_dim] (batch dims before `seq` are
+    fine; `seq` is assumed to be the second-to-last axis before the
+    flattened head dim, matching how this module calls it elsewhere).
+    """
+    shaped = x.reshape(*x.shape[:-1], num_heads, head_dim)  # [..., seq, H, D]
+    seq_dim = shaped.dim() - 3
+    seq_len = shaped.shape[seq_dim]
+    qmax = 2 ** (bits - 1) - 1
+
+    out = torch.empty_like(shaped)
+    reduce_dims = tuple(d for d in range(shaped.dim() - 2) if d != seq_dim)
+    for start in range(0, seq_len, block_size):
+        end = min(start + block_size, seq_len)
+        block = shaped.narrow(seq_dim, start, end - start)
+        scale = block.abs().amax(dim=reduce_dims + (seq_dim,), keepdim=True).clamp_min(1e-8)
+        q = torch.clamp(torch.round(block / scale * qmax), -qmax, qmax)
+        out.narrow(seq_dim, start, end - start).copy_(q * scale / qmax)
+    return out.reshape_as(x)
+
+
 class QuantizingProjection(nn.Module):
     """Wraps a projection and round-trips its output through INT8."""
 
     def __init__(self, proj: nn.Module, mode: QuantMode, num_heads: int, head_dim: int,
-                 bits: int = 8, asymmetric: bool = False):
+                 bits: int = 8, asymmetric: bool = False, block_size: Optional[int] = None):
         super().__init__()
         self.proj = proj
         self.mode, self.num_heads, self.head_dim, self.bits = mode, num_heads, head_dim, bits
         self.asymmetric = asymmetric
+        # When set, `mode == "per_channel"` uses the block-local scale
+        # fit instead of the global one — see quantize_dequantize_block_local.
+        self.block_size = block_size
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.proj(x)
+        if self.block_size is not None and self.mode == "per_channel":
+            if self.asymmetric:
+                raise NotImplementedError("block-local scaling is symmetric-only for now")
+            return quantize_dequantize_block_local(
+                out, self.num_heads, self.head_dim, self.block_size, self.bits
+            )
         return quantize_dequantize(
-            self.proj(x), self.mode, self.num_heads, self.head_dim, self.bits, self.asymmetric
+            out, self.mode, self.num_heads, self.head_dim, self.bits, self.asymmetric
         )
 
 
@@ -229,23 +277,30 @@ def install_separate_lowrank(
 def install_quantization(
     model, k_mode: QuantMode, v_mode: QuantMode, num_heads: int, head_dim: int,
     bits: int = 8, asymmetric: bool = False, k_bits: Optional[int] = None,
-    v_bits: Optional[int] = None,
+    v_bits: Optional[int] = None, k_block_size: Optional[int] = None,
+    v_block_size: Optional[int] = None,
 ) -> Installed:
     """K and V may carry different bit-widths.
 
     7.2 measured K as the sensitive one — its granularity changes KL by
     35x while V's changes it by 2% — so spending bits asymmetrically is
     the obvious thing to try, and the memory cost is the mean of the two.
+
+    `k_block_size` / `v_block_size`, when set, make a `per_channel` mode
+    fit its scale locally within blocks of that many tokens rather than
+    globally over the whole sequence — the scaling a streaming/paged
+    cache can actually compute. `per_token` needs no such flag: it is
+    already local to a single token and therefore already streaming-safe.
     """
     originals = []
     for layer in model.model.layers:
         k, v = layer.self_attn.k_proj, layer.self_attn.v_proj
         originals.append((layer, k, v))
         layer.self_attn.k_proj = QuantizingProjection(
-            k, k_mode, num_heads, head_dim, k_bits or bits, asymmetric
+            k, k_mode, num_heads, head_dim, k_bits or bits, asymmetric, k_block_size
         )
         layer.self_attn.v_proj = QuantizingProjection(
-            v, v_mode, num_heads, head_dim, v_bits or bits, asymmetric
+            v, v_mode, num_heads, head_dim, v_bits or bits, asymmetric, v_block_size
         )
     return Installed(originals)
 
