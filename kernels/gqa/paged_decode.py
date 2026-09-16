@@ -73,19 +73,7 @@ except ImportError:  # pragma: no cover
 
 # Pages per program, bounding the length of the serial online-softmax
 # chain. 32 pages at block 16 is 512 tokens per program.
-# Tuned by the Phase 12 sweep on a T4 (40 SMs, 2 KV heads, page 16).
-#
-#   splits  bandwidth climbs 5.3 -> 26.1 GB/s from 4 to 64 at batch 1,
-#           then flattens; at batch 4 it is saturated by 4 splits at
-#           ~47 GB/s. So batch 1 is occupancy-limited (exactly what
-#           Phase 2 measured: achieved bandwidth tracked batch x
-#           kv_heads) and batch 4 is not. 8 pages per split gives 64
-#           splits at 8K, which is the measured optimum for both.
-#   MAX     128 splits was slightly *worse* than 64 at batch 1
-#           (23.8 vs 26.1), so the target is capped rather than left to
-#           grow with context.
-TARGET_PAGES_PER_SPLIT = 8
-MAX_SPLITS = 64
+TARGET_PAGES_PER_SPLIT = 32
 
 # Pages fetched per loop iteration. One 16-token page is 4 KB of K and
 # 4 KB of V, and the online-softmax dependency serialises the iterations,
@@ -94,15 +82,8 @@ MAX_SPLITS = 64
 # Four pages give a 64-token tile, which is a real `tl.dot` N dimension
 # and enough in flight to pipeline. Set LATENTSERVE_PAGES_PER_ITER=1 to
 # fall back to the untiled kernel if the tiled one misbehaves.
-# PPI 1 -> 4 is worth 2.1x at batch 1 and 1.4x at batch 4. PPI 8 does not
-# compile: 8 pages x 16 tokens x 128 dims x 2 bytes x 2 tensors is 64 KB
-# against Turing's 48 KB of shared memory per block, so 4 is the ceiling
-# at this page size and head dim.
 PAGES_PER_ITER = int(os.environ.get("LATENTSERVE_PAGES_PER_ITER", "4"))
-# stages made almost no difference in the sweep; warps=8 was consistently
-# worse than 4 (11.3 -> 5.1 GB/s at batch 1), so neither is left to a
-# guess that happened to be wrong.
-NUM_STAGES = int(os.environ.get("LATENTSERVE_NUM_STAGES", "2"))
+NUM_STAGES = int(os.environ.get("LATENTSERVE_NUM_STAGES", "3"))
 NUM_WARPS = int(os.environ.get("LATENTSERVE_NUM_WARPS", "4"))
 
 
@@ -624,7 +605,7 @@ def paged_decode_attention(
             _SM_COUNT[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
         by_sms = -(-_SM_COUNT[dev] // max(1, b * h_kv))
         by_chain = -(-num_pages // TARGET_PAGES_PER_SPLIT)
-        num_splits = max(1, min(num_pages, MAX_SPLITS, max(by_sms, by_chain)))
+        num_splits = max(1, min(num_pages, max(by_sms, by_chain)))
 
     scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(d)
     is_int8 = k_pool.dtype == torch.int8
