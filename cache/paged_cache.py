@@ -93,9 +93,41 @@ class PagedKVCache:
         # would show up as "paging overhead" that is really a bug.
         self._read_slots: Optional[torch.Tensor] = None
         self._write_slots: Optional[torch.Tensor] = None
-        # Phase 11 kernel inputs, rebuilt alongside _read_slots.
         self._block_tables: Optional[torch.Tensor] = None
         self._seq_lens_tensor: Optional[torch.Tensor] = None
+
+        # ---- Phase 13: persistent decode buffers ----------------------
+        #
+        # A CUDA graph records memory *addresses*. Anything the decode
+        # step reads must therefore live at the same address on every
+        # step, with new values copied in — never a fresh tensor bound to
+        # the same attribute name, which leaves the graph reading the old
+        # one. These are allocated once at full capacity and written
+        # into from here on; `reset()` deliberately does not reallocate
+        # them, or a graph captured before a reset would break after it.
+        #
+        # The block table is held at *capacity* width, not at the current
+        # page count. The kernel masks by `seq_lens`, so trailing entries
+        # are never read, and a fixed width is what lets one captured
+        # graph serve a growing sequence.
+        self._capacity_pages = (spec.max_seq_len + block_size - 1) // block_size
+        self._block_tables_buf = torch.zeros(
+            (spec.max_batch_size, max(1, self._capacity_pages)),
+            dtype=torch.int32, device=self.device,
+        )
+        self._seq_lens_buf = torch.zeros(spec.max_batch_size, dtype=torch.int32,
+                                         device=self.device)
+        self._write_slots_buf = torch.zeros((spec.max_batch_size, 1), dtype=torch.long,
+                                            device=self.device)
+        # (slot, pages) last written into each block-table row, so a row
+        # is only rewritten when it actually changes — once per page of
+        # growth rather than once per token.
+        self._table_state: list = [None] * spec.max_batch_size
+        # The gather path's per-token slot index is only needed by
+        # read(). The kernel path never calls read(), so building it in
+        # advance() — a Python loop plus a host-to-device copy per
+        # sequence, every step — was pure overhead there.
+        self._read_slots_dirty = True
         # Which sequence slots participate in the next forward pass, in
         # batch order. Phase 3 always used range(batch_size); continuous
         # batching (Phase 4) needs holes — slot 3 can finish and be reused
@@ -148,6 +180,13 @@ class PagedKVCache:
         self.tables = [BlockTable(self.allocator) for _ in range(self.spec.max_batch_size)]
         self._read_slots = self._write_slots = None
         self._block_tables = self._seq_lens_tensor = None
+        # Contents cleared, storage kept: see the persistent-buffer note in
+        # __init__. Zeroing is for determinism only — the kernel masks by
+        # length and never reads past it.
+        self._block_tables_buf.zero_()
+        self._seq_lens_buf.zero_()
+        self._table_state = [None] * self.spec.max_batch_size
+        self._read_slots_dirty = True
         self._active = list(range(self.spec.max_batch_size))
         self.gather_calls = 0
 
@@ -162,7 +201,8 @@ class PagedKVCache:
         contiguous cache cannot express — it can only free the whole
         batch — and the reason paging survives churn."""
         self.tables[index].free()
-        self._read_slots = None
+        self._read_slots_dirty = True
+        self._table_state[index] = None
 
     # ------------------------------------------------------------------
     # Allocation
@@ -190,28 +230,43 @@ class PagedKVCache:
             self.tables[i].append(n)
 
         dev = self.device
-        self._write_slots = torch.tensor(
-            [
-                [self.tables[i].slot(p) for p in range(start, start + n)]
-                for i, start in zip(active, starts)
-            ],
-            dtype=torch.long,
-            device=dev,
-        )
         b = len(active)
-        max_len = self.max_len
-        # Pad short sequences with slot 0. Padded positions must be
-        # masked out by the caller (`padding_mask` below); block 0 is
-        # never left unwritten in practice, so an unmasked pad would
-        # silently attend to another sequence's tokens.
-        self._read_slots = torch.zeros((b, max_len), dtype=torch.long, device=dev)
+        slots_now = [
+            [self.tables[i].slot(p) for p in range(start, start + n)]
+            for i, start in zip(active, starts)
+        ]
+        if n == 1:
+            # Decode: write into the persistent buffer so the address is
+            # stable across steps. One small host-to-device copy.
+            self._write_slots_buf[:b].copy_(torch.tensor(slots_now, dtype=torch.long))
+            self._write_slots = self._write_slots_buf[:b]
+        else:
+            # Prefill is never captured (it stays eager, and its block
+            # count varies), so a fresh tensor is fine here.
+            self._write_slots = torch.tensor(slots_now, dtype=torch.long, device=dev)
+
+        self._read_slots_dirty = True
+        self._rebuild_kernel_inputs()
+
+    def _build_read_slots(self) -> None:
+        """Per-token slot index for the gather path, built on demand.
+
+        Pad short sequences with slot 0. Padded positions must be masked
+        out by the caller (`padding_mask`); block 0 is never left
+        unwritten in practice, so an unmasked pad would silently attend
+        to another sequence's tokens.
+        """
+        dev = self.device
+        active = self._active
+        b = len(active)
+        self._read_slots = torch.zeros((b, self.max_len), dtype=torch.long, device=dev)
         for row, i in enumerate(active):
             seq_slots = self.tables[i].slots()
             if seq_slots:
                 self._read_slots[row, : len(seq_slots)] = torch.tensor(
                     seq_slots, dtype=torch.long, device=dev
                 )
-        self._rebuild_kernel_inputs()
+        self._read_slots_dirty = False
 
     def _rebuild_kernel_inputs(self) -> None:
         """Block table and lengths as device tensors, for the Phase 11
@@ -226,18 +281,29 @@ class PagedKVCache:
         warned about precisely this; the kernel path did it anyway.
         """
         active = self._active
-        max_pages = max((len(self.tables[i].blocks) for i in active), default=0)
-        table = torch.zeros((len(active), max(1, max_pages)), dtype=torch.int32,
-                            device=self.device)
-        for r, i in enumerate(active):
+        b = len(active)
+        for row, i in enumerate(active):
             blocks = self.tables[i].blocks
-            if blocks:
-                table[r, : len(blocks)] = torch.tensor(blocks, dtype=torch.int32,
-                                                       device=self.device)
-        self._block_tables = table
-        self._seq_lens_tensor = torch.tensor(
-            [self.tables[i].length for i in active], dtype=torch.int32, device=self.device
+            state = (i, len(blocks))
+            # A row changes only when its sequence gains a page (every
+            # block_size tokens) or the slot is reassigned to a different
+            # sequence — not on every token.
+            if self._table_state[row] != state:
+                if len(blocks) > self._capacity_pages:
+                    raise RuntimeError(
+                        f"sequence in slot {i} needs {len(blocks)} pages, past the "
+                        f"cache's capacity of {self._capacity_pages}"
+                    )
+                if blocks:
+                    self._block_tables_buf[row, : len(blocks)].copy_(
+                        torch.tensor(blocks, dtype=torch.int32)
+                    )
+                self._table_state[row] = state
+        self._seq_lens_buf[:b].copy_(
+            torch.tensor([self.tables[i].length for i in active], dtype=torch.int32)
         )
+        self._block_tables = self._block_tables_buf[:b]
+        self._seq_lens_tensor = self._seq_lens_buf[:b]
 
     def block_tables_tensor(self, batch_size: Optional[int] = None) -> torch.Tensor:
         """[B, max_pages] of physical block ids, for the Phase 11 kernel.
@@ -302,9 +368,11 @@ class PagedKVCache:
         quantifies it and `benchmarks/runners/phase3_paged.py` measures
         whether the prediction holds.
         """
-        slots = self._read_slots
-        if slots is None:
+        if self._write_slots is None:
             raise RuntimeError("call advance() before read()")
+        if self._read_slots_dirty:
+            self._build_read_slots()
+        slots = self._read_slots
         idx = slots[:batch_size] if length is None else slots[:batch_size, :length]
         self.gather_calls += 1
         k = self._flat_k[layer_idx][idx]  # [B, L, H, D]
