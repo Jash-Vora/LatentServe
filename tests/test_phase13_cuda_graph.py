@@ -79,6 +79,20 @@ def test_buckets_end_at_capacity():
     assert d.bucket_for(3000) == 3000
 
 
+def test_cpu_model_is_never_captured_even_when_a_gpu_exists(monkeypatch):
+    """A CUDA graph records only CUDA kernels. On a GPU machine with a CPU
+    model, capture used to "succeed" with an empty graph whose replays did
+    nothing, freezing the output on the first step's logits — the engine
+    then emitted one token forever. Faking a GPU here reproduces the
+    condition on any machine."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    m = build("cpu")
+    decoder = GraphedDecoder(m)
+    assert not decoder.enabled, "a CPU model must decode eagerly"
+    with pytest.raises(GraphUnsupported, match="CPU|cpu"):
+        check_capturable(m)
+
+
 def test_rope_is_prebuilt_to_capacity():
     """A rebuild after capture would leave graphs pointing at freed
     cos/sin tables. Building to capacity up front makes one impossible."""

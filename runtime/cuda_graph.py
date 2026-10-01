@@ -113,6 +113,14 @@ def check_capturable(model) -> None:
         raise GraphUnsupported('graph capture needs attn_impl="triton_paged" on every layer')
     if model.rope is None:
         raise GraphUnsupported('graph capture needs rope_source="latentserve"')
+    # Checked last so the configuration-specific reasons above surface first
+    # and stay individually testable; a configuration that is otherwise
+    # capturable but lives on the CPU still ends up here.
+    if model.device.type != "cuda":
+        raise GraphUnsupported(
+            f"the model is on {model.device}; a CUDA graph records only CUDA kernels, "
+            "so capturing a CPU model records nothing and every replay is a no-op"
+        )
 
 
 @dataclass
@@ -215,7 +223,17 @@ class GraphedDecoder:
     ):
         self.model = model
         self.num_splits_override = num_splits or {}
-        self.enabled = enabled and torch.cuda.is_available()
+        # Whether the *model* is on a GPU, not whether the machine has one.
+        # Checking only `torch.cuda.is_available()` let a CPU model on a GPU
+        # machine "capture" a graph: the CPU ops ran once during capture,
+        # the graph recorded no CUDA kernels at all, and every replay after
+        # that was a no-op — so the output buffer froze on the first
+        # step's logits and decode emitted the same token forever. That is
+        # the stale-replay failure in its purest form, and it surfaced only
+        # on a machine with a GPU, which is why a CPU-only CI never saw it.
+        self.enabled = (
+            enabled and torch.cuda.is_available() and model.device.type == "cuda"
+        )
         self.graphs: dict[tuple[int, int], CapturedDecode] = {}
         self.eager_steps = 0
         self.graph_steps = 0
