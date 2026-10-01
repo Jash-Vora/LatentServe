@@ -11,6 +11,15 @@ are asserted by `benchmarks/harness.py::assert_comparable` before any
 ratio is printed — an unfair comparison raises rather than producing a
 plausible wrong number.
 
+## Validated environment
+
+    torch 2.13.0+cu130 (CUDA 13.0), triton 3.7.1, vllm 0.30.0
+
+The torch / CUDA / Triton versions are checked at import time and a
+mismatch exits immediately (override with LATENTSERVE_SKIP_VERSION_CHECK=1,
+in which case the numbers are not comparable with earlier runs). vLLM is
+only warned about, since LatentServe-only runs never import it.
+
 ## Running order matters
 
 vLLM and LatentServe cannot share a process: vLLM takes a large,
@@ -32,20 +41,62 @@ Phase 11 kernel is worth*, not a verdict. Report it that way.
 from __future__ import annotations
 
 import argparse
+import importlib.metadata as _md
+import os as _os
 import statistics
 import sys
 import time
 from typing import Optional
 
-from benchmarks.harness import (
+# Environment this benchmark was validated on. A mismatch exits immediately:
+# a different torch/CUDA/Triton changes kernel codegen and CUDA-graph
+# behaviour, which would quietly invalidate the LatentServe vs vLLM numbers.
+_REQUIRED = {"torch": "2.13.0", "cuda": "13.0", "triton": "3.7.1"}
+_EXPECTED_VLLM = "0.30.0"  # warn-only: LatentServe-only runs never import vLLM
+
+
+def _check_versions() -> None:
+    import torch
+
+    got = {
+        "torch": torch.__version__.split("+")[0],
+        "cuda": torch.version.cuda,
+    }
+    # Read from package metadata so we don't import triton (which can
+    # initialise a CUDA context) just to check its version.
+    try:
+        got["triton"] = _md.version("triton")
+    except _md.PackageNotFoundError:
+        got["triton"] = None
+
+    bad = {k: (got[k], want) for k, want in _REQUIRED.items() if got[k] != want}
+    if bad and not _os.environ.get("LATENTSERVE_SKIP_VERSION_CHECK"):
+        lines = "\n".join(f"  {k}: found {f}, need {w}" for k, (f, w) in bad.items())
+        raise SystemExit(
+            f"Environment mismatch:\n{lines}\n"
+            "Set LATENTSERVE_SKIP_VERSION_CHECK=1 to override "
+            "(results will not be comparable)."
+        )
+
+    try:
+        v = _md.version("vllm")
+        if v != _EXPECTED_VLLM:
+            print(f"[WARN] vllm {v} found, validated on {_EXPECTED_VLLM}", file=sys.stderr)
+    except _md.PackageNotFoundError:
+        pass  # fine unless --system vllm/both, which will fail on its own import
+
+
+_check_versions()
+
+from benchmarks.harness import (  # noqa: E402
     UnfairComparison,
     assert_comparable,
     check_environment,
     summarise_latency,
 )
-from benchmarks.schema import BenchmarkResult, ResultWriter
-from benchmarks.workloads.ragged import WORKLOADS
-from config import load_config
+from benchmarks.schema import BenchmarkResult, ResultWriter  # noqa: E402
+from benchmarks.workloads.ragged import WORKLOADS  # noqa: E402
+from config import load_config  # noqa: E402
 
 
 def build_uniform_requests(ref, context_length: int, num_requests: int,
@@ -282,6 +333,8 @@ def main() -> int:
     device = f"cuda:{cfg.hardware.devices[0]}" if torch.cuda.is_available() else "cpu"
     tok_ref = QwenReference(model_name=cfg.model.name, dtype=cfg.model.dtype, device=device).load()
     print(f"Loaded {cfg.model.name} once in {tok_ref.load_ms:.0f} ms on {device}")
+    print(f"Environment: torch {torch.__version__}, CUDA {torch.version.cuda}, "
+          f"triton {_md.version('triton')}")
     writer = ResultWriter(results_dir=args.results_dir)
 
     sweep = (
@@ -325,6 +378,10 @@ def main() -> int:
             "arrival_rate": 0.0, "arrival_pattern": "burst",
             "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
             "prefix_caching": False, "num_requests": args.num_requests,
+            # Recorded so check_environment() can flag drift across rows.
+            "torch_version": torch.__version__,
+            "cuda_version": torch.version.cuda,
+            "triton_version": _md.version("triton"),
         }
 
         for system in ([ls_label, "vllm"] if args.system == "both"
