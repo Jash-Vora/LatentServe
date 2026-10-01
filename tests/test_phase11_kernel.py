@@ -256,7 +256,11 @@ def test_block_tables_tensor_matches_the_block_tables():
     cache = PagedKVCache(spec, block_size=16)
     cache.advance(40, batch_size=3)
     table = cache.block_tables_tensor(3)
-    assert table.shape == (3, 3)
+    # Width is the cache's *capacity* (128 tokens / 16 = 8 pages), not the
+    # current page count: a fixed width is what lets one captured graph
+    # serve a growing sequence. The kernel masks by seq_lens, so entries
+    # past a sequence's pages are never read.
+    assert table.shape == (3, 8)
     for row, i in enumerate(cache.active_slots):
         assert table[row].tolist()[: len(cache.tables[i].blocks)] == cache.tables[i].blocks
     assert cache.seq_lens_tensor(3).tolist() == [40, 40, 40]
@@ -312,9 +316,13 @@ def test_block_tables_grow_with_each_decode_step():
                        max_seq_len=128, dtype=torch.float32, device="cpu")
     cache = PagedKVCache(spec, block_size=16)
     cache.advance(16, batch_size=1)
-    assert cache.block_tables_tensor(1).shape[1] == 1
+    assert len(cache.tables[0].blocks) == 1
     cache.advance(1, batch_size=1)
-    assert cache.block_tables_tensor(1).shape[1] == 2
+    # Crossing a page boundary adds a block, and the new block id must
+    # land in the table — the width stays fixed, the *contents* grow.
+    blocks = cache.tables[0].blocks
+    assert len(blocks) == 2
+    assert cache.block_tables_tensor(1)[0, :2].tolist() == blocks
     assert cache.seq_lens_tensor(1).tolist() == [17]
 
 

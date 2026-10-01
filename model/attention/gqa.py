@@ -118,6 +118,9 @@ class GQAAttention(nn.Module):
         self.kv_heads_mode = kv_heads_mode
         self.attn_impl = attn_impl
         self.kv_expansion = kv_expansion
+        # None lets the kernel choose per call; the Phase 13 graph runner
+        # pins it per bucket, since a captured grid cannot change size.
+        self.num_splits: Optional[int] = None
         self.scaling = head_dim**-0.5
 
     # ------------------------------------------------------------------
@@ -209,22 +212,24 @@ class GQAAttention(nn.Module):
         k, v = self._project_kv_for_cache(k, v)
         cache.write(self.layer_idx, k, v, start_pos)
 
-        # A paged cache pads ragged batches to the longest sequence; those
-        # pad slots hold another sequence's tokens and must be masked.
-        # Uniform batches (all of Phase 2 and 3's benchmarks) get None.
-        key_mask = cache.padding_mask()
-
         # The kernel branch has to come *before* cache.read(). Placed
         # after it, every layer gathered the whole cache into an fp16
         # buffer and the kernel then ignored it and re-read the pool —
         # paying the gather this phase exists to remove, plus the kernel.
         # torch.profiler showed it plainly: 56 `aten::index` calls per
         # decode step, two per layer, on a path that should have none.
+        #
+        # It also comes before `padding_mask()`, and no longer requires the
+        # batch to be uniform. The kernel masks each sequence by its own
+        # length from `seq_lens`, so it handles ragged batches natively —
+        # the Triton tests already check lengths [130, 48] — while
+        # padding_mask() builds a tensor on the host per layer for the
+        # gather path's benefit. That was a correctness-shaped caution
+        # that kept continuous batching off the kernel entirely.
         if (
             s == 1
             and self.attn_impl == "triton_paged"
             and hasattr(cache, "block_tables_tensor")
-            and key_mask is None
         ):
             from kernels.gqa.paged_decode import paged_decode_attention
 
@@ -243,6 +248,10 @@ class GQAAttention(nn.Module):
                 v_zero=self._pool(cache, "v_zero_pool"),
                 softmax_scale=self.scaling,
                 max_seq_len=cache.max_len,
+                # Fixed per captured graph. The kernel derives pages per
+                # split on the device from seq_lens, so a fixed count
+                # serves a sequence that grows within its bucket.
+                num_splits=self.num_splits,
             )
             attn_out = out.reshape(b, self.num_attention_heads, 1, self.head_dim)
             attn_out = attn_out.transpose(1, 2).contiguous().view(b, s, -1)
@@ -255,6 +264,13 @@ class GQAAttention(nn.Module):
         # is already correct for the uniform case too.
         k_all, v_all = cache.read(self.layer_idx, b)
         kv_len = k_all.shape[2]
+
+        # A paged cache pads ragged batches to the longest sequence; those
+        # pad slots hold another sequence's tokens and must be masked.
+        # Uniform batches (all of Phase 2 and 3's benchmarks) get None.
+        # Only the gather path needs this, which is why it sits after the
+        # kernel branch rather than before it.
+        key_mask = cache.padding_mask()
         if key_mask is not None and s > 1:
             raise NotImplementedError(
                 "ragged prefill needs a combined causal+padding mask; Phase 3 "

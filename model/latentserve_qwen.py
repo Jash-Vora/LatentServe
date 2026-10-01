@@ -301,13 +301,27 @@ class LatentServeQwen:
             cache.advance(input_ids.shape[1], slots=slots)
         else:
             cache.advance(input_ids.shape[1], batch_size=input_ids.shape[0])
-        h = self.embed_tokens(input_ids)
         cos, sin = (
             self._cos_sin(start_pos, input_ids.shape[1])
             if positions is None
             else self._cos_sin_at(positions)
         )
+        return self._run_layers(input_ids, cos, sin, start_pos)
 
+    @torch.no_grad()
+    def _run_layers(
+        self, input_ids: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, start_pos: int
+    ) -> torch.Tensor:
+        """The GPU half of a forward: embed, every layer, no bookkeeping.
+
+        Split out of `_forward_block` for Phase 13. A CUDA graph replays
+        GPU work only, so `cache.advance()` — Python bookkeeping that
+        decides *where* this step's KV goes — cannot live inside the
+        captured region: it would run once at capture and never again,
+        and every replay would write to the same slot.
+        """
+        cache = self._require_cache()
+        h = self.embed_tokens(input_ids)
         for layer in self.layers:
             residual = h
             h = layer.input_layernorm(h)
@@ -385,6 +399,23 @@ class LatentServeQwen:
         """
         hidden = self._forward_block(token_ids, start_pos=0, positions=positions, slots=slots)
         return self._to_logits(hidden)
+
+    @torch.no_grad()
+    def decode_forward_static(
+        self, token_ids: torch.Tensor, positions: torch.Tensor, max_position: int
+    ) -> torch.Tensor:
+        """One decode step with **no host work at all** — the graphable core.
+
+        The caller must already have called `cache.advance(1, ...)` for
+        this step; this only reads the cache's persistent buffers. No
+        Python-side state changes, no host syncs, no data-dependent
+        branches, which is exactly the set of things a CUDA graph cannot
+        record. `max_position` bounds RoPE so it needs no `.item()`.
+        """
+        if self.rope is None:
+            raise NotImplementedError('graph capture needs rope_source="latentserve"')
+        cos, sin = self.rope.cos_sin_at(positions, self.dtype, max_position=max_position)
+        return self._to_logits(self._run_layers(token_ids, cos, sin, start_pos=0))
 
     @torch.no_grad()
     def forward_logits_all(

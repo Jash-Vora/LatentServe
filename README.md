@@ -27,6 +27,8 @@ benchmarks/harness.py                  # Phase 5: percentiles, CIs, stall-aware 
 benchmarks/runners/phase6_vllm.py      # Phase 6: LatentServe vs vLLM under asserted-matched conditions
 comparisons/vllm/runner.py             # Phase 6: offline vLLM engine with every control recorded
 compression/spectra.py                 # Phase 7.1: streaming KV spectra, rank metrics, break-even
+runtime/cuda_graph.py                  # Phase 13: CUDA graph decode, bucketed by batch and context
+benchmarks/runners/phase13_graphs.py   # Phase 13: torch.compile break count + eager vs graphed latency
 benchmarks/runners/phase7_spectra.py   # Phase 7.1: KV compressibility map
 benchmarks/runners/check_env.py        # Phase 0 gate: verifies CUDA/GPU/torch actually work
 benchmarks/runners/phase1_reference.py # Phase 1: context-length sweep -> results/raw/phase1_reference.jsonl

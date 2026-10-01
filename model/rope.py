@@ -148,7 +148,9 @@ class RotaryEmbedding:
         sin = self._sin[start_pos:end].to(dtype)
         return cos[None, None, :, :], sin[None, None, :, :]
 
-    def cos_sin_at(self, positions: torch.Tensor, dtype: torch.dtype):
+    def cos_sin_at(
+        self, positions: torch.Tensor, dtype: torch.dtype, max_position: int | None = None
+    ):
         """cos/sin for explicit per-sequence positions.
 
         `positions` is [B, S] of absolute positions, returning
@@ -158,7 +160,11 @@ class RotaryEmbedding:
         describes the batch. Getting this wrong gives every sequence the
         first one's positional phase — plausible output, quietly wrong.
         """
-        end = int(positions.max().item()) + 1
+        # `positions.max().item()` is a host sync, once per decode step.
+        # A CUDA graph cannot contain one, and eager decode pays for it
+        # too. Callers that already know the bound (the graph runner
+        # knows its bucket) pass it and skip the sync entirely.
+        end = (max_position + 1) if max_position is not None else int(positions.max().item()) + 1
         if end > self.max_seq_len:
             self._build_tables(max(end, self.max_seq_len * 2))
         idx = positions.to(self._cos.device)
