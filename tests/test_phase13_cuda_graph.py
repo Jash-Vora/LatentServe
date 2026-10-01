@@ -207,3 +207,88 @@ def test_graph_survives_a_cache_reset():
         got = decoder.step(stream[:, t : t + 1], pos, [0]).clone()
         torch.testing.assert_close(got, want, rtol=3e-2, atol=3e-2)
     assert decoder.captures == 1, "the reset must not force a recapture"
+
+
+# ----------------------------------------------------------------------
+# The serving engine
+# ----------------------------------------------------------------------
+
+
+def _requests(specs, seed=0):
+    from runtime.request import ServedRequest
+
+    g = torch.Generator().manual_seed(seed)
+    return [
+        ServedRequest(request_id=i,
+                      prompt_ids=torch.randint(0, 128, (p,), generator=g).tolist(),
+                      max_new_tokens=n)
+        for i, (p, n) in enumerate(specs)
+    ]
+
+
+def _serve(device, dtype, use_cuda_graphs, specs, max_running=3, warmup=None):
+    from runtime.engine import ServingEngine
+
+    torch.manual_seed(0)
+    hf = Qwen2ForCausalLM(Qwen2Config(**CFG)).to(dtype).eval().to(device)
+    model = LatentServeQwen(hf_model=hf, tokenizer=None, shape=SHAPE, device=device,
+                            attn_impl="triton_paged", max_seq_len_hint=256)
+    engine = ServingEngine(model, max_running=max_running, max_seq_len=256, block_size=16,
+                           use_cuda_graphs=use_cuda_graphs)
+    if warmup:
+        engine.warmup_graphs(*warmup)
+    for r in _requests(specs):
+        engine.add_request(r)
+    return {r.request_id: r.output_ids for r in engine.run()}, engine
+
+
+SPECS = [(12, 9), (40, 4), (7, 14), (25, 6), (18, 11)]
+
+
+def test_engine_with_graphs_matches_engine_without():
+    """Gate 3 for the graph path: batching must never change what a request
+    receives. Ragged prompts and ragged output lengths mean the batch size
+    changes mid-run and slots are recycled — exactly the conditions under
+    which a graph keyed by batch size could replay the wrong rows."""
+    eager, _ = _serve("cpu", torch.float32, False, SPECS)
+    graphed, engine = _serve("cpu", torch.float32, True, SPECS)
+    assert graphed == eager
+    assert engine.decoder is not None
+
+
+def test_warmup_refuses_once_serving_has_started():
+    from runtime.engine import ServingEngine
+
+    torch.manual_seed(0)
+    hf = Qwen2ForCausalLM(Qwen2Config(**CFG)).to(torch.float32).eval()
+    model = LatentServeQwen(hf_model=hf, tokenizer=None, shape=SHAPE, device="cpu",
+                            attn_impl="triton_paged", max_seq_len_hint=256)
+    engine = ServingEngine(model, max_running=2, max_seq_len=256, block_size=16,
+                           use_cuda_graphs=True)
+    engine.add_request(_requests([(10, 3)])[0])
+    with pytest.raises(RuntimeError, match="before serving"):
+        engine.warmup_graphs([1, 2], context_length=32)
+
+
+@requires_gpu
+def test_engine_with_graphs_matches_eager_on_gpu():
+    """The same property with real capture and replay, and with the batch
+    size moving between 1 and 3 as requests finish."""
+    eager, _ = _serve("cuda", torch.float16, False, SPECS)
+    graphed, engine = _serve("cuda", torch.float16, True, SPECS)
+    # fp16 on a random-weight model: argmax ties can resolve differently,
+    # so compare most tokens rather than demanding every one.
+    agree = sum(a == b for rid in eager for a, b in zip(eager[rid], graphed[rid]))
+    total = sum(len(v) for v in eager.values())
+    assert agree / total > 0.95, f"only {agree}/{total} tokens agree"
+    assert engine.decoder.captures >= 2, "the batch size changed, so >1 graph is expected"
+
+
+@requires_gpu
+def test_warmup_captures_up_front_and_serving_still_matches():
+    eager, _ = _serve("cuda", torch.float16, False, SPECS)
+    graphed, engine = _serve("cuda", torch.float16, True, SPECS,
+                             warmup=([1, 2, 3], 64))
+    agree = sum(a == b for rid in eager for a, b in zip(eager[rid], graphed[rid]))
+    total = sum(len(v) for v in eager.values())
+    assert agree / total > 0.95

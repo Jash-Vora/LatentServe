@@ -139,9 +139,70 @@ def run_latency(args) -> int:
     return 0
 
 
+def run_splits(args) -> int:
+    """Re-tune num_splits per bucket *under replay*.
+
+    Phase 12 found the isolated-kernel optimum (64 splits) did not survive
+    the real model: in situ, with 28 layers of weight GEMMs evicting L2
+    between attention calls, it was slower. Graph replay changes the
+    environment again — no launch gaps, higher achieved bandwidth — so
+    the only trustworthy optimum is one measured here.
+    """
+    from runtime.cuda_graph import GraphedDecoder
+
+    cfg = load_config(args.config)
+    ref, model = _setup(cfg, max(args.context_lengths), max(args.batch_sizes), args.block_size)
+    writer = ResultWriter(results_dir=args.results_dir)
+
+    for batch in args.batch_sizes:
+        for ctx in args.context_lengths:
+            capacity = ctx + args.steps + args.warmup + 64
+            print(f"\n=== batch={batch} ctx={ctx} (graphed) ===")
+            best = None
+            for splits in args.splits:
+                model.allocate_cache(batch, capacity, paged=True, block_size=args.block_size)
+                model.cache.reset()
+                model.cache.advance(ctx, batch_size=batch)
+                slots = list(range(batch))
+                ids = torch.zeros(batch, 1, dtype=torch.long, device="cuda")
+                decoder = GraphedDecoder(model)
+                bucket = decoder.bucket_for(ctx + 1)
+                decoder.num_splits_override = {(batch, bucket): splits}
+
+                def step(i, decoder=decoder):
+                    pos = torch.full((batch, 1), ctx + i, dtype=torch.long, device="cuda")
+                    decoder.step(ids, pos, slots)
+
+                try:
+                    tpot, p95 = time_steps(step, args.steps, args.warmup)
+                except Exception as e:  # noqa: BLE001
+                    print(f"  splits={splits:>4}   failed: {str(e)[:60]}")
+                    model.cache = None
+                    torch.cuda.empty_cache()
+                    continue
+                print(f"  splits={splits:>4}   tpot {tpot:6.2f} ms   p95 {p95:6.2f}")
+                if best is None or tpot < best[0]:
+                    best = (tpot, splits)
+                writer.write(BenchmarkResult(
+                    system="latentserve_kernel_graphed", tag="phase13_splits",
+                    attention="gqa", model=cfg.model.name, batch_size=batch,
+                    context_length=ctx, output_length=args.steps, num_gpus=1,
+                    tpot_ms=tpot, tpot_p95_ms=p95, seed=0,
+                    extra={"status": "ok", "num_splits": splits, "bucket": bucket},
+                ))
+                model.cache = None
+                torch.cuda.empty_cache()
+            if best:
+                print(f"  best: {best[1]} splits at {best[0]:.2f} ms")
+    print("\nFeed the best per (batch, bucket) into GraphedDecoder(num_splits={...}),\n"
+          "or into TARGET_PAGES_PER_SPLIT / MAX_SPLITS if one rule fits them all.")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--experiment", choices=["compile", "latency"], default="latency")
+    p.add_argument("--experiment", choices=["compile", "latency", "splits"], default="latency")
+    p.add_argument("--splits", type=int, nargs="+", default=[8, 16, 32, 64])
     p.add_argument("--config", default="configs/phase2_gqa.yaml")
     p.add_argument("--context-lengths", type=int, nargs="+", default=[4096, 8192, 16384])
     p.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4])
@@ -153,7 +214,8 @@ def main() -> int:
     if not torch.cuda.is_available():
         print("[ERROR] Phase 13 is a GPU measurement.", file=sys.stderr)
         return 1
-    return {"compile": run_compile, "latency": run_latency}[args.experiment](args)
+    return {"compile": run_compile, "latency": run_latency,
+            "splits": run_splits}[args.experiment](args)
 
 
 if __name__ == "__main__":

@@ -70,6 +70,7 @@ class ServingEngine:
         prefill_chunk_size: Optional[int] = 4096,
         eos_token_id: Optional[int] = None,
         on_retire: Optional[callable] = None,
+        use_cuda_graphs: bool = False,
     ):
         self.model = model
         self.max_running = max_running
@@ -90,6 +91,34 @@ class ServingEngine:
         )
         assert isinstance(cache, PagedKVCache)
         self.cache: PagedKVCache = cache
+
+        # Phase 13: decode through captured CUDA graphs. Prefill stays
+        # eager — it is compute-bound and its shape varies per request.
+        #
+        # Graphs need the Triton kernel path (the gather path reads a
+        # slice whose length changes every step), so enabling them sets
+        # it. A configuration a graph cannot capture falls back to eager
+        # with a warning rather than failing: a missing graph is a
+        # slowdown, not an error.
+        #
+        # Graphs are keyed by batch size, and continuous batching changes
+        # the batch size as requests arrive and finish — so the first
+        # step at each new size pays a capture. `warmup_graphs()` moves
+        # that cost to start-up instead of onto whichever request
+        # happens to trigger it.
+        self.decoder = None
+        if use_cuda_graphs:
+            import warnings
+
+            from runtime.cuda_graph import GraphedDecoder, GraphUnsupported
+
+            for layer in model.layers:
+                layer.attn.attn_impl = "triton_paged"
+            try:
+                self.decoder = GraphedDecoder(model)
+            except GraphUnsupported as e:
+                warnings.warn(f"CUDA graphs disabled, decoding eagerly: {e}", stacklevel=2)
+                self.decoder = None
 
         self.scheduler = (
             scheduler if isinstance(scheduler, Scheduler)
@@ -194,7 +223,14 @@ class ServingEngine:
         )
 
         t0 = time.perf_counter()
-        logits = self.model.decode_step_ragged(tokens, positions, slots)
+        if self.decoder is not None:
+            # The returned tensor is the graph's static output, overwritten
+            # by the next replay. Reading the argmax below (with .tolist(),
+            # which copies to host) before the next step is what makes
+            # that safe.
+            logits = self.decoder.step(tokens, positions, slots)
+        else:
+            logits = self.model.decode_step_ragged(tokens, positions, slots)
         if device.type == "cuda":
             torch.cuda.synchronize()
         step_ms = (time.perf_counter() - t0) * 1000
@@ -255,6 +291,37 @@ class ServingEngine:
 
     # ------------------------------------------------------------------
 
+    @torch.no_grad()
+    def warmup_graphs(self, batch_sizes, context_length: int) -> int:
+        """Capture graphs for the given batch sizes before serving starts.
+
+        Uses throwaway sequences in real cache slots: the capture writes
+        their KV, and the cache is reset afterwards. Reset clears contents
+        and keeps storage, so the captured addresses stay valid — that is
+        the property `test_graph_survives_a_cache_reset` checks.
+
+        Returns the number of graphs captured. Call it before
+        `add_request`, since it resets the cache.
+        """
+        if self.decoder is None:
+            return 0
+        if self.running or self.waiting:
+            raise RuntimeError("warmup_graphs() resets the cache; call it before serving")
+        before = self.decoder.captures
+        device = self.model.device
+        for b in batch_sizes:
+            if b > self.max_running:
+                continue
+            self.cache.reset()
+            slots = list(range(b))
+            self.cache.advance(context_length - 1, slots=slots)
+            tokens = torch.zeros(b, 1, dtype=torch.long, device=device)
+            positions = torch.full((b, 1), context_length - 1, dtype=torch.long, device=device)
+            self.decoder.step(tokens, positions, slots)
+        self.cache.reset()
+        self._free_slots = list(range(self.max_running))
+        return self.decoder.captures - before
+
     def stats(self) -> dict:
         wall = self.prefill_s + self.decode_s
         mean_batch = (
@@ -283,6 +350,8 @@ class ServingEngine:
             "batch_efficiency": mean_batch / self.max_running if self.max_running else 0.0,
             "max_running": self.max_running,
             **self.scheduler.stats(),
+            **({f"graph_{k}": v for k, v in self.decoder.stats().items() if k != "keys"}
+               if self.decoder is not None else {"graph_captures": 0}),
             **self.cache.stats(),
         }
 

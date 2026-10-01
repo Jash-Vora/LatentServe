@@ -95,7 +95,8 @@ def _row(cfg, system: str, batch_size: int, ctx: int, out_len: int, summary: dic
 
 
 def run_latentserve(cfg, ref, requests, batch_size: int, block_size: int,
-                    max_seq_len: int) -> dict:
+                    max_seq_len: int, attn_impl: str = "sdpa",
+                    cuda_graphs: bool = False, warmup_graphs: bool = True) -> dict:
     """Run one configuration on an *already loaded* reference.
 
     The weights are loaded once, by the caller, and shared. Loading per
@@ -110,15 +111,32 @@ def run_latentserve(cfg, ref, requests, batch_size: int, block_size: int,
 
     from model.latentserve_qwen import LatentServeQwen
 
-    model = LatentServeQwen.from_reference(ref, max_seq_len_hint=max_seq_len)
+    # The original Phase 6 comparison built this with the default
+    # attn_impl="sdpa" — the *gather* path — so it measured vLLM against
+    # Phase 3's runtime, not against the Phase 11 kernel. Now explicit.
+    model = LatentServeQwen.from_reference(ref, max_seq_len_hint=max_seq_len,
+                                           attn_impl=attn_impl)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
     engine = ServingEngine(
         model, max_running=batch_size, max_seq_len=max_seq_len,
-        block_size=block_size, scheduler="fifo",
+        block_size=block_size, scheduler="fifo", use_cuda_graphs=cuda_graphs,
     )
+    warmup_captures = 0
+    if cuda_graphs and warmup_graphs and engine.decoder is not None:
+        # Capture outside the timed region. A burst of uniform requests
+        # decodes at the full batch until the tail, where the batch
+        # shrinks one request at a time — so every size from 1 to B
+        # appears. Lengths run from prompt+1 to prompt+output, which can
+        # straddle a bucket boundary, so both ends are captured. vLLM
+        # captures its graphs at construction for the same reason.
+        prompt = max(r.prompt_len for r in requests)
+        out = max(r.max_new_tokens for r in requests)
+        sizes = list(range(1, batch_size + 1))
+        for ctx_point in sorted({prompt + 1, prompt + out}):
+            warmup_captures += engine.warmup_graphs(sizes, context_length=ctx_point)
     for r in requests:
         engine.add_request(r)
     t0 = time.perf_counter()
@@ -137,6 +155,9 @@ def run_latentserve(cfg, ref, requests, batch_size: int, block_size: int,
     total_out = sum(r.generated for r in finished)
     return {
         "wall_s": wall,
+        "attn_impl": attn_impl,
+        "cuda_graphs": cuda_graphs,
+        "warmup_captures": warmup_captures,
         "requests": len(finished),
         "output_tokens": total_out,
         "output_tokens_per_s": total_out / wall if wall else 0.0,
@@ -216,6 +237,12 @@ def main() -> int:
                    help="sweep uniform prompt lengths instead of a workload family; "
                    "this is what locates the LatentServe/vLLM crossover")
     p.add_argument("--block-size", type=int, default=16)
+    p.add_argument("--attn-impl", default="sdpa", choices=["sdpa", "triton_paged"],
+                   help="LatentServe decode path: the Phase 3 gather or the Phase 11 kernel")
+    p.add_argument("--cuda-graphs", action="store_true",
+                   help="Phase 13: decode through captured CUDA graphs (implies the kernel)")
+    p.add_argument("--no-warmup-graphs", action="store_true",
+                   help="capture lazily during the timed run instead of before it")
     p.add_argument("--results-dir", default="results/raw")
     p.add_argument("--compare", action="store_true",
                    help="do not run anything; compare existing rows in the results file")
@@ -224,6 +251,16 @@ def main() -> int:
     cfg = load_config(args.config)
     if args.compare:
         return compare(cfg, args.results_dir)
+    if args.cuda_graphs:
+        args.attn_impl = "triton_paged"
+    # Each LatentServe variant is its own system, so the gather path, the
+    # eager kernel and the graphed kernel can sit in one results file and
+    # be compared against the same vLLM rows.
+    ls_label = "latentserve" + {
+        ("sdpa", False): "",
+        ("triton_paged", False): "_kernel",
+        ("triton_paged", True): "_kernel_graphed",
+    }[(args.attn_impl, args.cuda_graphs)]
 
     import torch
 
@@ -290,15 +327,18 @@ def main() -> int:
             "prefix_caching": False, "num_requests": args.num_requests,
         }
 
-        for system in (["latentserve", "vllm"] if args.system == "both" else [args.system]):
+        for system in ([ls_label, "vllm"] if args.system == "both"
+                       else [ls_label if args.system == "latentserve" else "vllm"]):
             fresh = make()
             if system == "vllm" and tok_ref.model is not None:
                 tok_ref.model = tok_ref.model.to("cpu")
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
                 torch.cuda.reset_peak_memory_stats() if torch.cuda.is_available() else None
             summary = (
-                run_latentserve(cfg, tok_ref, fresh, batch_size, args.block_size, max_seq_len)
-                if system == "latentserve"
+                run_latentserve(cfg, tok_ref, fresh, batch_size, args.block_size, max_seq_len,
+                                attn_impl=args.attn_impl, cuda_graphs=args.cuda_graphs,
+                                warmup_graphs=not args.no_warmup_graphs)
+                if system.startswith("latentserve")
                 else run_vllm(cfg, fresh, batch_size, max_seq_len)
             )
             row = _row(cfg, system, batch_size, ctx, out_len, summary, controls)
@@ -316,7 +356,7 @@ def main() -> int:
                 else 0
             )
             print(
-                f"  {system:<12} batch={batch_size:>2} "
+                f"  {system:<26} batch={batch_size:>2} "
                 + (f"ctx={context_length:>6} " if context_length else "")
                 + (f"~{summary['wall_s'] / steps * 1000:6.1f} ms/step  " if steps else "")
                 + f"{summary['output_tokens_per_s']:7.1f} tok/s  "
@@ -327,7 +367,7 @@ def main() -> int:
     if args.output_lengths:
         short, long = args.output_lengths
         print(f"\nDecode isolated by differencing {short} vs {long} output tokens:")
-        print(f"{'system':<12} {'batch':>5} {'ctx':>6} {'decode ms/step':>15} "
+        print(f"{'system':<26} {'batch':>5} {'ctx':>6} {'decode ms/step':>15} "
               f"{'prefill tok/s':>14}")
         for (system, batch_size, context_length), by_out in sorted(walls.items()):
             if short not in by_out or long not in by_out:
@@ -338,7 +378,7 @@ def main() -> int:
             prefill_s = by_out[short] - decode_ms / 1000 * short_steps
             prompt_tokens = (context_length or 0) * args.num_requests
             rate = prompt_tokens / prefill_s if prefill_s > 0 and prompt_tokens else float("nan")
-            print(f"{system:<12} {batch_size:>5} {context_length or 0:>6} "
+            print(f"{system:<26} {batch_size:>5} {context_length or 0:>6} "
                   f"{decode_ms:>15.1f} {rate:>14.0f}")
         print(
             "\nA high decode ms/step points at the decode attention kernel; a low "
@@ -348,49 +388,116 @@ def main() -> int:
     return 0
 
 
+def _decode_split(rows_by_out: dict, batch: int) -> tuple:
+    """Decode ms/step and prefill tok/s from two output lengths.
+
+    Identical prompts mean identical prefill, so it cancels in the wall
+    time difference and the remainder is pure decode. The only way to
+    separate the two for vLLM, whose V1 engine reports no TTFT.
+    """
+    if len(rows_by_out) < 2:
+        return None, None
+    short, long = sorted(rows_by_out)[:1][0], sorted(rows_by_out)[-1]
+    a, b = rows_by_out[short], rows_by_out[long]
+    n = (a.get("extra") or {}).get("num_requests")
+    wall_a = (a.get("extra") or {}).get("wall_s")
+    wall_b = (b.get("extra") or {}).get("wall_s")
+    if not n or wall_a is None or wall_b is None:
+        return None, None
+    extra_steps = (long - short) * n / batch
+    decode_ms = (wall_b - wall_a) / extra_steps * 1000
+    prefill_s = wall_a - decode_ms / 1000 * (short * n / batch)
+    prompt_tokens = a["context_length"] * n
+    rate = prompt_tokens / prefill_s if prefill_s > 0 else None
+    return decode_ms, rate
+
+
 def compare(cfg, results_dir: str) -> int:
-    """Pair up rows and report ratios, refusing unmatched comparisons."""
+    """Latency and throughput against vLLM, refusing unmatched pairs.
+
+    Two questions, answered separately because they can disagree:
+
+      latency     decode ms/step, from differenced output lengths. Lower
+                  is better. The batch-1 number is what a single user
+                  feels between tokens.
+      throughput  output tokens/s at the longest output length. Higher is
+                  better. The large-batch number is what a server can
+                  sustain, and vLLM's home ground.
+
+    "Surpassing vLLM on latency while keeping up on throughput" is a
+    claim about both columns at once, so the verdict reports both.
+    """
     import json
+    from collections import defaultdict
     from pathlib import Path
 
     path = Path(results_dir) / f"{cfg.tag}.jsonl"
     rows = [json.loads(line) for line in path.open()]
-    ours = {r["batch_size"]: r for r in rows if r["system"] == "latentserve"}
-    theirs = {r["batch_size"]: r for r in rows if r["system"] == "vllm"}
+    rows = [r for r in rows if (r.get("extra") or {}).get("status", "ok") == "ok"]
 
     drift = check_environment(rows)
     if drift:
-        print(f"[WARN] reproducibility drift across rows: {sorted(drift)}", file=sys.stderr)
+        print(f"[WARN] reproducibility drift across rows: {sorted(drift)} — rerun both "
+              "systems in one session before quoting a ratio", file=sys.stderr)
 
-    if not theirs:
-        print("No vLLM rows yet — run `--system vllm` in a separate session.")
+    groups: dict = defaultdict(dict)
+    for r in rows:
+        groups[(r["system"], r["batch_size"], r["context_length"])][r["output_length"]] = r
+
+    systems = sorted({k[0] for k in groups})
+    points = sorted({(k[1], k[2]) for k in groups})
+    if "vllm" not in systems:
+        print("No vLLM rows yet — run `--system vllm` in the same session.")
         return 0
 
-    print(f"{'batch':>5}  {'LatentServe':>12}  {'vLLM':>12}  {'ratio':>7}  {'ttft p50 ratio':>15}")
-    for batch_size in sorted(set(ours) & set(theirs)):
-        a, b = ours[batch_size], theirs[batch_size]
-        try:
-            assert_comparable(a, b)
-        except UnfairComparison as e:
-            print(f"{batch_size:>5}  SKIPPED — {e}")
+    print(f"{'batch':>5} {'ctx':>6}  {'system':<26}{'decode ms/step':>15}"
+          f"{'prefill tok/s':>15}{'out tok/s':>11}{'vs vLLM':>10}")
+    verdict = defaultdict(dict)
+    for batch, ctx in points:
+        base = groups.get(("vllm", batch, ctx))
+        if not base:
             continue
-        ta = a["throughput_tokens_sec"]
-        tb = b["throughput_tokens_sec"]
-        ra = (a.get("ttft_p50_ms") or 0) / (b.get("ttft_p50_ms") or 1)
-        print(f"{batch_size:>5}  {ta:12.1f}  {tb:12.1f}  {ta / tb:6.2f}x  {ra:14.2f}x")
-    print(
-        "\nAttribute the gap, do not just report it. Three measured mechanisms:\n"
-        "  - paged gather: Phase 3 measured 2x resident KV per step; Phase 4 showed it\n"
-        "    makes batching non-free (TPOT 33 -> 65 ms, batch 1 -> 8). vLLM's\n"
-        "    paged-attention kernel avoids it, so this gap estimates Phase 11's value.\n"
-        "  - CUDA graphs + torch.compile: vLLM captures graphs; LatentServe runs eager\n"
-        "    Python per layer, and Phase 2's P1 measured decode at 24-32% of peak\n"
-        "    bandwidth, i.e. launch-overhead-bound.\n"
-        "  - chunked prefill: vLLM mixes prefill into decode steps; LatentServe's\n"
-        "    prefill blocks, measured in Phase 4 as ~2.3 s inter-token stalls.\n"
-        "Not comparable: peak VRAM (vLLM preallocates by policy) and p99 inter-token\n"
-        "latency (vLLM reports a per-request mean)."
-    )
+        base_row = base[max(base)]
+        base_decode, _ = _decode_split(base, batch)
+        for system in systems:
+            g = groups.get((system, batch, ctx))
+            if not g:
+                continue
+            row = g[max(g)]
+            if system != "vllm":
+                try:
+                    assert_comparable(row, base_row)
+                except UnfairComparison as e:
+                    print(f"{batch:>5} {ctx:>6}  {system:<26}  SKIPPED — {e}")
+                    continue
+            decode_ms, prefill = _decode_split(g, batch)
+            tput = row["throughput_tokens_sec"]
+            ratio = tput / base_row["throughput_tokens_sec"] if system != "vllm" else 1.0
+            print(f"{batch:>5} {ctx:>6}  {system:<26}"
+                  f"{(f'{decode_ms:.1f}' if decode_ms else '-'):>15}"
+                  f"{(f'{prefill:.0f}' if prefill else '-'):>15}"
+                  f"{tput:>11.1f}{ratio:>9.2f}x")
+            if system != "vllm":
+                verdict[system][(batch, ctx)] = (decode_ms, base_decode, ratio)
+        print()
+
+    for system, pts in verdict.items():
+        print(f"=== {system} vs vLLM ===")
+        lat = [(b, c, d / bd) for (b, c), (d, bd, _) in pts.items() if d and bd]
+        thr = [(b, c, r) for (b, c), (_, _, r) in pts.items()]
+        if lat:
+            b1 = [x for x in lat if x[0] == min(x[0] for x in lat)]
+            for b, c, rel in b1:
+                word = "faster" if rel < 1 else "slower"
+                print(f"  latency  batch {b} ctx {c}: decode {abs(1 - rel):.0%} {word} than vLLM")
+        if thr:
+            top = max(t[0] for t in thr)
+            for b, c, r in [t for t in thr if t[0] == top]:
+                word = "ahead of" if r >= 1 else "behind"
+                print(f"  throughput batch {b} ctx {c}: {abs(r - 1):.0%} {word} vLLM")
+        print()
+    print("Same session, same torch, same prompts, same output lengths, both systems on\n"
+          "CUDA graphs. Peak VRAM is not compared: vLLM preallocates by policy.")
     return 0
 
 

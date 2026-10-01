@@ -154,9 +154,19 @@ class CapturedDecode:
         self.static_ids.copy_(token_ids)
         self.static_pos.copy_(positions)
 
-    def capture(self) -> None:
+    def capture(self, pool=None) -> None:
         """Record the step. Caller has already advanced the cache and
-        called `load()` with this step's real inputs."""
+        called `load()` with this step's real inputs.
+
+        `pool` is a memory pool shared with other graphs. Each graph
+        otherwise gets a private pool sized to its own peak, and warming
+        every batch size at two context points is 2B graphs — 32 at
+        batch 16. Sharing is safe here for two reasons: graphs never run
+        concurrently, and each graph's output stays referenced by its
+        `static_logits`, so no later capture can reuse it. Intermediates
+        are reused across graphs, which is fine because nothing reads
+        them between replays.
+        """
         self._set_splits(self.num_splits)
         try:
             # Warm-up on a side stream, as torch.cuda.graph requires: this
@@ -170,7 +180,7 @@ class CapturedDecode:
             torch.cuda.current_stream().wait_stream(side)
 
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            with torch.cuda.graph(graph, pool=pool):
                 self.static_logits = self._run()
             self.graph = graph
         finally:
@@ -210,6 +220,7 @@ class GraphedDecoder:
         self.eager_steps = 0
         self.graph_steps = 0
         self.captures = 0
+        self._pool = None
         if self.enabled:
             check_capturable(model)
 
@@ -266,7 +277,9 @@ class GraphedDecoder:
         if graph is None:
             graph = CapturedDecode(self.model, batch, bucket, self._splits_for(batch, bucket))
             graph.load(token_ids, positions)
-            graph.capture()
+            graph.capture(pool=self._pool)
+            if self._pool is None:
+                self._pool = graph.graph.pool()
             self.graphs[key] = graph
             self.captures += 1
         else:
