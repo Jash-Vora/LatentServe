@@ -451,7 +451,7 @@ def compare(cfg, results_dir: str) -> int:
         return 0
 
     print(f"{'batch':>5} {'ctx':>6}  {'system':<26}{'decode ms/step':>15}"
-          f"{'prefill tok/s':>15}{'out tok/s':>11}{'vs vLLM':>10}")
+          f"{'decode tok/s':>14}{'prefill tok/s':>15}{'e2e tok/s':>11}")
     verdict = defaultdict(dict)
     for batch, ctx in points:
         base = groups.get(("vllm", batch, ctx))
@@ -472,29 +472,40 @@ def compare(cfg, results_dir: str) -> int:
                     continue
             decode_ms, prefill = _decode_split(g, batch)
             tput = row["throughput_tokens_sec"]
-            ratio = tput / base_row["throughput_tokens_sec"] if system != "vllm" else 1.0
+            decode_tput = batch / decode_ms * 1000 if decode_ms else None
             print(f"{batch:>5} {ctx:>6}  {system:<26}"
                   f"{(f'{decode_ms:.1f}' if decode_ms else '-'):>15}"
+                  f"{(f'{decode_tput:.0f}' if decode_tput else '-'):>14}"
                   f"{(f'{prefill:.0f}' if prefill else '-'):>15}"
-                  f"{tput:>11.1f}{ratio:>9.2f}x")
+                  f"{tput:>11.1f}")
             if system != "vllm":
-                verdict[system][(batch, ctx)] = (decode_ms, base_decode, ratio)
+                _, base_prefill = _decode_split(base, batch)
+                verdict[system][(batch, ctx)] = (
+                    decode_ms, base_decode, tput / base_row["throughput_tokens_sec"],
+                    prefill, base_prefill,
+                )
         print()
 
     for system, pts in verdict.items():
         print(f"=== {system} vs vLLM ===")
-        lat = [(b, c, d / bd) for (b, c), (d, bd, _) in pts.items() if d and bd]
-        thr = [(b, c, r) for (b, c), (_, _, r) in pts.items()]
-        if lat:
-            b1 = [x for x in lat if x[0] == min(x[0] for x in lat)]
-            for b, c, rel in b1:
-                word = "faster" if rel < 1 else "slower"
-                print(f"  latency  batch {b} ctx {c}: decode {abs(1 - rel):.0%} {word} than vLLM")
-        if thr:
-            top = max(t[0] for t in thr)
-            for b, c, r in [t for t in thr if t[0] == top]:
-                word = "ahead of" if r >= 1 else "behind"
-                print(f"  throughput batch {b} ctx {c}: {abs(r - 1):.0%} {word} vLLM")
+        # Three answers, kept apart. End-to-end throughput was the only one
+        # reported at first, and at 8K it is 68-86% prefill — so a large
+        # "throughput lead" can be entirely a prefill lead, which says
+        # nothing about decode at all.
+        decode = {(b, c): bd / d for (b, c), (d, bd, *_ ) in pts.items() if d and bd}
+        if decode:
+            low = min(b for b, _ in decode)
+            high = max(b for b, _ in decode)
+            for label, batch in (("decode latency   ", low), ("decode throughput", high)):
+                for (b, c), rel in sorted(decode.items()):
+                    if b == batch:
+                        word = "faster" if rel >= 1 else "slower"
+                        print(f"  {label} batch {b:>2} ctx {c:>5}: {abs(rel - 1):4.0%} {word}")
+        for (b, c), (*_, ratio, pre, base_pre) in sorted(pts.items()):
+            if b == max(x[0] for x in pts) and pre and base_pre:
+                print(f"  end-to-end       batch {b:>2} ctx {c:>5}: {ratio:.2f}x vLLM "
+                      f"— prefill alone is {pre / base_pre:.1f}x, so read this as mostly "
+                      "a prefill result")
         print()
     print("Same session, same torch, same prompts, same output lengths, both systems on\n"
           "CUDA graphs. Peak VRAM is not compared: vLLM preallocates by policy.")

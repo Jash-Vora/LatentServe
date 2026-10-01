@@ -85,7 +85,15 @@ except ImportError:  # pragma: no cover
 #           (23.8 vs 26.1), so the target is capped rather than left to
 #           grow with context.
 TARGET_PAGES_PER_SPLIT = 8
-MAX_SPLITS = 64
+# Phase 13 re-tuned under CUDA-graph replay: 16 splits was best at three of
+# four measured points (b1/4K 20.33 ms vs 21.19 at 32; b1/16K 26.89 vs
+# 28.08 at 64; b4/4K 27.23 vs 31.49 at 64) and within noise at the fourth.
+# The isolated sweep had said 64 — that optimum did not survive the real
+# model eagerly (Phase 12) and does not survive replay either. 16 is
+# capped rather than targeted because more splits cost more partial
+# writes to merge, and under replay that traffic is no longer hidden
+# behind launch gaps.
+MAX_SPLITS = 16
 
 # Pages fetched per loop iteration. One 16-token page is 4 KB of K and
 # 4 KB of V, and the online-softmax dependency serialises the iterations,
