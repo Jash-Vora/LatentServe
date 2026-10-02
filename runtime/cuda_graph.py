@@ -132,10 +132,18 @@ class CapturedDecode:
     bucket_tokens: int
     num_splits: int
     warmup: int = 3
+    # Phase 14b: run the greedy argmax inside the graph. Outside it, the
+    # argmax is its own launch after the graph finishes, followed by a
+    # device-to-host copy — and the token it produces is then copied
+    # straight back to the device as the next step's input. Inside the
+    # graph it is one more recorded kernel, and its output buffer can be
+    # fed to the next step without ever leaving the GPU.
+    greedy: bool = False
 
     static_ids: torch.Tensor = field(init=False)
     static_pos: torch.Tensor = field(init=False)
     static_logits: Optional[torch.Tensor] = field(init=False, default=None)
+    static_next: Optional[torch.Tensor] = field(init=False, default=None)
     graph: Optional[torch.cuda.CUDAGraph] = field(init=False, default=None)
     replays: int = field(init=False, default=0)
 
@@ -148,10 +156,13 @@ class CapturedDecode:
         for layer in self.model.layers:
             layer.attn.num_splits = value
 
-    def _run(self) -> torch.Tensor:
-        return self.model.decode_forward_static(
+    def _run(self):
+        logits = self.model.decode_forward_static(
             self.static_ids, self.static_pos, max_position=self.bucket_tokens - 1
         )
+        if not self.greedy:
+            return logits, None
+        return logits, logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
     def load(self, token_ids: torch.Tensor, positions: torch.Tensor) -> None:
         """Copy this step's inputs into the buffers the graph reads.
@@ -189,7 +200,7 @@ class CapturedDecode:
 
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, pool=pool):
-                self.static_logits = self._run()
+                self.static_logits, self.static_next = self._run()
             self.graph = graph
         finally:
             # The split count is baked into the graph now; leave eager
@@ -220,6 +231,7 @@ class GraphedDecoder:
         buckets: Sequence[int] = DEFAULT_BUCKETS,
         num_splits: Optional[dict] = None,
         enabled: bool = True,
+        greedy: bool = False,
     ):
         self.model = model
         self.num_splits_override = num_splits or {}
@@ -235,10 +247,16 @@ class GraphedDecoder:
             enabled and torch.cuda.is_available() and model.device.type == "cuda"
         )
         self.graphs: dict[tuple[int, int], CapturedDecode] = {}
+        self._last_graph: Optional[CapturedDecode] = None
+        self.greedy = greedy
         self.eager_steps = 0
         self.graph_steps = 0
         self.captures = 0
         self._pool = None
+        # Host time spent inside the last step() — bookkeeping, copies and
+        # the replay *launch*, but not the GPU work the launch enqueues.
+        # The engine's loop profile subtracts it out of the wall time.
+        self.last_host_ms = 0.0
         if self.enabled:
             check_capturable(model)
 
@@ -273,9 +291,32 @@ class GraphedDecoder:
         )
 
     @torch.no_grad()
+    def step_greedy(
+        self, token_ids: torch.Tensor, positions: torch.Tensor, slots: Sequence[int]
+    ) -> torch.Tensor:
+        """One step, returning the greedy next tokens as a device [B, 1]
+        tensor instead of logits.
+
+        Under a graph this is the captured argmax's static output: valid
+        until the next replay of the same graph, and suitable to pass
+        straight back in as the next step's `token_ids` without a trip
+        through the host.
+        """
+        if not self.greedy:
+            raise RuntimeError("construct GraphedDecoder(greedy=True) to use step_greedy")
+        logits = self.step(token_ids, positions, slots)
+        if self._last_graph is not None:
+            return self._last_graph.static_next
+        return logits[:, -1, :].argmax(dim=-1, keepdim=True)
+
+    @torch.no_grad()
     def step(
         self, token_ids: torch.Tensor, positions: torch.Tensor, slots: Sequence[int]
     ) -> torch.Tensor:
+        import time as _time
+
+        t0 = _time.perf_counter()
+        self._last_graph = None
         cache = self.model.cache
         # Host bookkeeping first, outside any graph: decides where this
         # step's KV goes and updates the persistent buffers in place.
@@ -286,14 +327,17 @@ class GraphedDecoder:
 
         if not self.enabled or bucket is None or bucket > rope_limit:
             self.eager_steps += 1
-            return self.model.decode_forward_static(
+            out = self.model.decode_forward_static(
                 token_ids, positions, max_position=cache.max_len
             )
+            self.last_host_ms = (_time.perf_counter() - t0) * 1000
+            return out
 
         key = (batch, bucket)
         graph = self.graphs.get(key)
         if graph is None:
-            graph = CapturedDecode(self.model, batch, bucket, self._splits_for(batch, bucket))
+            graph = CapturedDecode(self.model, batch, bucket, self._splits_for(batch, bucket),
+                                   greedy=self.greedy)
             graph.load(token_ids, positions)
             graph.capture(pool=self._pool)
             if self._pool is None:
@@ -303,7 +347,10 @@ class GraphedDecoder:
         else:
             graph.load(token_ids, positions)
         self.graph_steps += 1
-        return graph.replay()
+        out = graph.replay()
+        self._last_graph = graph
+        self.last_host_ms = (_time.perf_counter() - t0) * 1000
+        return out
 
     def stats(self) -> dict:
         return {

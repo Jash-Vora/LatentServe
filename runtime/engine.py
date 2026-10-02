@@ -71,6 +71,8 @@ class ServingEngine:
         eos_token_id: Optional[int] = None,
         on_retire: Optional[callable] = None,
         use_cuda_graphs: bool = False,
+        sample_in_graph: bool = True,
+        profile_loop: bool = False,
     ):
         self.model = model
         self.max_running = max_running
@@ -107,6 +109,18 @@ class ServingEngine:
         # that cost to start-up instead of onto whichever request
         # happens to trigger it.
         self.decoder = None
+        # Phase 14b loop accounting. `profile_loop` adds per-phase timers to
+        # every decode step; they cost a few perf_counter calls, which is
+        # why they are off unless asked for.
+        self.profile_loop = profile_loop
+        self.loop_profile: dict = {}
+        self.profiled_steps = 0
+        # On-device token feedback: (batch key, next-token tensor, positions).
+        # Valid only for a step that serves exactly the same requests in the
+        # same order as the previous one.
+        self._fed = None
+        self.device_fed_steps = 0
+        self.host_fed_steps = 0
         if use_cuda_graphs:
             import warnings
 
@@ -115,7 +129,11 @@ class ServingEngine:
             for layer in model.layers:
                 layer.attn.attn_impl = "triton_paged"
             try:
-                self.decoder = GraphedDecoder(model)
+                # Phase 14b: greedy token selection inside the graph. The
+                # engine only ever samples greedily (argmax), so moving it
+                # into the graph changes no output — it removes a launch
+                # and a host round trip per step.
+                self.decoder = GraphedDecoder(model, greedy=sample_in_graph)
             except GraphUnsupported as e:
                 warnings.warn(f"CUDA graphs disabled, decoding eagerly: {e}", stacklevel=2)
                 self.decoder = None
@@ -206,40 +224,80 @@ class ServingEngine:
             return True
         return self.eos_token_id is not None and request.output_ids[-1] == self.eos_token_id
 
+    def _batch_key(self) -> tuple:
+        """Identity of this step's batch: which requests, in which order.
+
+        Keyed on request ids, not slots. A request that finishes frees its
+        slot, and a new request admitted into that slot leaves the slot
+        list unchanged — so a slot-keyed check would feed the newcomer the
+        previous occupant's last token.
+        """
+        return tuple(r.request_id for r in self.running)
+
+    def _prof(self, name: str, ms: float) -> None:
+        if self.profile_loop:
+            self.loop_profile[name] = self.loop_profile.get(name, 0.0) + ms
+
     def _decode(self) -> None:
         if not self.running:
             return
+        clock = time.perf_counter
+        t_start = clock()
         device = self.model.device
         slots = [r.slot for r in self.running]
-        tokens = torch.tensor(
-            [[r.output_ids[-1]] for r in self.running], dtype=torch.long, device=device
-        )
-        # Absolute position of the token about to be processed: prompt
-        # plus everything generated so far, minus the one being fed in.
-        positions = torch.tensor(
-            [[r.prompt_len + r.generated - 1] for r in self.running],
-            dtype=torch.long,
-            device=device,
-        )
+        key = self._batch_key()
+        greedy_graph = self.decoder is not None and self.decoder.greedy
 
-        t0 = time.perf_counter()
-        if self.decoder is not None:
-            # The returned tensor is the graph's static output, overwritten
-            # by the next replay. Reading the argmax below (with .tolist(),
-            # which copies to host) before the next step is what makes
-            # that safe.
-            logits = self.decoder.step(tokens, positions, slots)
+        if greedy_graph and self._fed is not None and self._fed[0] == key:
+            # Same requests, same order: last step's chosen tokens are still
+            # on the GPU in the graph's output buffer, and every position is
+            # one further on. Nothing to build on the host, nothing to copy up.
+            tokens, positions = self._fed[1], self._fed[2] + 1
+            self.device_fed_steps += 1
         else:
-            logits = self.model.decode_step_ragged(tokens, positions, slots)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        step_ms = (time.perf_counter() - t0) * 1000
+            tokens = torch.tensor(
+                [[r.output_ids[-1]] for r in self.running], dtype=torch.long, device=device
+            )
+            # Absolute position of the token about to be processed: prompt
+            # plus everything generated so far, minus the one being fed in.
+            positions = torch.tensor(
+                [[r.prompt_len + r.generated - 1] for r in self.running],
+                dtype=torch.long, device=device,
+            )
+            self.host_fed_steps += 1
+        t_inputs = clock()
+
+        if greedy_graph:
+            next_dev = self.decoder.step_greedy(tokens, positions, slots)
+            t_launch = clock()
+            # One tiny device-to-host copy, which is also the wait for the GPU.
+            next_ids = next_dev.view(-1).tolist()
+            t_gpu = clock()
+            t_sample = t_gpu
+            self._fed = (key, next_dev, positions)
+        else:
+            if self.decoder is not None:
+                # The returned tensor is the graph's static output, overwritten
+                # by the next replay. Reading the argmax below (with .tolist(),
+                # which copies to host) before the next step is what makes
+                # that safe.
+                logits = self.decoder.step(tokens, positions, slots)
+            else:
+                logits = self.model.decode_step_ragged(tokens, positions, slots)
+            t_launch = clock()
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t_gpu = clock()
+            next_ids = logits[:, -1, :].argmax(dim=-1).tolist()
+            t_sample = clock()
+            self._fed = None
+
+        step_ms = (t_gpu - t_inputs) * 1000
         self.decode_s += step_ms / 1000
         self.decode_steps += 1
         self.batch_occupancy.append(len(self.running))
 
-        next_ids = logits[:, -1, :].argmax(dim=-1).tolist()
-        now = time.perf_counter()
+        now = clock()
         still: list[ServedRequest] = []
         for request, token in zip(self.running, next_ids):
             request.output_ids.append(int(token))
@@ -254,13 +312,28 @@ class ServingEngine:
             else:
                 still.append(request)
         self.running = still
+        t_end = clock()
+
+        if self.profile_loop:
+            host_in_decoder = self.decoder.last_host_ms if self.decoder is not None else 0.0
+            self._prof("inputs", (t_inputs - t_start) * 1000)
+            self._prof("decoder_host", host_in_decoder)
+            self._prof("gpu_wait", (t_gpu - t_inputs) * 1000 - host_in_decoder)
+            self._prof("sample", (t_sample - t_gpu) * 1000)
+            self._prof("bookkeeping", (t_end - t_sample) * 1000)
+            self.profiled_steps += 1
 
     def step(self) -> None:
         """One engine iteration: admit, prefill, decode, retire."""
         t0 = time.perf_counter()
         gpu_before = self.prefill_s + self.decode_s
         self.step_count += 1
+        t_admit = time.perf_counter()
+        prefill_before = self.prefill_s
         self._admit_and_prefill()
+        if self.profile_loop:
+            admit_ms = (time.perf_counter() - t_admit) * 1000
+            self._prof("schedule", admit_ms - (self.prefill_s - prefill_before) * 1000)
         self._decode()
         # Everything in the step that was not GPU work: scheduling,
         # block-table updates, Python bookkeeping. Reported as its own
@@ -320,6 +393,7 @@ class ServingEngine:
             self.decoder.step(tokens, positions, slots)
         self.cache.reset()
         self._free_slots = list(range(self.max_running))
+        self._fed = None
         return self.decoder.captures - before
 
     def stats(self) -> dict:
@@ -350,6 +424,10 @@ class ServingEngine:
             "batch_efficiency": mean_batch / self.max_running if self.max_running else 0.0,
             "max_running": self.max_running,
             **self.scheduler.stats(),
+            "device_fed_steps": self.device_fed_steps,
+            "host_fed_steps": self.host_fed_steps,
+            **({f"loop_{k}_ms_per_step": v / max(1, self.profiled_steps)
+                for k, v in self.loop_profile.items()} if self.profile_loop else {}),
             **({f"graph_{k}": v for k, v in self.decoder.stats().items() if k != "keys"}
                if self.decoder is not None else {"graph_captures": 0}),
             **self.cache.stats(),
