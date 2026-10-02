@@ -66,23 +66,31 @@ SYSTEMS = ("hf_fp32", "hf_fp16", "latentserve_unfused", "latentserve_fused", "vl
 # ----------------------------------------------------------------------
 
 
-def nll_top1_kl(logits, ids, ref_logp=None):
-    """Per-position NLL of the next token, argmax, and KL(ref || this).
+def score_positions(logits, targets, ref_logp=None):
+    """NLL of each target, the argmax, KL(ref || this), and the log-probs.
 
-    logits [S, V] for one sequence, ids [S]. Position j predicts ids[j+1].
-    Returns (nll list of S-1, argmax list of S-1, kl list or None).
+    logits [n, V] for n positions whose next tokens are `targets` [n]. Works
+    on a slice of a sequence as well as a whole one, which is what keeps
+    memory bounded: a full 1024-position chunk of fp32 logits over a
+    152K vocabulary is 622 MB per copy, and the first version of this
+    runner made several at once and ran out of memory on a T4.
     """
     import torch
 
-    logp = torch.log_softmax(logits.float(), dim=-1)[:-1]
-    target = ids[1:]
-    nll = (-logp.gather(-1, target[:, None]).squeeze(-1)).tolist()
+    logp = torch.log_softmax(logits.float(), dim=-1)
+    nll = (-logp.gather(-1, targets[:, None]).squeeze(-1)).tolist()
     top1 = logp.argmax(dim=-1).tolist()
     kl = None
     if ref_logp is not None:
         # KL is non-negative; float32 round-off can leave ~-1e-8 when two
         # distributions agree, which would print as a nonsensical negative.
         kl = (ref_logp.exp() * (ref_logp - logp)).sum(dim=-1).clamp_min(0).tolist()
+    return nll, top1, kl, logp
+
+
+def nll_top1_kl(logits, ids, ref_logp=None):
+    """Whole-sequence form: position j predicts ids[j+1]."""
+    nll, top1, kl, _ = score_positions(logits[:-1], ids[1:], ref_logp)
     return nll, top1, kl
 
 
@@ -212,6 +220,22 @@ def _greedy_hf(model, prompt, n, device):
     return tokens
 
 
+def _hf_hidden(model, t):
+    """Final hidden states [S, H], after the final norm (Qwen2Model applies
+    it), so logits for any slice are just `lm_head` of that slice."""
+    return model.model(input_ids=t[None]).last_hidden_state[0]
+
+
+def _ls_hidden(ls, ids, device):
+    """LatentServe's hidden states [S, H], *before* the final norm, through
+    its own layers. `_to_logits` applies the norm — fused or not — per slice."""
+    import torch
+
+    ls.allocate_cache(1, len(ids) + 8, paged=True, block_size=16)
+    ls.cache.reset()
+    return ls._forward_block(torch.tensor([ids], device=device), start_pos=0)[0]
+
+
 def _ls_logits(ls, ids, device):
     import torch
 
@@ -250,24 +274,44 @@ def run_latentserve_arm(args, load_reference) -> dict:
 
     with torch.no_grad():
         # --- text ---
+        # Each system's network runs once per chunk; its hidden states are
+        # turned into logits `args.score_slice` positions at a time and
+        # scored before the next slice is made. Every position's score
+        # depends only on its own logits, so slicing changes no number.
         for chunk in data["chunks"]:
             t = torch.tensor(chunk, device=device)
-            logits32 = ref32.model(input_ids=t[None]).logits[0]
-            ref_logp = torch.log_softmax(logits32.float(), dim=-1)[:-1]
-            nll, top1, _ = nll_top1_kl(logits32, t)
-            argmax32.append(top1)
-            res["hf_fp32"]["nll"] += nll
-            res["hf_fp32"]["top1_agree"] += [1.0] * len(top1)
-            res["hf_fp32"]["kl"] += [0.0] * len(top1)
-            candidates = {"hf_fp16": lambda: ref16.model(input_ids=t[None]).logits[0]}
+            hidden = {"hf_fp32": _hf_hidden(ref32.model, t),
+                      "hf_fp16": _hf_hidden(ref16.model, t)}
             for name, fused in (("latentserve_unfused", False), ("latentserve_fused", True)):
-                candidates[name] = (lambda f=fused: (ls_variant(f), _ls_logits(ls, chunk, device))[1])
-            for name, get in candidates.items():
-                nll_s, top1_s, kl_s = nll_top1_kl(get(), t, ref_logp)
-                res[name]["nll"] += nll_s
-                res[name]["kl"] += kl_s
-                res[name]["top1_agree"] += [float(a == b) for a, b in zip(top1_s, top1)]
-            del logits32, ref_logp
+                ls_variant(fused)
+                hidden[name] = _ls_hidden(ls, chunk, device)
+            heads = {"hf_fp32": ref32.model.lm_head, "hf_fp16": ref16.model.lm_head}
+
+            def logits_of(name, a, b):
+                if name in heads:
+                    return heads[name](hidden[name][a:b])
+                ls_variant(name == "latentserve_fused")
+                return ls._to_logits(hidden[name][None, a:b])[0]
+
+            chunk_top1 = []
+            last = len(chunk) - 1                        # the final token predicts nothing
+            for a in range(0, last, args.score_slice):
+                b = min(a + args.score_slice, last)
+                targets = t[a + 1 : b + 1]
+                nll, top1, _, ref_logp = score_positions(logits_of("hf_fp32", a, b), targets)
+                chunk_top1 += top1
+                res["hf_fp32"]["nll"] += nll
+                res["hf_fp32"]["top1_agree"] += [1.0] * len(top1)
+                res["hf_fp32"]["kl"] += [0.0] * len(top1)
+                for name in ("hf_fp16", "latentserve_unfused", "latentserve_fused"):
+                    nll_s, top1_s, kl_s, _ = score_positions(logits_of(name, a, b), targets,
+                                                             ref_logp)
+                    res[name]["nll"] += nll_s
+                    res[name]["kl"] += kl_s
+                    res[name]["top1_agree"] += [float(x == y) for x, y in zip(top1_s, top1)]
+                del ref_logp
+            argmax32.append(chunk_top1)
+            del hidden
 
         # --- task ---
         preds = {s: [] for s in SYSTEMS[:-1]}
@@ -472,6 +516,8 @@ def main() -> int:
     p.add_argument("--gen-prompt-len", type=int, default=128)
     p.add_argument("--gen-new-tokens", type=int, default=128)
     p.add_argument("--gen-batch", type=int, default=16)
+    p.add_argument("--score-slice", type=int, default=128,
+                   help="positions turned into logits at a time; bounds peak memory")
     p.add_argument("--synthetic", action="store_true", help="random tokens; smoke test only")
     p.add_argument("--results-dir", default="results/raw/quality")
     args = p.parse_args()
