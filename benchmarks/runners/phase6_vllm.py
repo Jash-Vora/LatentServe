@@ -235,6 +235,27 @@ def run_vllm(cfg, requests, batch_size: int, max_seq_len: int) -> dict:
     }
 
 
+def settle_gpu(seconds: float = 30.0) -> None:
+    """Bring the GPU to its sustained clock before anything is timed.
+
+    A T4 coming off idle — model loading, graph capture — runs at boost
+    clock, then settles lower under sustained load. Without this, the first
+    configuration's short run was measured fast and its long run slow, and
+    the differenced decode came out as 2b - a: +1-2 ms at batch 1 / 2K on
+    every host measured, with impossible prefill rates alongside it.
+    """
+    if not torch.cuda.is_available():
+        return
+    a = torch.randn(4096, 4096, device="cuda", dtype=torch.float16)
+    end = time.perf_counter() + seconds
+    while time.perf_counter() < end:
+        for _ in range(20):
+            a = (a @ a).clamp_(-1, 1)
+        torch.cuda.synchronize()
+    del a
+    torch.cuda.empty_cache()
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--config", default="configs/phase6_vllm.yaml")
@@ -256,6 +277,9 @@ def main() -> int:
                    help="LatentServe decode path: the Phase 3 gather or the Phase 11 kernel")
     p.add_argument("--cuda-graphs", action="store_true",
                    help="Phase 13: decode through captured CUDA graphs (implies the kernel)")
+    p.add_argument("--settle-seconds", type=float, default=30.0,
+                   help="sustained GPU load before the first timed run, so it is not "
+                   "measured at boost clock (0 to skip)")
     p.add_argument("--profile-loop", action="store_true",
                    help="per-phase breakdown of every LatentServe decode step")
     p.add_argument("--fuse-projections", action="store_true",
@@ -319,6 +343,9 @@ def main() -> int:
     output_lengths = args.output_lengths or [args.max_output]
     walls: dict = {}
 
+    if args.settle_seconds > 0:
+        print(f"Settling the GPU for {args.settle_seconds:.0f} s before the first timed run ...")
+        settle_gpu(args.settle_seconds)
     for batch_size, context_length in sweep:
       for out_tokens in output_lengths:
         args.max_output = out_tokens
@@ -459,6 +486,33 @@ def _decode_split(rows_by_out: dict, batch: int) -> tuple:
     return decode_ms, rate
 
 
+DRIFT_LIMIT = 0.025
+
+
+def _best_decode(rows_by_out: dict, batch: int) -> dict:
+    """Decode ms/step, and whether the differenced figure can be trusted.
+
+    Differencing assumes the short and long runs went at the same speed.
+    The check is direct: compare their median token gaps. Across every run
+    measured in Phases 13-14 the steady configurations differ by at most
+    1.8% between their two runs, while the first configuration of a run —
+    measured on a GPU still at boost clock — differs by 2.6-7.3%. Past the
+    limit the subtraction returns 2b - a, so the long run's median gap is
+    used instead, and the prefill estimate derived from it is withheld.
+    """
+    decode_ms, prefill = _decode_split(rows_by_out, batch)
+    lens = sorted(rows_by_out)
+    gap = {L: rows_by_out[L].get("tpot_p50_ms") for L in lens}
+    drift = None
+    if len(lens) >= 2 and gap[lens[0]] and gap[lens[-1]]:
+        drift = (gap[lens[-1]] - gap[lens[0]]) / gap[lens[0]]
+    if drift is not None and drift > DRIFT_LIMIT:
+        return {"decode": gap[lens[-1]], "method": "median", "drift": drift,
+                "prefill": None, "differenced": decode_ms}
+    return {"decode": decode_ms, "method": "diff", "drift": drift,
+            "prefill": prefill, "differenced": decode_ms}
+
+
 def compare(cfg, results_dir: str, host: str | None = None) -> int:
     """Run the comparison once per machine, never across machines.
 
@@ -554,15 +608,17 @@ def _compare_rows(rows: list) -> None:
         print("No vLLM rows yet — run `--system vllm` in the same session.")
         return
 
+    suspect: list = []
     print(f"{'batch':>5} {'ctx':>6}  {'system':<26}{'decode ms/step':>15}"
-          f"{'decode tok/s':>14}{'prefill tok/s':>15}{'e2e tok/s':>11}")
+          f"{'median gap':>12}{'decode tok/s':>14}{'prefill tok/s':>15}{'e2e tok/s':>11}")
     verdict = defaultdict(dict)
     for batch, ctx in points:
         base = groups.get(("vllm", batch, ctx))
         if not base:
             continue
         base_row = base[max(base)]
-        base_decode, _ = _decode_split(base, batch)
+        base_best = _best_decode(base, batch)
+        base_decode = base_best["decode"]
         for system in systems:
             g = groups.get((system, batch, ctx))
             if not g:
@@ -574,16 +630,25 @@ def _compare_rows(rows: list) -> None:
                 except UnfairComparison as e:
                     print(f"{batch:>5} {ctx:>6}  {system:<26}  SKIPPED — {e}")
                     continue
-            decode_ms, prefill = _decode_split(g, batch)
+            best = _best_decode(g, batch)
+            decode_ms, prefill = best["decode"], best["prefill"]
             tput = row["throughput_tokens_sec"]
             decode_tput = batch / decode_ms * 1000 if decode_ms else None
+            gaps = [r.get("tpot_p50_ms") for r in g.values() if r.get("tpot_p50_ms")]
+            median_gap = max(gaps) if gaps else None
+            flag = ""
+            if best["method"] == "median":
+                flag = (f"  <- runs drifted {best['drift']:.1%}: differenced "
+                        f"{best['differenced']:.1f} discarded, long-run median used")
+                suspect.append((system, batch, ctx))
             print(f"{batch:>5} {ctx:>6}  {system:<26}"
                   f"{(f'{decode_ms:.1f}' if decode_ms else '-'):>15}"
+                  f"{(f'{median_gap:.1f}' if median_gap else '-'):>12}"
                   f"{(f'{decode_tput:.0f}' if decode_tput else '-'):>14}"
                   f"{(f'{prefill:.0f}' if prefill else '-'):>15}"
-                  f"{tput:>11.1f}")
+                  f"{tput:>11.1f}{flag}")
             if system != "vllm":
-                _, base_prefill = _decode_split(base, batch)
+                base_prefill = base_best["prefill"]
                 verdict[system][(batch, ctx)] = (
                     decode_ms, base_decode, tput / base_row["throughput_tokens_sec"],
                     prefill, base_prefill,
@@ -612,6 +677,12 @@ def _compare_rows(rows: list) -> None:
                         "a prefill result") if not 0.67 < pre_ratio < 1.5 else ""
                 print(f"  end-to-end       batch {b:>2} ctx {c:>5}: {ratio:.2f}x vLLM{note}")
         print()
+    if suspect:
+        print(f"[WARN] the short and long runs drifted apart by more than "
+              f"{DRIFT_LIMIT:.1%} at {suspect}, so differencing would report 2b - a. "
+              "Those rows use the long run's median token gap instead, and their "
+              "prefill estimate is withheld. (vLLM's median is over per-request "
+              "means — fair at batch 1, where a request is its own batch.)")
     print("Same host, same torch, same prompts, same output lengths, both systems on\n"
           "CUDA graphs. Peak VRAM is not compared: vLLM preallocates by policy.")
 

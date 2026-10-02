@@ -70,7 +70,7 @@ def test_a_host_with_one_system_is_not_paired_with_another_hosts_rows(tmp_path):
             + _rows("vllm", "hostA", "2026-10-01T10:30", 1.2, 2.2, 40)
             + _rows("latentserve_kernel_graphed", "lonely", "2026-10-03T12:00", 9.0, 9.9, 5))
     out = _run(tmp_path, rows)
-    assert "only one system, not compared: ['lonely']" in out
+    assert "only one system, not compared" in out and "lonely" in out
     assert "host lonely" not in out
 
 
@@ -81,3 +81,60 @@ def test_host_flag_restricts_to_one_machine(tmp_path):
             + _rows("vllm", "hostB", "2026-10-02T09:30", 1.2, 2.2, 40))
     out = _run(tmp_path, rows, host="hostB")
     assert "host hostB" in out and "host hostA" not in out
+
+
+def test_one_host_with_two_stacks_is_never_paired_across_them(tmp_path):
+    """Installing vLLM replaces torch in place, so one session — one
+    hostname — can hold LatentServe rows from before the install and vLLM
+    rows from after. Exactly what happened on a real host."""
+    before = _rows("latentserve_kernel_graphed", "same", "2026-10-02T10:00", 2.0, 3.6, 25)
+    after = _rows("vllm", "same", "2026-10-02T12:00", 1.2, 2.2, 40)
+    for r in before:
+        r["lib_versions"] = {"torch": "2.10.0"}
+        r["cuda_version"] = "12.8"
+    for r in after:
+        r["lib_versions"] = {"torch": "2.13.0", "vllm": "0.30.0"}
+        r["cuda_version"] = "13.0"
+    out = _run(tmp_path, before + after)
+    assert "No host has rows for both systems" in out
+    assert "decode latency" not in out
+
+
+def test_drift_between_runs_is_flagged_and_the_median_gap_reported(tmp_path):
+    """The real failure, reproduced: the short run measured at 19.1 ms per
+    step, the long one at 20.1, so differencing reports 2b - a = 21.1 —
+    above both. The compare must show the median gap beside it and say
+    which to trust."""
+    n, batch, short, long, prefill_s = 4, 1, 8, 16, 1.0
+    a, b = 0.0191, 0.0201
+    rows = []
+    for system in ("latentserve_kernel_graphed", "vllm"):
+        for length, per_step in ((short, a), (long, b)):
+            wall = prefill_s + length * n / batch * per_step
+            r = _rows(system, "h", "2026-10-02T10:00", wall, wall, 40)[0]
+            r["output_length"] = length
+            r["extra"]["wall_s"] = wall
+            r["tpot_p50_ms"] = per_step * 1000
+            rows.append(r)
+    out = _run(tmp_path, rows)
+    assert "median gap" in out
+    assert "runs drifted" in out and "[WARN] the short and long runs drifted" in out
+    assert "differenced 21.1 discarded" in out    # 2b - a, named and set aside
+    assert "20.1" in out                          # the long run's median, used instead
+
+
+def test_steady_runs_keep_the_differenced_figure(tmp_path):
+    """No drift, no override: 1.3% between runs is under the limit, which
+    is where every steady configuration measured so far sits."""
+    n, batch = 4, 1
+    rows = []
+    for system in ("latentserve_kernel_graphed", "vllm"):
+        for length, per_step in ((8, 0.0239), (16, 0.0242)):
+            wall = 1.0 + length * n / batch * per_step
+            r = _rows(system, "h", "2026-10-02T10:00", wall, wall, 40)[0]
+            r["output_length"] = length
+            r["extra"]["wall_s"] = wall
+            r["tpot_p50_ms"] = per_step * 1000
+            rows.append(r)
+    out = _run(tmp_path, rows)
+    assert "runs drifted" not in out
