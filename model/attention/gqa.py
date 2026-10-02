@@ -117,6 +117,8 @@ class GQAAttention(nn.Module):
         self._qkv_bias: Optional[torch.Tensor] = None
         self._qkv_split: Optional[tuple[int, int, int]] = None
         self.use_fused = False
+        # Phase 14a step 2: RoPE on q and k in one kernel.
+        self.fused_rope = False
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
@@ -233,6 +235,14 @@ class GQAAttention(nn.Module):
         b, s, _ = hidden_states.shape
 
         q, k, v = self._project_qkv(hidden_states)
+        if self.fused_rope:
+            # Applied on the projection's own [B, S, H*D] layout, before the
+            # transpose, so the kernel reads q and k where the fused
+            # projection wrote them.
+            from kernels.fused_elementwise import rope_qk
+
+            q, k = rope_qk(q, k, cos, sin, self.num_attention_heads,
+                           self.num_key_value_heads, self.head_dim)
         # reshape rather than view: the fused path's outputs are slices of
         # one wider tensor, so they are not contiguous across `s`. Only the
         # last dimension is being split into (heads, head_dim), which a
@@ -241,7 +251,8 @@ class GQAAttention(nn.Module):
         k = k.reshape(b, s, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         v = v.reshape(b, s, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        q, k = apply_rope(q, k, cos, sin)
+        if not self.fused_rope:
+            q, k = apply_rope(q, k, cos, sin)
 
         k, v = self._project_kv_for_cache(k, v)
         cache.write(self.layer_idx, k, v, start_pos)
@@ -286,6 +297,11 @@ class GQAAttention(nn.Module):
                 # split on the device from seq_lens, so a fixed count
                 # serves a sequence that grows within its bucket.
                 num_splits=self.num_splits,
+                # Phase 14c: the INT8 cache keeps each sequence's last page of
+                # K unquantized in its residual; the kernel reads it from there.
+                k_residual=cache.residual(self.layer_idx) if hasattr(cache, "residual") else None,
+                res_rows=(cache.residual_rows_tensor(b)
+                          if hasattr(cache, "residual_rows_tensor") else None),
             )
             attn_out = out.reshape(b, self.num_attention_heads, 1, self.head_dim)
             attn_out = attn_out.transpose(1, 2).contiguous().view(b, s, -1)

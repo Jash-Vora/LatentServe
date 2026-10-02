@@ -280,6 +280,49 @@ class Int8PagedKVCache:
         self._active: list[int] = list(range(spec.max_batch_size))
         self.gather_calls = 0
 
+        # ---- Phase 14c: the INT8 cache at graph speed ------------------
+        #
+        # A completed block used to be quantized inside write(), on a
+        # decision made in Python, per layer — exactly what a CUDA graph
+        # cannot contain. The block that just filled is still intact in
+        # the residual, though, so its quantization can wait until the
+        # next advance(), which already runs outside the graph. Meanwhile
+        # the kernel reads that page from the residual.
+        #
+        # Invariant, in both modes: every page of a sequence except its
+        # last is in the INT8 pool; the last is in the residual, exact.
+        # Immediate mode satisfies it already (it quantizes into the pool
+        # and leaves the residual intact); deferred mode satisfies it by
+        # quantizing any block the previous step completed before this
+        # step's write. The kernel derives "last page" from the sequence
+        # length alone, on the device.
+        self.deferred_finalize = False
+        # Blocks quantized so far, per layer and slot. Per *layer* because
+        # writes happen layer by layer within a step: when layer 0 reads,
+        # layers 1+ have not yet written this step's token, so a flush that
+        # quantized every layer at once froze their blocks one token short.
+        # The gather path caught it; the kernel path never flushes mid-step.
+        self._fin = [[0] * spec.max_batch_size for _ in range(spec.num_layers)]
+        bs = block_size
+        self._capacity_pages = (spec.max_seq_len + bs - 1) // bs
+        mb = spec.max_batch_size
+        # Persistent decode buffers, allocated once and written into, for
+        # the same reason as PagedKVCache's (Phase 13): a graph records
+        # addresses, so the tensors it reads must never be replaced.
+        self._block_tables_buf = torch.zeros((mb, max(1, self._capacity_pages)),
+                                             dtype=torch.int32, device=self.device)
+        self._seq_lens_buf = torch.zeros(mb, dtype=torch.int32, device=self.device)
+        self._write_slots_buf = torch.zeros((mb, 1), dtype=torch.long, device=self.device)
+        self._k_res_idx_buf = torch.zeros(mb, dtype=torch.long, device=self.device)
+        self._res_rows_buf = torch.zeros(mb, dtype=torch.int32, device=self.device)
+        self._table_state: list = [None] * mb
+        self._block_tables: Optional[torch.Tensor] = None
+        self._seq_lens_tensor: Optional[torch.Tensor] = None
+        self._res_rows: Optional[torch.Tensor] = None
+        self._graph_write = False
+        self._k_res_flat = [r.view(mb * bs, spec.num_kv_heads, spec.head_dim)
+                            for r in self._k_residual]
+
     # ------------------------------------------------------------------
     # State — identical to PagedKVCache; duplicated rather than shared
     # by inheritance, since the two classes' storage is different enough
@@ -320,6 +363,14 @@ class Int8PagedKVCache:
         self._write_plan = None
         self._active = list(range(self.spec.max_batch_size))
         self.gather_calls = 0
+        # Phase 14c: contents cleared, storage kept, so a graph captured
+        # before a reset is still valid after it.
+        self._fin = [[0] * self.spec.max_batch_size for _ in range(self.spec.num_layers)]
+        self._table_state = [None] * self.spec.max_batch_size
+        self._block_tables = self._seq_lens_tensor = self._res_rows = None
+        self._graph_write = False
+        self._block_tables_buf.zero_()
+        self._seq_lens_buf.zero_()
         # Not strictly required for correctness (every finalized block
         # belongs to a freed sequence and will be overwritten before it
         # is ever read again, same as the int8 pool itself), but zeroing
@@ -335,6 +386,8 @@ class Int8PagedKVCache:
         self.tables[index].free()
         self._read_slots = None
         self._write_plan = None
+        self._set_finalized(index, 0)
+        self._table_state = [None] * self.spec.max_batch_size
 
     # ------------------------------------------------------------------
     # Allocation — identical to PagedKVCache, plus the K write plan.
@@ -358,11 +411,31 @@ class Int8PagedKVCache:
         elif batch_size is not None:
             self.set_active(range(batch_size))
         active = self._active
+        if self.deferred_finalize:
+            # Blocks the previous step completed are still whole in the
+            # residual; quantize them before this step overwrites it.
+            self._finalize_pending(active)
         starts = [self.tables[i].length for i in active]
         for i in active:
             self.tables[i].append(n)
 
         dev = self.device
+        self._graph_write = self.deferred_finalize and n == 1
+        if n > 1 or not self.deferred_finalize:
+            # The eager write path finalises every block it completes,
+            # immediately.
+            for i, start in zip(active, starts):
+                self._set_finalized(i, (start + n) // self.block_size)
+        if n == 1:
+            self._fill_decode_buffers(active, starts)
+        if self._graph_write:
+            # Graph path: writes go through the persistent buffers, and the
+            # gather path's per-token slot index is built only if read()
+            # is ever called.
+            self._write_starts = starts
+            self._write_plan = None
+            self._read_slots = None
+            return
         self._write_slots = torch.tensor(
             [
                 [self.tables[i].slot(p) for p in range(start, start + n)]
@@ -395,6 +468,117 @@ class Int8PagedKVCache:
     # ------------------------------------------------------------------
     # Write-plan construction — host-side, once per advance()
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Phase 14c: deferred finalisation and the kernel's inputs
+    # ------------------------------------------------------------------
+
+    @property
+    def _finalized(self) -> list[int]:
+        """Blocks quantized in *every* layer, per slot."""
+        return [min(layer[s] for layer in self._fin) for s in range(self.spec.max_batch_size)]
+
+    def _set_finalized(self, slot: int, count: int) -> None:
+        for layer in self._fin:
+            layer[slot] = count
+
+    def enable_deferred_finalize(self) -> None:
+        """Switch to deferring block quantization to the next advance().
+
+        Safe at any point: immediate mode has already quantized every
+        complete block, so the finalized counts start from the lengths.
+        """
+        for i, t in enumerate(self.tables):
+            self._set_finalized(i, t.length // self.block_size)
+        self.deferred_finalize = True
+
+    def _finalize_pending(self, seqs: Sequence[int], layers: Optional[Sequence[int]] = None) -> None:
+        """Quantize, for every layer, any block a sequence completed but
+        has not yet had quantized.
+
+        At most one per sequence: the residual holds a single block, so a
+        second pending block would already have been overwritten. That
+        cannot happen if advance() runs before every write, and raising is
+        the honest response if it ever does.
+        """
+        bs = self.block_size
+        for layer in (range(self.spec.num_layers) if layers is None else layers):
+            fin = self._fin[layer]
+            slots, ids = [], []
+            for s in seqs:
+                done = self.tables[s].length // bs
+                pending = done - fin[s]
+                if pending <= 0:
+                    continue
+                if pending > 1:
+                    raise RuntimeError(
+                        f"sequence in slot {s} has {pending} unquantized blocks; the residual "
+                        "holds one, so the earlier ones are already lost"
+                    )
+                slots.append(s)
+                ids.append(self.tables[s].blocks[done - 1])
+                fin[s] = done
+            if slots:
+                self._finalize_blocks(layer, self._k_residual[layer][self._ids(slots)],
+                                      self._ids(ids))
+
+    def _fill_decode_buffers(self, active: list[int], starts: list[int]) -> None:
+        """Write this decode step's indices into the persistent buffers."""
+        b = len(active)
+        bs = self.block_size
+        slots_now = [self.tables[i].slot(st) for i, st in zip(active, starts)]
+        self._write_slots_buf[:b, 0].copy_(torch.tensor(slots_now, dtype=torch.long))
+        self._k_res_idx_buf[:b].copy_(torch.tensor(
+            [i * bs + st % bs for i, st in zip(active, starts)], dtype=torch.long))
+        self._res_rows_buf[:b].copy_(torch.tensor(active, dtype=torch.int32))
+        for row, i in enumerate(active):
+            blocks = self.tables[i].blocks
+            state = (i, len(blocks))
+            if self._table_state[row] != state:
+                if len(blocks) > self._capacity_pages:
+                    raise RuntimeError(
+                        f"sequence in slot {i} needs {len(blocks)} pages, past the "
+                        f"cache's capacity of {self._capacity_pages}"
+                    )
+                self._block_tables_buf[row, : len(blocks)].copy_(
+                    torch.tensor(blocks, dtype=torch.int32))
+                self._table_state[row] = state
+        self._seq_lens_buf[:b].copy_(
+            torch.tensor([self.tables[i].length for i in active], dtype=torch.int32))
+        self._write_slots = self._write_slots_buf[:b]
+        self._block_tables = self._block_tables_buf[:b]
+        self._seq_lens_tensor = self._seq_lens_buf[:b]
+        self._res_rows = self._res_rows_buf[:b]
+
+    def block_tables_tensor(self, batch_size: Optional[int] = None) -> torch.Tensor:
+        if self._block_tables is None:
+            raise RuntimeError("block tables exist only after a decode advance(1)")
+        return self._block_tables if batch_size is None else self._block_tables[:batch_size]
+
+    def seq_lens_tensor(self, batch_size: Optional[int] = None) -> torch.Tensor:
+        if self._seq_lens_tensor is None:
+            raise RuntimeError("sequence lengths exist only after a decode advance(1)")
+        return self._seq_lens_tensor if batch_size is None else self._seq_lens_tensor[:batch_size]
+
+    def residual(self, layer_idx: int) -> torch.Tensor:
+        """[max_batch, block_size, kv_heads, head_dim]: each slot's last page."""
+        return self._k_residual[layer_idx]
+
+    def residual_rows_tensor(self, batch_size: Optional[int] = None) -> torch.Tensor:
+        """Residual row (= slot) of each active sequence, for the kernel."""
+        if self._res_rows is None:
+            raise RuntimeError("residual rows exist only after a decode advance(1)")
+        return self._res_rows if batch_size is None else self._res_rows[:batch_size]
+
+    def _build_read_slots(self) -> None:
+        dev = self.device
+        active = self._active
+        self._read_slots = torch.zeros((len(active), self.max_len), dtype=torch.long, device=dev)
+        for row, i in enumerate(active):
+            seq_slots = self.tables[i].slots()
+            if seq_slots:
+                self._read_slots[row, : len(seq_slots)] = torch.tensor(
+                    seq_slots, dtype=torch.long, device=dev)
 
     def _rows(self, ids: list[int]) -> Rows:
         """A basic slice when `ids` are consecutive, else a LongTensor."""
@@ -504,6 +688,7 @@ class Int8PagedKVCache:
 
         k_tok = k.permute(0, 2, 1, 3)  # [B, n, h, d]
         v_tok = v.permute(0, 2, 1, 3)
+        graph_path = self._graph_write and n == 1
 
         # --- V: per-token scale, no look-ahead, quantize+scatter now. ---
         # The fit is FP32 for the same reason K's is (see
@@ -526,6 +711,14 @@ class Int8PagedKVCache:
             ).to(torch.int8)
         self._flat_v[layer_idx].index_copy_(0, flat, v_q.reshape(-1, h, d))
         self._flat_v_scale[layer_idx].index_copy_(0, flat, v_step.squeeze(-1).reshape(-1, h))
+
+        if graph_path:
+            # --- K, graph path: into the residual at a fixed index, no plan,
+            # no host decision. A block this completes is quantized by the
+            # next advance(); until then the kernel reads it from here. ---
+            self._k_res_flat[layer_idx].index_copy_(
+                0, self._k_res_idx_buf[:b], k_tok.reshape(b, h, d))
+            return
 
         # --- K: replay the plan. ---
         bs = self.block_size
@@ -610,9 +803,16 @@ class Int8PagedKVCache:
         of K traffic against the FP16 paged cache's ~17 MB, which is the
         opposite of the point of the exercise.
         """
-        slots = self._read_slots
-        if slots is None:
+        if self._write_slots is None:
             raise RuntimeError("call advance() before read()")
+        if self.deferred_finalize:
+            # The gather path reads completed pages from the pool, so a block
+            # this step completed must be quantized first — for *this layer
+            # only*: its write has happened, later layers' have not.
+            self._finalize_pending(self._active, layers=[layer_idx])
+        if self._read_slots is None:
+            self._build_read_slots()
+        slots = self._read_slots
         active = self._active[:batch_size]
         idx = slots[:batch_size] if length is None else slots[:batch_size, :length]
         b, view_len = idx.shape

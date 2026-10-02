@@ -97,15 +97,12 @@ def check_capturable(model) -> None:
         raise GraphUnsupported("allocate the cache before capturing")
     try:
         from cache.int8_paged_cache import Int8PagedKVCache
-
-        if isinstance(cache, Int8PagedKVCache):
-            raise GraphUnsupported(
-                "the INT8 cache finalises blocks on a host-side condition and its "
-                "residual writes are not idempotent; capture the fp16 paged cache"
-            )
-    except ImportError:
-        pass
-    if not isinstance(cache, PagedKVCache):
+    except ImportError:  # pragma: no cover
+        Int8PagedKVCache = ()
+    # Phase 14c: the INT8 cache is capturable in deferred mode, where a
+    # decode write is two fixed-address GPU writes and block quantization
+    # happens in advance(), outside the graph.
+    if not isinstance(cache, (PagedKVCache, Int8PagedKVCache)):
         raise GraphUnsupported(
             "the contiguous cache reads a slice whose length changes every step"
         )
@@ -259,6 +256,8 @@ class GraphedDecoder:
         self.last_host_ms = 0.0
         if self.enabled:
             check_capturable(model)
+            if hasattr(model.cache, "enable_deferred_finalize"):
+                model.cache.enable_deferred_finalize()
 
         capacity = model.cache.spec.max_seq_len
         # Buckets past the cache's capacity are unreachable; the capacity

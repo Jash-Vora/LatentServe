@@ -42,13 +42,17 @@ from benchmarks.schema import BenchmarkResult, ResultWriter
 from config import load_config
 
 
+MODE = {"kv_dtype": "fp16"}
+
+
 def kernels_per_step(model, batch: int, ctx: int, block_size: int) -> int:
     """CUDA kernels in one eager decode step.
 
     Counted eagerly because that is where each launch is a separate
     event; under a graph they are the same kernels, replayed as one call.
     """
-    model.allocate_cache(batch, ctx + 64, paged=True, block_size=block_size)
+    model.allocate_cache(batch, ctx + 64, paged=True, block_size=block_size,
+                         kv_dtype=MODE["kv_dtype"])
     model.cache.reset()
     model.cache.advance(ctx, batch_size=batch)
     slots = list(range(batch))
@@ -70,7 +74,8 @@ def kernels_per_step(model, batch: int, ctx: int, block_size: int) -> int:
 def time_graphed(model, batch: int, ctx: int, block_size: int, steps: int, warmup: int) -> float:
     from runtime.cuda_graph import GraphedDecoder
 
-    model.allocate_cache(batch, ctx + steps + warmup + 64, paged=True, block_size=block_size)
+    model.allocate_cache(batch, ctx + steps + warmup + 64, paged=True, block_size=block_size,
+                         kv_dtype=MODE["kv_dtype"])
     model.cache.reset()
     model.cache.advance(ctx, batch_size=batch)
     slots = list(range(batch))
@@ -99,6 +104,10 @@ def main() -> int:
     p.add_argument("--context-lengths", type=int, nargs="+", default=[2048, 8192])
     p.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4, 16])
     p.add_argument("--block-size", type=int, default=16)
+    p.add_argument("--toggle", choices=["projections", "elementwise", "int8"],
+                   default="projections",
+                   help="which fusion to A/B. 'elementwise' keeps projections fused on both "
+                   "sides, so it measures elementwise fusion alone, on top of 14a.")
     p.add_argument("--rounds", type=int, default=4,
                    help="alternating unfused/fused rounds per configuration")
     p.add_argument("--steps", type=int, default=48)
@@ -119,14 +128,26 @@ def main() -> int:
     longest = max(args.context_lengths) + args.steps + args.warmup + 64
     model = LatentServeQwen.from_reference(ref, max_seq_len_hint=longest,
                                            attn_impl="triton_paged", fuse_projections=True)
+    # One switch per experiment, so each fusion is measured against its
+    # own baseline: projections against unfused, elementwise against
+    # projections-fused.
+    def set_int8(on: bool) -> None:
+        MODE["kv_dtype"] = "int8" if on else "fp16"
+
+    if args.toggle == "int8":
+        # INT8 is measured on the best model there is: projections and
+        # elementwise both fused, on both sides.
+        model.set_elementwise(True)
+    switch = {"projections": model.set_fused, "elementwise": model.set_elementwise,
+              "int8": set_int8}[args.toggle]
     writer = ResultWriter(results_dir=args.results_dir)
 
     # The mechanism, before the timing: if the kernel count does not fall
     # by ~84, nothing downstream is measuring fusion.
     ctx0 = args.context_lengths[0]
-    model.set_fused(False)
+    switch(False)
     k_unfused = kernels_per_step(model, 1, ctx0, args.block_size)
-    model.set_fused(True)
+    switch(True)
     k_fused = kernels_per_step(model, 1, ctx0, args.block_size)
     print(f"CUDA kernels per decode step (batch 1, ctx {ctx0}): "
           f"unfused {k_unfused}, fused {k_fused}  ({k_unfused - k_fused} fewer)\n")
@@ -138,7 +159,7 @@ def main() -> int:
             unfused, fused = [], []
             for _ in range(args.rounds):
                 for on, bucket in ((False, unfused), (True, fused)):
-                    model.set_fused(on)
+                    switch(on)
                     bucket.append(time_graphed(model, batch, ctx, args.block_size,
                                                args.steps, args.warmup))
             deltas = [u - f for u, f in zip(unfused, fused)]
@@ -149,7 +170,8 @@ def main() -> int:
                   f"{saved / u_med:>8.1%}{spread:>17.2f}")
             for label, value in (("unfused", u_med), ("fused", f_med)):
                 writer.write(BenchmarkResult(
-                    system=f"latentserve_kernel_graphed_{label}", tag="phase14_fusion",
+                    system=f"latentserve_kernel_graphed_{args.toggle}_{label}",
+                    tag="phase14_fusion",
                     attention="gqa", model=cfg.model.name, batch_size=batch,
                     context_length=ctx, output_length=args.steps, num_gpus=1,
                     tpot_ms=value, seed=0,
@@ -157,7 +179,7 @@ def main() -> int:
                            "saved_ms_median": saved, "saved_ms_spread": spread,
                            "kernels_unfused": k_unfused, "kernels_fused": k_fused},
                 ))
-    model.set_fused(True)
+    switch(True)
     print("\nA saving smaller than its round spread is not a saving. The prediction was\n"
           "most of a ~1.5 ms gap at batch 1, roughly constant in ms across contexts.")
     return 0

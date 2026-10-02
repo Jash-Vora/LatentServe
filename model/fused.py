@@ -92,9 +92,17 @@ class FusedMLP(nn.Module):
         self.weight = concat_into_views([mlp.gate_proj, mlp.up_proj], "weight")
         self.bias = concat_into_views([mlp.gate_proj, mlp.up_proj], "bias")
         self.use_fused = True
+        # Phase 14a step 2: SiLU and the multiply by `up` in one kernel,
+        # reading the fused gate/up output directly.
+        self.fused_act = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.use_fused:
             return self.inner(x)
-        gate, up = F.linear(x, self.weight, self.bias).split(self.intermediate, dim=-1)
+        gate_up = F.linear(x, self.weight, self.bias)
+        if self.fused_act:
+            from kernels.fused_elementwise import silu_and_mul
+
+            return self.inner.down_proj(silu_and_mul(gate_up))
+        gate, up = gate_up.split(self.intermediate, dim=-1)
         return self.inner.down_proj(F.silu(gate) * up)

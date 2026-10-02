@@ -162,6 +162,8 @@ def paged_decode_reference(
     num_splits: int = 1,
     softmax_scale: Optional[float] = None,
     compute_dtype: torch.dtype = torch.float32,
+    k_residual: Optional[torch.Tensor] = None,
+    res_rows: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Paged decode attention, one query position per sequence.
 
@@ -174,6 +176,11 @@ def paged_decode_reference(
     seq_lens     [B]
     k_scale      [num_blocks, H_kv, D]        (INT8 only; per block/head/channel)
     v_scale      [num_blocks, PAGE, H_kv]     (INT8 only; per block/token/head)
+    k_residual   [max_batch, PAGE, H_kv, D]   (INT8 only; Phase 14c) each sequence's
+                                              *last* page of K, exact, at row
+                                              `res_rows[b]`. Every other page's K
+                                              comes from the pool. V is always
+                                              in the pool.
 
     Returns [B, H_kv, N_REP, D].
     """
@@ -203,12 +210,17 @@ def paged_decode_reference(
 
                 for p in range(lo, hi):
                     blk = int(block_tables[i, p].item())
-                    k = _dequant_k(
-                        k_pool[blk, :, head], 
-                        None if k_scale is None else k_scale[blk, head],
-                        None if k_zero is None else k_zero[blk, head],
-                        compute_dtype,
-                    )                                   # [PAGE, D]
+                    if k_residual is not None and p == num_pages - 1:
+                        # The last page is still in the residual — finished
+                        # or not, it has not been quantized yet.
+                        k = k_residual[int(res_rows[i].item()), :, head].to(compute_dtype)
+                    else:
+                        k = _dequant_k(
+                            k_pool[blk, :, head],
+                            None if k_scale is None else k_scale[blk, head],
+                            None if k_zero is None else k_zero[blk, head],
+                            compute_dtype,
+                        )                               # [PAGE, D]
                     v = _dequant_v(
                         v_pool[blk, :, head],
                         None if v_scale is None else v_scale[blk, :, head],
@@ -268,6 +280,7 @@ if HAS_TRITON:  # pragma: no cover - requires a GPU
     def _paged_decode_kernel(
         Q, K_pool, V_pool, K_scale, V_scale, K_zero, V_zero,
         BlockTables, SeqLens, PartialOut, PartialM, PartialL,
+        KRes, ResRows,
         stride_qb, stride_qh, stride_qm, stride_qd,
         stride_kb, stride_kp, stride_kh, stride_kd,
         stride_ksb, stride_ksh, stride_ksd,
@@ -275,6 +288,7 @@ if HAS_TRITON:  # pragma: no cover - requires a GPU
         stride_btb, stride_btp,
         stride_ob, stride_oh, stride_os, stride_om, stride_od,
         stride_mb, stride_mh, stride_ms, stride_mm,
+        stride_rb, stride_rp, stride_rh, stride_rd,
         softmax_scale,
         num_splits,
         N_REP: tl.constexpr,
@@ -283,6 +297,7 @@ if HAS_TRITON:  # pragma: no cover - requires a GPU
         PAGE: tl.constexpr,
         IS_INT8: tl.constexpr,
         ASYM: tl.constexpr,
+        HAS_RES: tl.constexpr,
     ):
         """One program per (sequence, kv_head, split).
 
@@ -347,6 +362,15 @@ if HAS_TRITON:  # pragma: no cover - requires a GPU
                     v = v + vz[:, None]
                 k = k.to(q.dtype)
                 v = v.to(q.dtype)
+
+            if HAS_RES:
+                if p == num_pages - 1:
+                    # The last page's K is still in the residual, exact.
+                    res_row = tl.load(ResRows + b)
+                    k = tl.load(
+                        KRes + res_row * stride_rb + offs_p[:, None] * stride_rp
+                        + h * stride_rh + offs_d[None, :] * stride_rd
+                    ).to(q.dtype)
 
             tokens = p * PAGE + offs_p
             valid = tokens < seq_len
@@ -461,6 +485,7 @@ if HAS_TRITON:  # pragma: no cover - requires a GPU
     def _paged_decode_tiled(
         Q, K_pool, V_pool, K_scale, V_scale, K_zero, V_zero,
         BlockTables, SeqLens, PartialOut, PartialM, PartialL,
+        KRes, ResRows,
         stride_qb, stride_qh, stride_qm, stride_qd,
         stride_kb, stride_kp, stride_kh, stride_kd,
         stride_ksb, stride_ksh, stride_ksd,
@@ -468,10 +493,11 @@ if HAS_TRITON:  # pragma: no cover - requires a GPU
         stride_btb, stride_btp,
         stride_ob, stride_oh, stride_os, stride_om, stride_od,
         stride_mb, stride_mh, stride_ms, stride_mm,
+        stride_rb, stride_rp, stride_rh, stride_rd,
         softmax_scale, num_splits,
         N_REP: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr,
         PAGE: tl.constexpr, PPI: tl.constexpr,
-        IS_INT8: tl.constexpr, ASYM: tl.constexpr,
+        IS_INT8: tl.constexpr, ASYM: tl.constexpr, HAS_RES: tl.constexpr,
     ):
         """Same algorithm, PPI pages per iteration.
 
@@ -538,6 +564,23 @@ if HAS_TRITON:  # pragma: no cover - requires a GPU
                                  + offs_p[None, :] * stride_vsp + h * stride_vsh)
                     k = k + kz[:, None, :]
                     v = v + vz[:, :, None]
+
+            if HAS_RES:
+                # Within the tile, only the sequence's last page comes from the
+                # residual. The pointer is broadcast over the tile and masked to
+                # that page; the pool value is kept everywhere else. Both
+                # sources are always finite (pool scales are clamped, the
+                # residual is zero-initialised), so the unselected side of the
+                # where() cannot leak a NaN.
+                is_last = pages == (num_pages - 1)
+                res_row = tl.load(ResRows + b)
+                k_res = tl.load(
+                    KRes + res_row * stride_rb + offs_i[:, None, None] * 0
+                    + offs_p[None, :, None] * stride_rp + h * stride_rh
+                    + offs_d[None, None, :] * stride_rd,
+                    mask=is_last[:, None, None], other=0.0,
+                ).to(tl.float32)
+                k = tl.where(is_last[:, None, None], k_res, k.to(tl.float32))
 
             k = tl.reshape(k, (PPI * PAGE, BLOCK_D)).to(q.dtype)
             v = tl.reshape(v, (PPI * PAGE, BLOCK_D)).to(q.dtype)
@@ -621,6 +664,8 @@ def paged_decode_attention(
     softmax_scale: Optional[float] = None,
     max_seq_len: Optional[int] = None,
     force_reference: bool = False,
+    k_residual: Optional[torch.Tensor] = None,
+    res_rows: Optional[torch.Tensor] = None,
     pages_per_iter: Optional[int] = None,
     num_warps: Optional[int] = None,
     num_stages: Optional[int] = None,
@@ -636,6 +681,7 @@ def paged_decode_attention(
         return paged_decode_reference(
             q, k_pool, v_pool, block_tables, seq_lens, k_scale, v_scale,
             k_zero, v_zero, num_splits or 1, softmax_scale,
+            k_residual=k_residual, res_rows=res_rows,
         )
 
     page = k_pool.shape[1]
@@ -686,13 +732,16 @@ def paged_decode_attention(
         k_zero if k_zero is not None else dummy,
         v_zero if v_zero is not None else dummy,
         block_tables, seq_lens, partial_acc, partial_m, partial_l,
+        k_residual if k_residual is not None else dummy,
+        res_rows if res_rows is not None else dummy,
         *q.stride(), *k_pool.stride(),
         *(k_scale.stride() if k_scale is not None else (0, 0, 0)),
         *(v_scale.stride() if v_scale is not None else (0, 0, 0)),
         *block_tables.stride(), *partial_acc.stride(), *partial_m.stride(),
+        *(k_residual.stride() if k_residual is not None else (0, 0, 0, 0)),
         scale, num_splits,
         N_REP=n_rep, BLOCK_M=16, BLOCK_D=d, PAGE=page,
-        IS_INT8=is_int8, ASYM=asym, **extra,
+        IS_INT8=is_int8, ASYM=asym, HAS_RES=k_residual is not None, **extra,
         num_warps=warps, num_stages=stages,
     )
     if num_splits == 1:

@@ -73,6 +73,7 @@ class ServingEngine:
         use_cuda_graphs: bool = False,
         sample_in_graph: bool = True,
         profile_loop: bool = False,
+        kv_dtype: str = "fp16",
     ):
         self.model = model
         self.max_running = max_running
@@ -90,8 +91,13 @@ class ServingEngine:
             paged=True,
             block_size=block_size,
             num_blocks=num_blocks,
+            kv_dtype=kv_dtype,
         )
-        assert isinstance(cache, PagedKVCache)
+        # The INT8 cache mirrors PagedKVCache's interface (allocation, block
+        # tables, admission) without inheriting from it.
+        from cache.int8_paged_cache import Int8PagedKVCache
+
+        assert isinstance(cache, (PagedKVCache, Int8PagedKVCache))
         self.cache: PagedKVCache = cache
 
         # Phase 13: decode through captured CUDA graphs. Prefill stays

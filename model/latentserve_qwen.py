@@ -96,6 +96,7 @@ class LatentServeQwen:
         rope_source: str = "latentserve",
         max_seq_len_hint: int = 4096,
         fuse_projections: bool = False,
+        fuse_elementwise: bool = False,
     ):
         self.hf_model = hf_model
         self.tokenizer = tokenizer
@@ -157,8 +158,11 @@ class LatentServeQwen:
 
         self.cache: Optional[ContiguousKVCache] = None
         self.fused = False
+        self.elementwise = False
         if fuse_projections:
             self.fuse_projections()
+        if fuse_elementwise:
+            self.set_elementwise(True)
 
     # ------------------------------------------------------------------
     # Construction
@@ -346,6 +350,24 @@ class LatentServeQwen:
             if isinstance(layer.mlp, FusedMLP):
                 layer.mlp.use_fused = on
 
+    def set_elementwise(self, on: bool) -> None:
+        """Phase 14a step 2: fused norms, RoPE and SiLU-and-multiply.
+
+        The fused MLP activation reads the merged gate/up output, so this
+        fuses the projections first if they are not already. Like
+        `set_fused`, it shares every weight with the unfused path, so the
+        switch is exact and free, and graphs must be captured after it.
+        """
+        from model.fused import FusedMLP
+
+        if on and not self.fused:
+            self.fuse_projections()
+        self.elementwise = on
+        for layer in self.layers:
+            layer.attn.fused_rope = on
+            if isinstance(layer.mlp, FusedMLP):
+                layer.mlp.fused_act = on
+
     def _run_layers(
         self, input_ids: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, start_pos: int
     ) -> torch.Tensor:
@@ -359,6 +381,8 @@ class LatentServeQwen:
         """
         cache = self._require_cache()
         h = self.embed_tokens(input_ids)
+        if self.elementwise:
+            return self._run_layers_fused(h, cos, sin, cache, start_pos)
         for layer in self.layers:
             residual = h
             h = layer.input_layernorm(h)
@@ -372,7 +396,40 @@ class LatentServeQwen:
 
         return h
 
+    def _run_layers_fused(self, h, cos, sin, cache, start_pos):
+        """The layer loop with each residual add folded into the next norm.
+
+        Unfused, every sub-layer ends `h = residual + h` and the next one
+        begins with a norm of it — an add kernel then eight norm kernels.
+        Here the residual is carried into the next norm, which adds and
+        normalises in one kernel. The first layer has nothing to add yet,
+        and the last layer's add is the one returned; so the loop computes
+        exactly what the unfused one does, with the add moved, not removed.
+        """
+        from kernels.fused_elementwise import fused_add_rms_norm, rms_norm
+
+        residual = None
+        for layer in self.layers:
+            norm_in = layer.input_layernorm
+            if residual is None:
+                residual = h
+                h = rms_norm(h, norm_in.weight, norm_in.variance_epsilon)
+            else:
+                h, residual = fused_add_rms_norm(h, residual, norm_in.weight,
+                                                 norm_in.variance_epsilon)
+            h = layer.attn(h, cos, sin, cache, start_pos)
+            norm_post = layer.post_attention_layernorm
+            h, residual = fused_add_rms_norm(h, residual, norm_post.weight,
+                                             norm_post.variance_epsilon)
+            h = layer.mlp(h)
+        return residual + h
+
     def _to_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        if self.elementwise:
+            from kernels.fused_elementwise import rms_norm
+
+            norm = self.final_norm
+            return self.lm_head(rms_norm(hidden, norm.weight, norm.variance_epsilon))
         return self.lm_head(self.final_norm(hidden))
 
     # ------------------------------------------------------------------

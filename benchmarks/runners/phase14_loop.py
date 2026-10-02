@@ -170,9 +170,17 @@ def main() -> int:
                            "host_fed_steps": runs[mode][-1]["host_fed_steps"]},
                 ))
             saved = totals[False] - totals[True]
-            gap = totals[False] - floor
-            print(f"in-graph saves {saved:.2f} ms per token "
-                  f"({saved / gap:.0%} of the loop's cost over the floor)" if gap > 0 else "")
+            # Per-round differences, so a saving can be judged against how
+            # much the measurement itself wobbles. The first version of this
+            # runner printed only the medians, and a -0.28 ms "regression" at
+            # batch 16 could not be told apart from noise.
+            per_round = [sum(h[p] for p in PHASES) - sum(g[p] for p in PHASES)
+                         for h, g in zip(runs[False], runs[True])]
+            spread = max(per_round) - min(per_round)
+            verdict = "within noise" if abs(saved) <= spread else (
+                "a real saving" if saved > 0 else "a real cost")
+            print(f"in-graph saves {saved:+.2f} ms per token, round spread {spread:.2f} ms "
+                  f"-> {verdict}")
 
     print("\nWhat is left over the floor, and which phase holds it, decides whether\n"
           "overlapping host work with the next step is worth building.")

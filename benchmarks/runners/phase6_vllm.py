@@ -97,7 +97,8 @@ def _row(cfg, system: str, batch_size: int, ctx: int, out_len: int, summary: dic
 def run_latentserve(cfg, ref, requests, batch_size: int, block_size: int,
                     max_seq_len: int, attn_impl: str = "sdpa",
                     cuda_graphs: bool = False, warmup_graphs: bool = True,
-                    fuse_projections: bool = False, profile_loop: bool = False) -> dict:
+                    fuse_projections: bool = False, profile_loop: bool = False,
+                    fuse_elementwise: bool = False, kv_dtype: str = "fp16") -> dict:
     """Run one configuration on an *already loaded* reference.
 
     The weights are loaded once, by the caller, and shared. Loading per
@@ -117,7 +118,8 @@ def run_latentserve(cfg, ref, requests, batch_size: int, block_size: int,
     # Phase 3's runtime, not against the Phase 11 kernel. Now explicit.
     model = LatentServeQwen.from_reference(ref, max_seq_len_hint=max_seq_len,
                                            attn_impl=attn_impl,
-                                           fuse_projections=fuse_projections)
+                                           fuse_projections=fuse_projections,
+                                           fuse_elementwise=fuse_elementwise)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -125,7 +127,7 @@ def run_latentserve(cfg, ref, requests, batch_size: int, block_size: int,
     engine = ServingEngine(
         model, max_running=batch_size, max_seq_len=max_seq_len,
         block_size=block_size, scheduler="fifo", use_cuda_graphs=cuda_graphs,
-        profile_loop=profile_loop,
+        profile_loop=profile_loop, kv_dtype=kv_dtype,
     )
     warmup_captures = 0
     if cuda_graphs and warmup_graphs and engine.decoder is not None:
@@ -169,6 +171,8 @@ def run_latentserve(cfg, ref, requests, batch_size: int, block_size: int,
         "attn_impl": attn_impl,
         "cuda_graphs": cuda_graphs,
         "fuse_projections": fuse_projections,
+        "fuse_elementwise": fuse_elementwise,
+        "kv_dtype": kv_dtype,
         "warmup_captures": warmup_captures,
         "requests": len(finished),
         "output_tokens": total_out,
@@ -295,6 +299,10 @@ def main() -> int:
                    "measured at boost clock (0 to skip)")
     p.add_argument("--profile-loop", action="store_true",
                    help="per-phase breakdown of every LatentServe decode step")
+    p.add_argument("--fuse-elementwise", action="store_true",
+                   help="Phase 14a step 2: fused norms, RoPE and SiLU-and-multiply")
+    p.add_argument("--kv-dtype", default="fp16", choices=["fp16", "int8"],
+                   help="Phase 14c: INT8 KV cache (graph-capturable in deferred mode)")
     p.add_argument("--fuse-projections", action="store_true",
                    help="Phase 14a: q/k/v and gate/up as one projection each")
     p.add_argument("--no-warmup-graphs", action="store_true",
@@ -319,7 +327,9 @@ def main() -> int:
         ("sdpa", False): "",
         ("triton_paged", False): "_kernel",
         ("triton_paged", True): "_kernel_graphed",
-    }[(args.attn_impl, args.cuda_graphs)] + ("_fused" if args.fuse_projections else "")
+    }[(args.attn_impl, args.cuda_graphs)] + ("_fused" if args.fuse_projections else "") + (
+        "_elementwise" if args.fuse_elementwise else "") + (
+        "_int8" if args.kv_dtype == "int8" else "")
 
     import torch
 
@@ -423,7 +433,9 @@ def main() -> int:
                                     cuda_graphs=args.cuda_graphs,
                                     warmup_graphs=not args.no_warmup_graphs,
                                     fuse_projections=args.fuse_projections,
-                                    profile_loop=args.profile_loop)
+                                    profile_loop=args.profile_loop,
+                                    fuse_elementwise=args.fuse_elementwise,
+                                    kv_dtype=args.kv_dtype)
                     if system.startswith("latentserve")
                     else run_vllm(cfg, fresh, batch_size, max_seq_len)
                 )

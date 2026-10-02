@@ -57,9 +57,12 @@ def test_contiguous_cache_is_refused():
         check_capturable(build(paged=False, impl="sdpa"))
 
 
-def test_int8_cache_is_refused():
-    with pytest.raises(GraphUnsupported, match="INT8"):
+def test_int8_cache_is_no_longer_refused_for_being_int8():
+    """Phase 14c made the INT8 cache capturable. On this CPU model the only
+    refusal left is the device one — not the cache type."""
+    with pytest.raises(GraphUnsupported) as e:
         check_capturable(build(kv_dtype="int8"))
+    assert "INT8" not in str(e.value) and "cpu" in str(e.value).lower()
 
 
 def test_gather_path_is_refused():
