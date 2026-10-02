@@ -97,7 +97,7 @@ def _row(cfg, system: str, batch_size: int, ctx: int, out_len: int, summary: dic
 def run_latentserve(cfg, ref, requests, batch_size: int, block_size: int,
                     max_seq_len: int, attn_impl: str = "sdpa",
                     cuda_graphs: bool = False, warmup_graphs: bool = True,
-                    fuse_projections: bool = False) -> dict:
+                    fuse_projections: bool = False, profile_loop: bool = False) -> dict:
     """Run one configuration on an *already loaded* reference.
 
     The weights are loaded once, by the caller, and shared. Loading per
@@ -125,6 +125,7 @@ def run_latentserve(cfg, ref, requests, batch_size: int, block_size: int,
     engine = ServingEngine(
         model, max_running=batch_size, max_seq_len=max_seq_len,
         block_size=block_size, scheduler="fifo", use_cuda_graphs=cuda_graphs,
+        profile_loop=profile_loop,
     )
     warmup_captures = 0
     if cuda_graphs and warmup_graphs and engine.decoder is not None:
@@ -153,7 +154,15 @@ def run_latentserve(cfg, ref, requests, batch_size: int, block_size: int,
         torch.cuda.empty_cache()
 
     ttft = summarise_latency([r.ttft_ms for r in finished])
-    itl = summarise_latency([ms for r in finished for ms in r.decode_step_ms])
+    gaps = [ms for r in finished for ms in r.decode_step_ms]
+    itl = summarise_latency(gaps)
+    # How much of the mean is a slow tail. The median gap and the
+    # differenced mean disagreed by ~1.5 ms at batch 1, which is a tail of
+    # occasional slow steps rather than every step being a bit slower.
+    import statistics as _st
+
+    median_gap = _st.median(gaps) if gaps else 0.0
+    slow = [g for g in gaps if g > 1.5 * median_gap] if gaps else []
     total_out = sum(r.generated for r in finished)
     return {
         "wall_s": wall,
@@ -172,6 +181,9 @@ def run_latentserve(cfg, ref, requests, batch_size: int, block_size: int,
         else None,
         **{f"ttft_{k}": v for k, v in ttft.__dict__.items()},
         **{f"itl_{k}": v for k, v in itl.__dict__.items()},
+        "itl_mean": _st.fmean(gaps) if gaps else None,
+        "itl_slow_frac": len(slow) / len(gaps) if gaps else None,
+        "itl_slow_ms_total": sum(slow),
         **stats,
     }
 
@@ -244,6 +256,8 @@ def main() -> int:
                    help="LatentServe decode path: the Phase 3 gather or the Phase 11 kernel")
     p.add_argument("--cuda-graphs", action="store_true",
                    help="Phase 13: decode through captured CUDA graphs (implies the kernel)")
+    p.add_argument("--profile-loop", action="store_true",
+                   help="per-phase breakdown of every LatentServe decode step")
     p.add_argument("--fuse-projections", action="store_true",
                    help="Phase 14a: q/k/v and gate/up as one projection each")
     p.add_argument("--no-warmup-graphs", action="store_true",
@@ -342,14 +356,22 @@ def main() -> int:
                 tok_ref.model = tok_ref.model.to("cpu")
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
                 torch.cuda.reset_peak_memory_stats() if torch.cuda.is_available() else None
-            summary = (
-                run_latentserve(cfg, tok_ref, fresh, batch_size, args.block_size, max_seq_len,
-                                attn_impl=args.attn_impl, cuda_graphs=args.cuda_graphs,
-                                warmup_graphs=not args.no_warmup_graphs,
-                                fuse_projections=args.fuse_projections)
-                if system.startswith("latentserve")
-                else run_vllm(cfg, fresh, batch_size, max_seq_len)
-            )
+            from benchmarks.gpu_sampler import GpuSampler
+
+            # Both systems, same sampler: if one is measured on a hotter,
+            # slower GPU than the other, the rows say so.
+            with GpuSampler() as gpu:
+                summary = (
+                    run_latentserve(cfg, tok_ref, fresh, batch_size, args.block_size,
+                                    max_seq_len, attn_impl=args.attn_impl,
+                                    cuda_graphs=args.cuda_graphs,
+                                    warmup_graphs=not args.no_warmup_graphs,
+                                    fuse_projections=args.fuse_projections,
+                                    profile_loop=args.profile_loop)
+                    if system.startswith("latentserve")
+                    else run_vllm(cfg, fresh, batch_size, max_seq_len)
+                )
+            summary.update(gpu.summary())
             row = _row(cfg, system, batch_size, ctx, out_len, summary, controls)
             writer.write(row)
             walls.setdefault((system, batch_size, context_length), {})[args.max_output] = (
@@ -373,6 +395,22 @@ def main() -> int:
                 + f"itl p50 {summary.get('itl_p50') or float('nan'):6.1f} ms  "
                 + f"kv {(summary.get('kv_allocated_mb') or float('nan')):7.0f} MB"
             )
+            if summary.get("gpu_samples"):
+                print(f"      gpu: sm clock mean {summary['gpu_sm_clock_mean_mhz']:5.0f} MHz "
+                      f"(min {summary['gpu_sm_clock_min_mhz']:4.0f})  "
+                      f"temp max {summary['gpu_temp_max_c']:3.0f} C  "
+                      f"power {summary['gpu_power_mean_w']:4.1f} W  "
+                      f"throttled {summary['gpu_throttled_frac']:4.0%} "
+                      f"{summary['gpu_throttle_reasons'] or ''}")
+            if summary.get("itl_mean") is not None:
+                print(f"      itl: median {summary.get('itl_p50') or 0:5.1f}  "
+                      f"mean {summary['itl_mean']:5.1f}  "
+                      f"slow steps {summary['itl_slow_frac']:5.1%} "
+                      f"({summary['itl_slow_ms_total'] / 1000:5.1f} s total)")
+            loop = {k[5:-12]: v for k, v in summary.items()
+                    if k.startswith("loop_") and k.endswith("_ms_per_step")}
+            if loop:
+                print("      loop ms/step: " + "  ".join(f"{k} {v:.3f}" for k, v in loop.items()))
     if args.output_lengths:
         short, long = args.output_lengths
         print(f"\nDecode isolated by differencing {short} vs {long} output tokens:")
@@ -442,13 +480,27 @@ def compare(cfg, results_dir: str, host: str | None = None) -> int:
     rows = [json.loads(line) for line in path.open()]
     rows = [r for r in rows if (r.get("extra") or {}).get("status", "ok") == "ok"]
 
+    def stack(r):
+        libs = r.get("lib_versions") or {}
+        return (r.get("cuda_version") or "?",) + tuple(
+            f"{k}={libs.get(k)}" for k in ("torch", "triton", "vllm") if libs.get(k)
+        )
+
+    # Keyed by host *and* software stack. Installing vLLM replaces torch
+    # in place, so one Kaggle session — one hostname — can hold LatentServe
+    # rows written before the install and vLLM rows written after it. The
+    # per-host split alone paired them. A table now only ever holds rows
+    # from one machine on one stack; the vLLM column of the LatentServe-only
+    # stack is simply empty, and that combination is listed as not compared.
     by_host = defaultdict(list)
     for r in rows:
-        by_host[r.get("hostname", "?")].append(r)
+        libs = r.get("lib_versions") or {}
+        torch_v = libs.get("torch", "?")
+        by_host[f"{r.get('hostname', '?')} [torch {torch_v}, cuda {r.get('cuda_version')}]"].append(r)
 
     usable = {
         h: rs for h, rs in by_host.items()
-        if (host is None or h == host)
+        if (host is None or h.split(" [")[0] == host)
         and any(r["system"] == "vllm" for r in rs)
         and any(r["system"].startswith("latentserve") for r in rs)
     }
