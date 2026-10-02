@@ -436,45 +436,48 @@ def test_tunables_are_per_call_not_module_level():
 
 @requires_gpu
 def test_kernel_path_does_not_gather():
-    """The whole point of Phase 11 is to stop staging the cache into an
-    fp16 buffer. Placed after `cache.read()`, the kernel branch paid the
-    gather *and* the kernel — torch.profiler showed 56 `aten::index`
-    calls per decode step, two per layer, on a path that should have
-    none. Counting the calls is the only way this stays fixed.
+    """The kernel path must not stage the cache through a per-layer gather.
+
+    The property is *per layer*. A count of zero index ops was the wrong
+    test: with CPU events recorded, the kernel path shows exactly one per
+    step — the token-embedding lookup, which is an index op too. So the
+    test compares 2- and 4-layer models: the gather path's count must grow
+    with depth, the kernel path's must not.
     """
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
     from model.latentserve_qwen import LatentServeQwen
     from model.qwen import ModelShape
 
-    model, cfg = _tiny_model()
-    model = model.half().cuda()
-    shape = ModelShape(2, 8, 2, 16, 128, 128, 1024, "torch.float16")
-    prompt = torch.randint(0, 128, (1, 64)).cuda()
-
-    def gather_calls(impl: str) -> int:
-        ls = LatentServeQwen(hf_model=model, tokenizer=None, shape=shape, device="cuda",
+    def gather_calls(impl: str, layers: int) -> int:
+        torch.manual_seed(0)
+        cfg = Qwen2Config(vocab_size=128, hidden_size=128, intermediate_size=256,
+                          num_hidden_layers=layers, num_attention_heads=8,
+                          num_key_value_heads=2, max_position_embeddings=1024)
+        hf = Qwen2ForCausalLM(cfg).half().cuda().eval()
+        shape = ModelShape(layers, 8, 2, 16, 128, 128, 1024, "torch.float16")
+        ls = LatentServeQwen(hf_model=hf, tokenizer=None, shape=shape, device="cuda",
                              attn_impl=impl, max_seq_len_hint=256)
         ls.allocate_cache(1, 256, paged=True, block_size=16)
         ls.cache.reset()
-        ls.prefill(prompt)
+        ls.prefill(torch.randint(0, 128, (1, 64)).cuda())
         token = torch.zeros(1, 1, dtype=torch.long, device="cuda")
-        ls.decode_step(token)                       # warm up
-        # CPU *and* CUDA activity. `aten::index` is a CPU-side op event, and
-        # with CUDA activity alone torch 2.13 records none — so this counted
-        # zero on both paths, and the control assertion below is what caught
-        # it. The gather's GPU kernel is counted too, so the test does not
-        # depend on either kind of event being reported.
+        ls.decode_step(token)                           # warm up
+        # CPU and CUDA activity: aten:: ops are CPU-side events, and torch
+        # 2.13 records none of them with CUDA activity alone.
         with torch.profiler.profile(activities=[
             torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA,
         ]) as prof:
             ls.decode_step(token)
             torch.cuda.synchronize()
-        return sum(
-            e.count for e in prof.key_averages()
-            if e.key in ("aten::index", "aten::index_select") or "gather_kernel" in e.key
-        )
+        return sum(e.count for e in prof.key_averages()
+                   if e.key in ("aten::index", "aten::index_select") or "gather_kernel" in e.key)
 
-    assert gather_calls("sdpa") > 0, "the SDPA path gathers, by construction"
-    assert gather_calls("triton_paged") == 0, "the kernel path must not gather"
+    sdpa2, sdpa4 = gather_calls("sdpa", 2), gather_calls("sdpa", 4)
+    kern2, kern4 = gather_calls("triton_paged", 2), gather_calls("triton_paged", 4)
+    assert sdpa4 > sdpa2, "control: the gather path gathers per layer"
+    assert kern4 == kern2, f"the kernel path gathers per layer ({kern2} -> {kern4})"
+
 
 
 @pytest.mark.parametrize("impl", ["sdpa", "triton_paged"])

@@ -244,14 +244,25 @@ def parse_sass(text: str) -> dict:
     return counts
 
 
+CENSUS = ("LDL", "STL", "LDG 128", "LDS", "STS", "HMMA", "FFMA", "HFMA2", "FMUL", "IMAD",
+          "SHFL", "BAR", "total")
+
+
 def print_census(label, compiled):
+    """Static counts, plus whether Triton's PTX asked for tensor cores at all.
+
+    HMMA is the tensor-core instruction; FFMA and HFMA2 are scalar fp32 and
+    paired-fp16 multiply-adds on the CUDA cores. If the matrix multiplies
+    became FFMA/HFMA2 and the PTX has no `mma`, Triton never tried.
+    """
     c = sass_census(compiled)
     if c is None:
         print(f"  {label:<26} (no cubin or nvdisasm)")
         return
-    keys = ("LDL", "STL", "LDG 128", "LDG 64", "LDG 32 or less", "LDS", "STS", "HMMA",
-            "BAR", "SHFL", "MUFU", "total")
-    print(f"  {label:<26}" + "".join(f"{c.get(k, 0):>9}" for k in keys))
+    ptx = (getattr(compiled, "asm", None) or {}).get("ptx", "") or ""
+    mma = ptx.count("mma.sync") + ptx.count("wgmma") + ptx.count("mma.")
+    print(f"  {label:<26}" + "".join(f"{c.get(k, 0):>8}" for k in CENSUS)
+          + f"{mma:>9}")
 
 
 def child(variant: str) -> int:
@@ -297,6 +308,8 @@ def main() -> int:
     p.add_argument("--child", default=None, help=argparse.SUPPRESS)
     p.add_argument("--skip-ncu", action="store_true")
     p.add_argument("--ctx", type=int, default=8192)
+    p.add_argument("--census-only", action="store_true",
+                   help="just the machine-code census: seconds, not minutes")
     args = p.parse_args()
     if args.child:
         return child(args.child)
@@ -309,8 +322,17 @@ def main() -> int:
     print(f"device: {torch.cuda.get_device_name(0)}  torch {torch.__version__}", flush=True)
     ctx = args.ctx
 
+    if args.census_only:
+        args.skip_ncu = True
     status, ncu = ("skipped", None) if args.skip_ncu else ncu_status()
     print(f"\n[0/4] Nsight Compute: {status}" + (f" ({ncu})" if ncu else ""), flush=True)
+
+    from kernels.gqa import paged_decode as pd
+    from kernels.gqa import paged_decode_ablations as ab
+
+    if args.census_only:
+        _census_section(torch, pd, ab)
+        return 0
 
     print("\n[1/4] correctness of every variant against the reference (ragged batch)", flush=True)
     ok = check_correctness(torch)
@@ -348,10 +370,17 @@ def main() -> int:
                     print(f"{variant} stages{stages}  failed: {str(e).splitlines()[0][:70]}")
         print(flush=True)
 
+    _census_section(torch, pd, ab)
+    _reading()
+    if status == "usable":
+        profile_with_ncu(ncu)
+    return 0
+
+
+def _census_section(torch, pd, ab):
     print("[4/4] machine-code census (static instruction counts, nvdisasm)\n")
-    keys = ("LDL", "STL", "LDG128", "LDG64", "LDG<=32", "LDS", "STS", "HMMA", "BAR", "SHFL",
-            "MUFU", "total")
-    print(f"  {'kernel':<26}" + "".join(f"{k:>9}" for k in keys))
+    print(f"  {'kernel':<26}" + "".join(f"{k.replace(' ', ''):>8}" for k in CENSUS)
+          + f"{'PTX mma':>9}")
     for label, int8, ppi in (("fp16 ppi4 (production)", False, 4), ("fp16 ppi1", False, 1),
                              ("int8 ppi4", True, 4), ("int8 ppi1", True, 1)):
         measure(torch, 1, 1024, int8, ppi, iters=1, stages=2)
@@ -359,6 +388,8 @@ def main() -> int:
     measure_ablation(torch, "prefetch", 1, 1024, 1, 2, iters=1)
     print_census("prefetch ppi1", ab.LAST_COMPILED.get("prefetch"))
 
+
+def _reading():
     print("\nReading it:\n"
           "  [2] stages1 beating stages2 at ppi4 means shared memory was capping occupancy.\n"
           "      int8 regs/spills now near fp16's means the fp32-tile fix worked.\n"
@@ -366,11 +397,9 @@ def main() -> int:
           "      arithmetic (via register pressure) is. no_lookup << full: the dependent\n"
           "      block-table load serialises the loop. prefetch < full: overlapping that\n"
           "      load with compute is the fix.\n"
-          "  [4] LDL/STL are spills made concrete; LDG 128 are fully vectorised loads.")
-
-    if status == "usable":
-        profile_with_ncu(ncu)
-    return 0
+          "  [4] LDL/STL are spills made concrete; LDG 128 are fully vectorised loads.\n"
+          "      HMMA = 0 with FFMA/HFMA2 in the hundreds and no PTX mma: the matrix\n"
+          "      multiplies run on CUDA cores, and Triton never asked for tensor cores.")
 
 
 if __name__ == "__main__":
