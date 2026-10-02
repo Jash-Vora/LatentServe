@@ -351,17 +351,21 @@ if HAS_TRITON:  # pragma: no cover - requires a GPU
                              + offs_d * stride_ksd)
                 vs = tl.load(V_scale + blk * stride_vsb + offs_p * stride_vsp
                              + h * stride_vsh)
-                k = k.to(tl.float32) * ks[None, :]
-                v = v.to(tl.float32) * vs[:, None]
+                # Phase 12: no fp32 tiles. The previous version converted K and V
+                # to fp32 across the whole tile and back, which the compiler had to
+                # hold in registers: 198 registers against fp16's 128 at one page
+                # per iteration, and 160 spills against 90 at four. K is scaled and
+                # rounded to fp16 in one expression, so no fp32 tile outlives it;
+                # V is never dequantized at all (below).
                 if ASYM:
                     kz = tl.load(K_zero + blk * stride_ksb + h * stride_ksh
                                  + offs_d * stride_ksd)
                     vz = tl.load(V_zero + blk * stride_vsb + offs_p * stride_vsp
                                  + h * stride_vsh)
-                    k = k + kz[None, :]
-                    v = v + vz[:, None]
-                k = k.to(q.dtype)
-                v = v.to(q.dtype)
+                    k = (k.to(tl.float32) * ks[None, :] + kz[None, :]).to(q.dtype)
+                else:
+                    k = (k.to(tl.float32) * ks[None, :]).to(q.dtype)
+                v = v.to(q.dtype)                    # int8 -> fp16 is exact
 
             if HAS_RES:
                 if p == num_pages - 1:
@@ -383,7 +387,20 @@ if HAS_TRITON:  # pragma: no cover - requires a GPU
             pw = tl.exp(qk - m_new[:, None])
             pw = tl.where(valid[None, :], pw, 0.0)
             l_i = l_i * alpha + tl.sum(pw, axis=1)
-            acc = acc * alpha[:, None] + tl.dot(pw.to(v.dtype), v)
+            if IS_INT8:
+                # V's per-token scale moves onto the weights:
+                # sum_t p_t (s_t v_t) = sum_t (p_t s_t) v_t. Normalised by the
+                # page's largest scale first, so the scaled weights stay in
+                # [0, 1] instead of sinking into fp16's subnormals, and the
+                # maximum is applied back in fp32 after the multiply.
+                vsm = tl.where(valid, vs, 0.0)
+                vmax = tl.maximum(tl.max(vsm, axis=0), 1e-20)
+                upd = tl.dot((pw * (vsm / vmax)[None, :]).to(v.dtype), v) * vmax
+                if ASYM:
+                    upd += tl.sum(pw * tl.where(valid, vz, 0.0)[None, :], axis=1)[:, None]
+            else:
+                upd = tl.dot(pw.to(v.dtype), v)
+            acc = acc * alpha[:, None] + upd
             m_i = m_new
 
         tl.store(
@@ -560,15 +577,21 @@ if HAS_TRITON:  # pragma: no cover - requires a GPU
                              + offs_d[None, :] * stride_ksd)
                 vs = tl.load(V_scale + blk[:, None] * stride_vsb
                              + offs_p[None, :] * stride_vsp + h * stride_vsh)
-                k = k.to(tl.float32) * ks[:, None, :]
-                v = v.to(tl.float32) * vs[:, :, None]
+                # Phase 12: no fp32 tiles. The previous version converted K and V
+                # to fp32 across the whole tile and back, which the compiler had to
+                # hold in registers: 198 registers against fp16's 128 at one page
+                # per iteration, and 160 spills against 90 at four. K is scaled and
+                # rounded to fp16 in one expression, so no fp32 tile outlives it;
+                # V is never dequantized at all (below).
                 if ASYM:
                     kz = tl.load(K_zero + blk[:, None] * stride_ksb + h * stride_ksh
                                  + offs_d[None, :] * stride_ksd)
                     vz = tl.load(V_zero + blk[:, None] * stride_vsb
                                  + offs_p[None, :] * stride_vsp + h * stride_vsh)
-                    k = k + kz[:, None, :]
-                    v = v + vz[:, :, None]
+                    k = (k.to(tl.float32) * ks[:, None, :] + kz[:, None, :]).to(q.dtype)
+                else:
+                    k = (k.to(tl.float32) * ks[:, None, :]).to(q.dtype)
+                v = v.to(q.dtype)                    # int8 -> fp16 is exact
 
             if HAS_RES:
                 # Within the tile, only the sequence's last page comes from the
@@ -584,8 +607,8 @@ if HAS_TRITON:  # pragma: no cover - requires a GPU
                     + offs_p[None, :, None] * stride_rp + h * stride_rh
                     + offs_d[None, None, :] * stride_rd,
                     mask=is_last[:, None, None], other=0.0,
-                ).to(tl.float32)
-                k = tl.where(is_last[:, None, None], k_res, k.to(tl.float32))
+                ).to(q.dtype)
+                k = tl.where(is_last[:, None, None], k_res, k.to(q.dtype))
 
             k = tl.reshape(k, (PPI * PAGE, BLOCK_D)).to(q.dtype)
             v = tl.reshape(v, (PPI * PAGE, BLOCK_D)).to(q.dtype)
@@ -603,7 +626,19 @@ if HAS_TRITON:  # pragma: no cover - requires a GPU
             pw = tl.exp(qk - m_new[:, None])
             pw = tl.where(valid[None, :], pw, 0.0)
             l_i = l_i * alpha + tl.sum(pw, axis=1)
-            acc = acc * alpha[:, None] + tl.dot(pw.to(v.dtype), v)
+            if IS_INT8:
+                # As in the untiled kernel: V's per-token scale on the weights,
+                # normalised to keep them out of fp16's subnormals. Per-token
+                # scales fold across page boundaries in the tile.
+                vsf = tl.where(valid, tl.reshape(vs, (PPI * PAGE,)), 0.0)
+                vmax = tl.maximum(tl.max(vsf, axis=0), 1e-20)
+                upd = tl.dot((pw * (vsf / vmax)[None, :]).to(v.dtype), v) * vmax
+                if ASYM:
+                    vzf = tl.where(valid, tl.reshape(vz, (PPI * PAGE,)), 0.0)
+                    upd += tl.sum(pw * vzf[None, :], axis=1)[:, None]
+            else:
+                upd = tl.dot(pw.to(v.dtype), v)
+            acc = acc * alpha[:, None] + upd
             m_i = m_new
 
         tl.store(

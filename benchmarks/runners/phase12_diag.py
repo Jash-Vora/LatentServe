@@ -88,9 +88,14 @@ def occupancy(regs: int, smem: int, warps: int) -> tuple[float, str]:
     return min(limits.values()) / MAX_WARPS_PER_SM, bound
 
 
-def build_inputs(torch, batch, ctx, int8, page=16, h=2, d=128, n_rep=6, seed=0):
+def build_inputs(torch, batch, ctx, int8, page=16, h=2, d=128, n_rep=6, seed=0,
+                 identity=False, ragged=None):
+    """Pools, tables, lengths, query. `identity` lays sequence b's page j at
+    block b*P+j, so the no-lookup ablation reads the same addresses as the
+    lookup it replaces. `ragged` gives per-sequence lengths."""
     g = torch.Generator(device="cuda").manual_seed(seed)
-    pages = ctx // page
+    lens_list = ragged or [ctx] * batch
+    pages = (max(lens_list) + page - 1) // page
     nb = batch * pages + 4
     dev = "cuda"
     if int8:
@@ -109,40 +114,147 @@ def build_inputs(torch, batch, ctx, int8, page=16, h=2, d=128, n_rep=6, seed=0):
         v = torch.randn(nb, page, h, d, dtype=torch.float16, device=dev, generator=g)
         extra = {}
         kv_bytes = 2 * batch * ctx * h * d * 2
-    tables = torch.randperm(nb, device=dev, generator=g)[: batch * pages]
-    tables = tables.reshape(batch, pages).to(torch.int32)
-    lens = torch.full((batch,), ctx, dtype=torch.int32, device=dev)
+    if identity:
+        tables = torch.arange(batch * pages, dtype=torch.int32, device=dev).reshape(batch, pages)
+    else:
+        tables = torch.randperm(nb, device=dev, generator=g)[: batch * pages]
+        tables = tables.reshape(batch, pages).to(torch.int32)
+    lens = torch.tensor(lens_list, dtype=torch.int32, device=dev)
     q = torch.randn(batch, h, n_rep, d, dtype=torch.float16, device=dev, generator=g)
     return (q, k, v, tables, lens), extra, kv_bytes
 
 
-def measure(torch, batch, ctx, int8, ppi, iters=50):
-    from kernels.gqa import paged_decode as pd
-
-    args, extra, kv_bytes = build_inputs(torch, batch, ctx, int8)
-    run = lambda: pd.paged_decode_attention(*args, max_seq_len=ctx, num_splits=16,  # noqa: E731
-                                            pages_per_iter=ppi, **extra)
-    for _ in range(5):
-        run()
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(iters):
-        run()
-    torch.cuda.synchronize()
-    ms = (time.perf_counter() - t0) / iters * 1000
-    k = pd.LAST_COMPILED.get("decode")
+def _resources(k, default_warps=4):
     meta = getattr(k, "metadata", None)
     regs = getattr(k, "n_regs", 0) or 0
     spills = getattr(k, "n_spills", 0) or 0
     smem = getattr(meta, "shared", 0) if meta is not None else 0
-    warps = getattr(meta, "num_warps", pd.NUM_WARPS) if meta is not None else pd.NUM_WARPS
+    warps = getattr(meta, "num_warps", default_warps) if meta is not None else default_warps
     occ, bound = occupancy(regs, smem, warps)
-    return {"ms": ms, "gbs": kv_bytes / (ms / 1000) / 1e9, "regs": regs,
-            "spills": spills, "smem": smem, "warps": warps, "occ": occ, "bound": bound}
+    return {"regs": regs, "spills": spills, "smem": smem, "warps": warps, "occ": occ,
+            "bound": bound}
+
+
+def _time(torch, fn, iters):
+    for _ in range(5):
+        fn()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t0) / iters * 1000
+
+
+def measure(torch, batch, ctx, int8, ppi, iters=50, stages=None):
+    from kernels.gqa import paged_decode as pd
+
+    args, extra, kv_bytes = build_inputs(torch, batch, ctx, int8)
+    ms = _time(torch, lambda: pd.paged_decode_attention(
+        *args, max_seq_len=ctx, num_splits=16, pages_per_iter=ppi, num_stages=stages,
+        **extra), iters)
+    return {"ms": ms, "gbs": kv_bytes / (ms / 1000) / 1e9,
+            **_resources(pd.LAST_COMPILED.get("decode"), pd.NUM_WARPS)}
+
+
+def measure_ablation(torch, variant, batch, ctx, ppi, stages, iters=50):
+    from kernels.gqa import paged_decode_ablations as ab
+
+    args, _, kv_bytes = build_inputs(torch, batch, ctx, False, identity=True)
+    run = ab.prepare(variant, *args, pages_per_iter=ppi, num_stages=stages)
+    ms = _time(torch, run, iters)
+    return {"ms": ms, "gbs": kv_bytes / (ms / 1000) / 1e9,
+            **_resources(ab.LAST_COMPILED.get(variant))}
+
+
+def check_correctness(torch) -> bool:
+    """Every timed variant against the reference, on a small ragged batch."""
+    from kernels.gqa import paged_decode as pd
+    from kernels.gqa import paged_decode_ablations as ab
+
+    ok = True
+    ragged = [300, 61]
+    for int8 in (False, True):
+        args, extra, _ = build_inputs(torch, 2, 300, int8, ragged=ragged, seed=1)
+        want = pd.paged_decode_reference(*args, num_splits=1, **extra)
+        for ppi in (1, 2, 4):
+            for stages in (1, 2):
+                got = pd.paged_decode_attention(*args, max_seq_len=300, num_splits=4,
+                                                pages_per_iter=ppi, num_stages=stages, **extra)
+                err = float((got.float() - want.float()).abs().max())
+                good = err < 2e-2
+                ok &= good
+                if not good:
+                    print(f"  FAIL {'int8' if int8 else 'fp16'} ppi{ppi} stages{stages}: "
+                          f"max abs error {err:.3e}")
+    args, _, _ = build_inputs(torch, 2, 300, False, ragged=ragged, seed=2, identity=True)
+    want = pd.paged_decode_reference(*args, num_splits=1)
+    for variant in ("full", "no_lookup", "prefetch"):
+        got = ab.run_variant(variant, *args, num_splits=4, pages_per_iter=4 if variant != "prefetch" else 1)
+        err = float((got.float() - want.float()).abs().max())
+        good = err < 2e-2
+        ok &= good
+        if not good:
+            print(f"  FAIL ablation {variant}: max abs error {err:.3e}")
+    return ok
+
+
+def sass_census(compiled) -> dict | None:
+    """Static instruction counts from the compiled kernel's machine code.
+
+    Not a profile: these are instructions *in* the kernel, not executions.
+    But they show what no timing can — whether spill code exists (local
+    loads/stores), how wide the global loads are, how much tensor-core and
+    synchronisation work the compiler emitted.
+    """
+    import tempfile
+
+    asm = getattr(compiled, "asm", None) or {}
+    cubin = asm.get("cubin")
+    tool = shutil.which("nvdisasm") or "/usr/local/cuda/bin/nvdisasm"
+    if not cubin or not os.path.exists(tool):
+        return None
+    with tempfile.NamedTemporaryFile(suffix=".cubin", delete=False) as f:
+        f.write(cubin)
+        path = f.name
+    try:
+        out = subprocess.run([tool, "-c", path], capture_output=True, text=True, timeout=60)
+    finally:
+        os.unlink(path)
+    return parse_sass(out.stdout)
+
+
+def parse_sass(text: str) -> dict:
+    """Opcode counts from nvdisasm output. Predicates (@P0, @!PT, @UP1) are
+    skipped; labels and headers do not match. LDG is also split by width."""
+    import re
+
+    counts: dict = {}
+    for line in text.splitlines():
+        m = re.search(r"\*/\s+(@!?U?P\w+\s+)?([A-Z][A-Z0-9_.]+)", line)
+        if not m:
+            continue
+        op = m.group(2)
+        base = op.split(".")[0]
+        counts["total"] = counts.get("total", 0) + 1
+        counts[base] = counts.get(base, 0) + 1
+        if base == "LDG":
+            width = "128" if ".128" in op else "64" if ".64" in op else "32 or less"
+            counts[f"LDG {width}"] = counts.get(f"LDG {width}", 0) + 1
+    return counts
+
+
+def print_census(label, compiled):
+    c = sass_census(compiled)
+    if c is None:
+        print(f"  {label:<26} (no cubin or nvdisasm)")
+        return
+    keys = ("LDL", "STL", "LDG 128", "LDG 64", "LDG 32 or less", "LDS", "STS", "HMMA",
+            "BAR", "SHFL", "MUFU", "total")
+    print(f"  {label:<26}" + "".join(f"{c.get(k, 0):>9}" for k in keys))
 
 
 def child(variant: str) -> int:
-    """Launch one kernel configuration a few times, for ncu to profile."""
     import torch
 
     int8, ppi = variant.split("_")
@@ -157,8 +269,6 @@ def profile_with_ncu(ncu: str) -> None:
                "--launch-count", "1", "--csv", "--page", "details"]
         for sec in sections:
             cmd += ["--section", sec]
-        # Why warps wait, not just that they do. Long scoreboard is waiting on
-        # global memory; barrier on other warps; math throttle on ALUs.
         stalls = ["long_scoreboard", "short_scoreboard", "barrier", "wait",
                   "math_pipe_throttle", "mio_throttle", "not_selected"]
         cmd += ["--metrics", ",".join(f"smsp__warp_issue_stalled_{x}_per_warp_active.pct"
@@ -166,26 +276,27 @@ def profile_with_ncu(ncu: str) -> None:
         cmd += [sys.executable, "-m", "benchmarks.runners.phase12_diag", "--child", variant]
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
         print(f"\n--- ncu: {variant} (batch 16, ctx 8192) ---")
-        wanted = ("Achieved Occupancy", "Theoretical Occupancy", "DRAM Throughput",
-                  "Memory Throughput", "Compute (SM) Throughput", "Registers Per Thread",
-                  "Warp Cycles Per Issued Instruction", "Stall Long Scoreboard",
-                  "Stall Barrier", "Stall Math Pipe Throttle", "Duration")
-        shown = 0
         for line in out.stdout.splitlines():
-            if any(w in line for w in wanted) or "issue_stalled" in line:
+            if "Occupancy" in line or "Throughput" in line or "issue_stalled" in line:
                 cells = [c.strip('"') for c in line.split('","')]
                 if len(cells) >= 3:
-                    print(f"  {cells[-3]:<40} {cells[-1]:>14} {cells[-2]}")
-                    shown += 1
-        if not shown:
-            print("  (no matching metrics; raw tail below)")
-            print("\n".join((out.stdout + out.stderr).splitlines()[-15:]))
+                    print(f"  {cells[-3]:<50} {cells[-1]:>12} {cells[-2]}")
+
+
+ROW = (f"{'variant':<24}{'batch':>6}{'ms':>8}{'GB/s':>7}{'regs':>6}{'spills':>8}"
+       f"{'smem KB':>9}{'occupancy':>11}  bound by")
+
+
+def _row(name, batch, m):
+    print(f"{name:<24}{batch:>6}{m['ms']:>8.3f}{m['gbs']:>7.1f}{m['regs']:>6}{m['spills']:>8}"
+          f"{m['smem'] / 1024:>9.1f}{m['occ']:>10.0%}  {m['bound']}")
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--child", default=None, help=argparse.SUPPRESS)
     p.add_argument("--skip-ncu", action="store_true")
+    p.add_argument("--ctx", type=int, default=8192)
     args = p.parse_args()
     if args.child:
         return child(args.child)
@@ -195,35 +306,69 @@ def main() -> int:
     if not torch.cuda.is_available():
         print("[ERROR] this is a GPU diagnostic.", file=sys.stderr)
         return 1
-    print(f"device: {torch.cuda.get_device_name(0)}  torch {torch.__version__}")
+    print(f"device: {torch.cuda.get_device_name(0)}  torch {torch.__version__}", flush=True)
+    ctx = args.ctx
 
     status, ncu = ("skipped", None) if args.skip_ncu else ncu_status()
-    print(f"\n[1/3] Nsight Compute: {status}" + (f" ({ncu})" if ncu else ""))
-    if status == "no-permission":
-        print("      The driver refuses performance counters in this container. The\n"
-              "      resource numbers below are the fallback, and usually enough.")
-    elif status == "missing":
-        print("      Not installed. The resource numbers below are the fallback.")
+    print(f"\n[0/4] Nsight Compute: {status}" + (f" ({ncu})" if ncu else ""), flush=True)
 
-    print("\n[2/3] + [3/3] kernel resources and achieved bandwidth (16 splits)\n")
-    print(f"{'variant':<12}{'batch':>6}{'ctx':>6}{'ms':>8}{'GB/s':>7}{'regs':>6}"
-          f"{'spills':>8}{'smem KB':>9}{'warps':>6}{'occupancy':>11}  bound by")
-    for int8 in (False, True):
-        for ppi in (1, 4):
-            for batch in (1, 16):
-                m = measure(torch, batch, 8192, int8, ppi)
-                name = f"{'int8' if int8 else 'fp16'} ppi{ppi}"
-                print(f"{name:<12}{batch:>6}{8192:>6}{m['ms']:>8.3f}{m['gbs']:>7.1f}"
-                      f"{m['regs']:>6}{m['spills']:>8}{m['smem'] / 1024:>9.1f}{m['warps']:>6}"
-                      f"{m['occ']:>10.0%}  {m['bound']}")
+    print("\n[1/4] correctness of every variant against the reference (ragged batch)", flush=True)
+    ok = check_correctness(torch)
+    print("  all variants match the reference" if ok else
+          "  SOME VARIANTS ARE WRONG — their timings below mean nothing", flush=True)
 
-    print("\nReading it: spills above zero turn register reads into memory traffic;\n"
-          "occupancy well under 50% leaves too few warps to hide memory latency.\n"
-          "INT8 rows with more registers or spills than their fp16 twins point at\n"
-          "dequantizing into full fp32 tiles.")
+    from kernels.gqa import paged_decode as pd
+    from kernels.gqa import paged_decode_ablations as ab
+
+    print(f"\n[2/4] production kernel: dtype x pages-per-iteration x pipeline stages, ctx {ctx}\n")
+    print(ROW)
+    for batch in (16, 1):
+        for int8 in (False, True):
+            for ppi in (1, 2, 4):
+                for stages in (1, 2):
+                    try:
+                        m = measure(torch, batch, ctx, int8, ppi, stages=stages)
+                        _row(f"{'int8' if int8 else 'fp16'} ppi{ppi} stages{stages}", batch, m)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"{'int8' if int8 else 'fp16'} ppi{ppi} stages{stages}  failed: "
+                              f"{str(e).splitlines()[0][:70]}")
+        print(flush=True)
+
+    print(f"[3/4] ablations (fp16, identity page layout so lookup vs no-lookup read the same "
+          f"addresses), ctx {ctx}\n")
+    print(ROW)
+    for batch in (16, 1):
+        for stages in (1, 2):
+            for variant, ppi in (("full", 4), ("no_lookup", 4), ("loads_only", 4),
+                                 ("compute_only", 4), ("prefetch", 1)):
+                try:
+                    m = measure_ablation(torch, variant, batch, ctx, ppi, stages)
+                    _row(f"{variant} ppi{ppi} stages{stages}", batch, m)
+                except Exception as e:  # noqa: BLE001
+                    print(f"{variant} stages{stages}  failed: {str(e).splitlines()[0][:70]}")
+        print(flush=True)
+
+    print("[4/4] machine-code census (static instruction counts, nvdisasm)\n")
+    keys = ("LDL", "STL", "LDG128", "LDG64", "LDG<=32", "LDS", "STS", "HMMA", "BAR", "SHFL",
+            "MUFU", "total")
+    print(f"  {'kernel':<26}" + "".join(f"{k:>9}" for k in keys))
+    for label, int8, ppi in (("fp16 ppi4 (production)", False, 4), ("fp16 ppi1", False, 1),
+                             ("int8 ppi4", True, 4), ("int8 ppi1", True, 1)):
+        measure(torch, 1, 1024, int8, ppi, iters=1, stages=2)
+        print_census(label, pd.LAST_COMPILED.get("decode"))
+    measure_ablation(torch, "prefetch", 1, 1024, 1, 2, iters=1)
+    print_census("prefetch ppi1", ab.LAST_COMPILED.get("prefetch"))
+
+    print("\nReading it:\n"
+          "  [2] stages1 beating stages2 at ppi4 means shared memory was capping occupancy.\n"
+          "      int8 regs/spills now near fp16's means the fp32-tile fix worked.\n"
+          "  [3] loads_only ~ full: the memory path is the cost. compute_only ~ full: the\n"
+          "      arithmetic (via register pressure) is. no_lookup << full: the dependent\n"
+          "      block-table load serialises the loop. prefetch < full: overlapping that\n"
+          "      load with compute is the fix.\n"
+          "  [4] LDL/STL are spills made concrete; LDG 128 are fully vectorised loads.")
 
     if status == "usable":
-        print("\n[ncu] profiling fp16 and INT8 at batch 16 / 8K ...")
         profile_with_ncu(ncu)
     return 0
 
