@@ -190,7 +190,8 @@ broken.
       changes the environment again
 - [x] graphs wired into `ServingEngine` (`use_cuda_graphs=True`), with
       `warmup_graphs()` to move capture cost to start-up
-- [ ] side-by-side vLLM comparison with both systems on CUDA graphs
+- [x] side-by-side vLLM comparison with both systems on CUDA graphs
+- [x] `num_splits` re-tuned under replay: capped at 16
 
 ## Serving integration
 
@@ -233,3 +234,104 @@ all of them can be compared against the same vLLM rows.
   batch 1, which is what a single user feels between tokens;
 * **throughput** — output tokens/s, read at the largest batch, which is
   what a server can sustain and is vLLM's home ground.
+
+## A bug the GPU found that the CPU suite could not
+
+`test_engine_with_graphs_matches_engine_without` builds its model on the
+CPU. In a CPU-only environment it passed, because the decoder never
+enabled. On a T4 it failed — the graphed engine emitted the same token on
+every step — and CUDA reported "The CUDA Graph is empty".
+
+`GraphedDecoder` decided whether to capture by checking
+`torch.cuda.is_available()`, which is about the *machine*. A CPU model on
+a GPU machine therefore "captured": the CPU ops executed once during
+capture and produced one real set of logits, the graph recorded no CUDA
+kernels, and every replay afterwards was a no-op. The output buffer froze
+on the first step's logits.
+
+That is the stale-replay failure this phase was most worried about,
+arriving by a route nobody wrote a test for, and visible only on hardware
+the default test run does not use. Capture is now keyed on the model's
+device, `check_capturable` refuses a CPU model, and
+`test_cpu_model_is_never_captured_even_when_a_gpu_exists` fakes a GPU so
+the condition reproduces on any machine.
+
+## `num_splits` under replay
+
+16 splits was best at three of four points (b1/4K 20.33 ms vs 21.19 at
+32; b1/16K 26.89 vs 28.08 at 64; b4/4K 27.23 vs 31.49 at 64) and within
+noise at b4/16K. The isolated sweep had said 64; that optimum survived
+neither eager execution (Phase 12) nor replay. `MAX_SPLITS` is now 16.
+
+## Against vLLM, same session, both on CUDA graphs
+
+32 uniform requests, contexts 2K and 8K, decode isolated by differencing
+128 vs 256 output tokens.
+
+| batch | ctx | LS decode | vLLM decode | decode | prefill ratio |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 2048 | 20.8 ms | 17.7 ms | **-15%** | 3.3x |
+| 1 | 8192 | 24.7 | 23.0 | -7% | 3.1x |
+| 4 | 2048 | 23.8 | 22.2 | -7% | 1.9x |
+| 4 | 8192 | 39.5 | 42.1 | +7% | 3.1x |
+| 8 | 2048 | 28.7 | 29.1 | +1% | 1.9x |
+| 8 | 8192 | 59.4 | 63.9 | +8% | 3.1x |
+| 16 | 2048 | 39.9 | 42.2 | +6% | 1.9x |
+| 16 | 8192 | 99.6 | 106.9 | +7% | 3.1x |
+
+### The prediction was wrong both ways
+
+The prediction was: lead on batch-1 latency, fall behind on throughput as
+batch grows. Measured: **behind on batch-1 latency** (15% at 2K) and
+**slightly ahead on decode at batch >= 4 and long context** (5-8%).
+
+### The first verdict reported the wrong throughput
+
+The compare's first version read throughput from end-to-end output
+tokens/s and reported LatentServe "147% ahead" at b16/8K. At that point
+prefill is 86% of vLLM's run and 68% of LatentServe's, and LatentServe's
+prefill is 3.1x faster — the Turing-specific Triton fallback Phase 6
+already found. So the headline lead was a **prefill** result presented
+as a throughput one. The compare now reports decode latency, decode
+throughput and end-to-end throughput separately, and annotates the last
+with the prefill ratio wherever prefill dominates.
+
+That is the fourth time in this project a measurement answered a
+different question than the one asked, and the second time the cause was
+blending prefill into a per-token figure (Phase 6 caught the first).
+
+### What the decode column says
+
+One consistent reading fits every row: a roughly **constant ~3 ms deficit
+outside attention**, offset by an **attention advantage that grows with
+context and batch**.
+
+* At b1/2K attention is a small share of the step, and the full deficit
+  shows: 3.1 ms.
+* At b1/8K the deficit narrows to 1.7 ms, because the attention kernel
+  is now doing more of the work and is slightly better than vLLM's.
+* From b4/8K on, the attention advantage outweighs the deficit.
+
+The attention side is Phase 6's finding again: on sm75 vLLM falls back to
+TRITON_ATTN, which degrades with context. The deficit side is **fusion**.
+vLLM's startup log (Phase 6) shows inductor compilation, and its Qwen2
+implementation merges `q/k/v` into one projection and `gate/up` into
+another. LatentServe runs three projections where vLLM runs one, two
+where vLLM runs one, and roughly 630 small elementwise kernels per step
+(Phase 12: 1.80 ms of GPU time on its own).
+
+CUDA graphs removed the CPU cost of launching those kernels. They did not
+remove the kernels: each still has a minimum GPU execution time, and the
+boundaries between them serialise. **Graphs remove launch overhead, not
+kernel count** — which is why the batch-1 gap survived Phase 13.
+
+### The honest headline
+
+On a T4, under CUDA graphs on both sides:
+
+* **decode is at parity with vLLM** — within 8% everywhere except batch 1
+  at short context, where vLLM leads by 15%;
+* **prefill is 1.9-3.3x faster**, a Turing-specific result (no FA2 on
+  sm75) that should be expected to invert on an A100;
+* end-to-end throughput therefore ranges 0.96x-2.47x vLLM, and should be
+  quoted alongside the prefill ratio, never on its own.

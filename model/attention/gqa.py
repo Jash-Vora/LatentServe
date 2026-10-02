@@ -111,6 +111,12 @@ class GQAAttention(nn.Module):
     ):
         super().__init__()
         self.q_proj, self.k_proj, self.v_proj, self.o_proj = q_proj, k_proj, v_proj, o_proj
+        # Phase 14a: q/k/v in one projection. Built by `fuse_projections`;
+        # None until then, and `use_fused` selects the path per call.
+        self._qkv_weight: Optional[torch.Tensor] = None
+        self._qkv_bias: Optional[torch.Tensor] = None
+        self._qkv_split: Optional[tuple[int, int, int]] = None
+        self.use_fused = False
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
@@ -172,6 +178,29 @@ class GQAAttention(nn.Module):
 
     # ------------------------------------------------------------------
 
+    def fuse_projections(self) -> None:
+        """Merge q/k/v into one projection, sharing the checkpoint's memory.
+
+        Qwen2.5's q/k/v carry biases, and those fuse too, so the merged
+        projection is still a single fused matmul-plus-bias. See
+        model/fused.py for why the originals are re-pointed rather than
+        copied.
+        """
+        from model.fused import concat_into_views
+
+        mods = [self.q_proj, self.k_proj, self.v_proj]
+        self._qkv_weight = concat_into_views(mods, "weight")
+        self._qkv_bias = concat_into_views(mods, "bias")
+        self._qkv_split = tuple(m.out_features for m in mods)
+        self.use_fused = True
+
+    def _project_qkv(self, hidden_states: torch.Tensor):
+        if self.use_fused and self._qkv_weight is not None:
+            return F.linear(hidden_states, self._qkv_weight, self._qkv_bias).split(
+                self._qkv_split, dim=-1
+            )
+        return self.q_proj(hidden_states), self.k_proj(hidden_states), self.v_proj(hidden_states)
+
     def _pool(self, cache, name: str):
         """This layer's slice of an optional scale pool.
 
@@ -203,9 +232,14 @@ class GQAAttention(nn.Module):
         """
         b, s, _ = hidden_states.shape
 
-        q = self.q_proj(hidden_states).view(b, s, self.num_attention_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(hidden_states).view(b, s, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(hidden_states).view(b, s, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        q, k, v = self._project_qkv(hidden_states)
+        # reshape rather than view: the fused path's outputs are slices of
+        # one wider tensor, so they are not contiguous across `s`. Only the
+        # last dimension is being split into (heads, head_dim), which a
+        # slice still supports without a copy.
+        q = q.reshape(b, s, self.num_attention_heads, self.head_dim).transpose(1, 2)
+        k = k.reshape(b, s, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        v = v.reshape(b, s, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         q, k = apply_rope(q, k, cos, sin)
 

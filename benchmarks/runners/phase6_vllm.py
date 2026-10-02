@@ -96,7 +96,8 @@ def _row(cfg, system: str, batch_size: int, ctx: int, out_len: int, summary: dic
 
 def run_latentserve(cfg, ref, requests, batch_size: int, block_size: int,
                     max_seq_len: int, attn_impl: str = "sdpa",
-                    cuda_graphs: bool = False, warmup_graphs: bool = True) -> dict:
+                    cuda_graphs: bool = False, warmup_graphs: bool = True,
+                    fuse_projections: bool = False) -> dict:
     """Run one configuration on an *already loaded* reference.
 
     The weights are loaded once, by the caller, and shared. Loading per
@@ -115,7 +116,8 @@ def run_latentserve(cfg, ref, requests, batch_size: int, block_size: int,
     # attn_impl="sdpa" — the *gather* path — so it measured vLLM against
     # Phase 3's runtime, not against the Phase 11 kernel. Now explicit.
     model = LatentServeQwen.from_reference(ref, max_seq_len_hint=max_seq_len,
-                                           attn_impl=attn_impl)
+                                           attn_impl=attn_impl,
+                                           fuse_projections=fuse_projections)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -157,6 +159,7 @@ def run_latentserve(cfg, ref, requests, batch_size: int, block_size: int,
         "wall_s": wall,
         "attn_impl": attn_impl,
         "cuda_graphs": cuda_graphs,
+        "fuse_projections": fuse_projections,
         "warmup_captures": warmup_captures,
         "requests": len(finished),
         "output_tokens": total_out,
@@ -241,6 +244,8 @@ def main() -> int:
                    help="LatentServe decode path: the Phase 3 gather or the Phase 11 kernel")
     p.add_argument("--cuda-graphs", action="store_true",
                    help="Phase 13: decode through captured CUDA graphs (implies the kernel)")
+    p.add_argument("--fuse-projections", action="store_true",
+                   help="Phase 14a: q/k/v and gate/up as one projection each")
     p.add_argument("--no-warmup-graphs", action="store_true",
                    help="capture lazily during the timed run instead of before it")
     p.add_argument("--results-dir", default="results/raw")
@@ -263,7 +268,7 @@ def main() -> int:
         ("sdpa", False): "",
         ("triton_paged", False): "_kernel",
         ("triton_paged", True): "_kernel_graphed",
-    }[(args.attn_impl, args.cuda_graphs)]
+    }[(args.attn_impl, args.cuda_graphs)] + ("_fused" if args.fuse_projections else "")
 
     import torch
 
@@ -340,7 +345,8 @@ def main() -> int:
             summary = (
                 run_latentserve(cfg, tok_ref, fresh, batch_size, args.block_size, max_seq_len,
                                 attn_impl=args.attn_impl, cuda_graphs=args.cuda_graphs,
-                                warmup_graphs=not args.no_warmup_graphs)
+                                warmup_graphs=not args.no_warmup_graphs,
+                                fuse_projections=args.fuse_projections)
                 if system.startswith("latentserve")
                 else run_vllm(cfg, fresh, batch_size, max_seq_len)
             )

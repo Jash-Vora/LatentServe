@@ -95,6 +95,7 @@ class LatentServeQwen:
         kv_expansion: KVExpansion = "fold",
         rope_source: str = "latentserve",
         max_seq_len_hint: int = 4096,
+        fuse_projections: bool = False,
     ):
         self.hf_model = hf_model
         self.tokenizer = tokenizer
@@ -155,6 +156,9 @@ class LatentServeQwen:
             raise ValueError(f"unknown rope_source {rope_source!r}")
 
         self.cache: Optional[ContiguousKVCache] = None
+        self.fused = False
+        if fuse_projections:
+            self.fuse_projections()
 
     # ------------------------------------------------------------------
     # Construction
@@ -309,6 +313,39 @@ class LatentServeQwen:
         return self._run_layers(input_ids, cos, sin, start_pos)
 
     @torch.no_grad()
+    def fuse_projections(self) -> None:
+        """Phase 14a: q/k/v and gate/up as one projection each, every layer.
+
+        84 fewer kernels per decode step, no extra weight memory, and the
+        unfused path still available through `set_fused(False)`. Done one
+        layer at a time so peak memory grows by one layer's worth, not the
+        whole model's.
+        """
+        from model.fused import FusedMLP
+
+        for layer in self.layers:
+            if not isinstance(layer.mlp, FusedMLP):
+                layer.attn.fuse_projections()
+                layer.mlp = FusedMLP(layer.mlp)
+        self.fused = True
+
+    def set_fused(self, on: bool) -> None:
+        """Switch every layer between the fused and unfused paths.
+
+        Both share the same weights, so this is free and exact — which is
+        what makes a same-process A/B possible. Graphs bake in the path
+        active at capture, so switch before building a GraphedDecoder.
+        """
+        from model.fused import FusedMLP
+
+        if on and not getattr(self, "fused", False):
+            self.fuse_projections()
+            return
+        for layer in self.layers:
+            layer.attn.use_fused = on
+            if isinstance(layer.mlp, FusedMLP):
+                layer.mlp.use_fused = on
+
     def _run_layers(
         self, input_ids: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, start_pos: int
     ) -> torch.Tensor:
