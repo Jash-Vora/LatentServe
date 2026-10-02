@@ -138,3 +138,41 @@ def test_steady_runs_keep_the_differenced_figure(tmp_path):
             rows.append(r)
     out = _run(tmp_path, rows)
     assert "runs drifted" not in out
+
+
+def _abba_rows(system, base_ms, drift_ms, n=4, batch=1, short=8, long=16, prefill_s=1.0):
+    """Four runs in ABBA order, per-step time creeping up by drift_ms per
+    run — the shape of a GPU settling under sustained load."""
+    out = []
+    for slot, length in enumerate((short, long, long, short)):
+        per_step = (base_ms + slot * drift_ms) / 1000
+        wall = prefill_s + length * n / batch * per_step
+        r = _rows(system, "h", f"2026-10-02T10:0{slot}", wall, wall, 40)[0]
+        r["output_length"] = length
+        r["extra"].update(wall_s=wall, run_id="run1", abba_slot=slot)
+        r["tpot_p50_ms"] = per_step * 1000 if system != "vllm" else None
+        out.append(r)
+    return out
+
+
+def test_abba_cancels_steady_drift(tmp_path):
+    """Per-step time 19.0, 19.5, 20.0, 20.5 ms across the four runs. ABBA
+    recovers the session mean, 19.75; a plain short-then-long subtraction
+    of the first two runs would have said 2 x 19.5 - 19.0 = 20.0."""
+    rows = _abba_rows("latentserve_kernel_graphed", 19.0, 0.5) + _abba_rows("vllm", 17.0, 0.5)
+    out = _run(tmp_path, rows)
+    assert "ABBA pairs" in out
+    assert "19.8" in out                      # LatentServe, 19.75 rounded
+    assert "runs drifted" not in out          # drift handled, not just flagged
+
+
+def test_abba_averages_only_within_one_run(tmp_path):
+    """An older session's rows for the same configuration must not be
+    averaged into this one."""
+    old = _abba_rows("latentserve_kernel_graphed", 30.0, 0.0)
+    for r in old:
+        r["extra"]["run_id"] = "older"
+        r["timestamp_utc"] = "2026-10-01T09:00"
+    new = _abba_rows("latentserve_kernel_graphed", 19.0, 0.0)
+    out = _run(tmp_path, old + new + _abba_rows("vllm", 17.0, 0.0))
+    assert "19.0" in out and "30.0" not in out

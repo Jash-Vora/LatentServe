@@ -244,6 +244,11 @@ def settle_gpu(seconds: float = 30.0) -> None:
     the differenced decode came out as 2b - a: +1-2 ms at batch 1 / 2K on
     every host measured, with impossible prefill rates alongside it.
     """
+    # This module imports torch inside each function (vLLM replaces it in
+    # place, and the module must import cleanly either way), so this one
+    # does too.
+    import torch
+
     if not torch.cuda.is_available():
         return
     a = torch.randn(4096, 4096, device="cuda", dtype=torch.float16)
@@ -277,6 +282,14 @@ def main() -> int:
                    help="LatentServe decode path: the Phase 3 gather or the Phase 11 kernel")
     p.add_argument("--cuda-graphs", action="store_true",
                    help="Phase 13: decode through captured CUDA graphs (implies the kernel)")
+    p.add_argument("--abba", action="store_true",
+                   help="run each configuration's output lengths short, long, long, short "
+                   "and average each pair. A drift that is linear in time hits both lengths "
+                   "equally and cancels, and the two per-pair estimates give a "
+                   "repeatability check. Needs exactly two --output-lengths.")
+    p.add_argument("--throwaway-first", action="store_true",
+                   help="run the first configuration once, untimed and unrecorded, so no "
+                   "measured run is the first one after loading")
     p.add_argument("--settle-seconds", type=float, default=30.0,
                    help="sustained GPU load before the first timed run, so it is not "
                    "measured at boost clock (0 to skip)")
@@ -342,12 +355,28 @@ def main() -> int:
     # whose V1 engine does not report TTFT.
     output_lengths = args.output_lengths or [args.max_output]
     walls: dict = {}
+    if args.abba and len(output_lengths) != 2:
+        raise SystemExit("--abba needs exactly two --output-lengths")
+    import uuid
+
+    # One id per invocation. The compare averages repeated lengths only within
+    # one run id, so ABBA pairs from this session are never averaged with an
+    # older session's rows for the same configuration.
+    run_id = uuid.uuid4().hex[:12]
+    order = ([(output_lengths[0], 0), (output_lengths[1], 1),
+              (output_lengths[1], 2), (output_lengths[0], 3)]
+             if args.abba else [(L, None) for L in output_lengths])
+    first_config = True
 
     if args.settle_seconds > 0:
         print(f"Settling the GPU for {args.settle_seconds:.0f} s before the first timed run ...")
         settle_gpu(args.settle_seconds)
     for batch_size, context_length in sweep:
-      for out_tokens in output_lengths:
+      plan = list(order)
+      if args.throwaway_first and first_config:
+          plan = [(output_lengths[0], "throwaway")] + plan
+      first_config = False
+      for out_tokens, slot in plan:
         args.max_output = out_tokens
 
         def make():
@@ -399,11 +428,17 @@ def main() -> int:
                     else run_vllm(cfg, fresh, batch_size, max_seq_len)
                 )
             summary.update(gpu.summary())
+            if slot == "throwaway":
+                print(f"  {system:<26} batch={batch_size:>2} throwaway run "
+                      f"({summary['wall_s']:.1f} s) — discarded, not recorded")
+                continue
+            summary["run_id"] = run_id
+            if slot is not None:
+                summary["abba_slot"] = slot
             row = _row(cfg, system, batch_size, ctx, out_len, summary, controls)
             writer.write(row)
-            walls.setdefault((system, batch_size, context_length), {})[args.max_output] = (
-                summary["wall_s"]
-            )
+            walls.setdefault((system, batch_size, context_length), {}).setdefault(
+                args.max_output, []).append(summary["wall_s"])
             # Use the *requested* token counts, not r.generated: only the
             # LatentServe arm writes generated tokens back onto the request
             # objects, so r.generated is 0 for vLLM and the column silently
@@ -446,10 +481,18 @@ def main() -> int:
         for (system, batch_size, context_length), by_out in sorted(walls.items()):
             if short not in by_out or long not in by_out:
                 continue
+            w_short = statistics.fmean(by_out[short])
+            w_long = statistics.fmean(by_out[long])
             extra_steps = (long - short) * args.num_requests / batch_size
-            decode_ms = (by_out[long] - by_out[short]) / extra_steps * 1000
+            decode_ms = (w_long - w_short) / extra_steps * 1000
             short_steps = short * args.num_requests / batch_size
-            prefill_s = by_out[short] - decode_ms / 1000 * short_steps
+            prefill_s = w_short - decode_ms / 1000 * short_steps
+            if len(by_out[short]) == 2 and len(by_out[long]) == 2:
+                # short, long, long, short: pair each long with its neighbour.
+                e1 = (by_out[long][0] - by_out[short][0]) / extra_steps * 1000
+                e2 = (by_out[long][1] - by_out[short][1]) / extra_steps * 1000
+                print(f"{system:<26} {batch_size:>5} {context_length or 0:>6}   "
+                      f"pair estimates {e1:.1f} and {e2:.1f} ms -> ABBA {decode_ms:.1f}")
             prompt_tokens = (context_length or 0) * args.num_requests
             rate = prompt_tokens / prefill_s if prefill_s > 0 and prompt_tokens else float("nan")
             print(f"{system:<26} {batch_size:>5} {context_length or 0:>6} "
@@ -598,9 +641,40 @@ def _compare_rows(rows: list) -> None:
         print(f"[WARN] reproducibility drift across rows: {sorted(drift)} — rerun both "
               "systems in one session before quoting a ratio", file=sys.stderr)
 
-    groups: dict = defaultdict(dict)
+    import copy as _copy
+
+    # Rows from runs that carry a run id (Phase 14 onwards): take the latest
+    # run per configuration and average repeated output lengths within it —
+    # that is what an ABBA run writes. Older rows have no run id and keep the
+    # original rule, last row per output length, so existing results files
+    # read exactly as they did.
+    by_key = defaultdict(list)
     for r in rows:
-        groups[(r["system"], r["batch_size"], r["context_length"])][r["output_length"]] = r
+        by_key[(r["system"], r["batch_size"], r["context_length"])].append(r)
+    groups: dict = defaultdict(dict)
+    abba_pairs: dict = {}
+    for key, rs in by_key.items():
+        tagged = [r for r in rs if (r.get("extra") or {}).get("run_id")]
+        if not tagged:
+            for r in rs:
+                groups[key][r["output_length"]] = r
+            continue
+        latest = max(tagged, key=lambda r: r.get("timestamp_utc", ""))["extra"]["run_id"]
+        mine = [r for r in tagged if r["extra"]["run_id"] == latest]
+        per_len = defaultdict(list)
+        for r in mine:
+            per_len[r["output_length"]].append(r)
+        for length, lst in per_len.items():
+            rep = _copy.deepcopy(lst[-1])
+            rep["extra"]["wall_s"] = statistics.fmean(r["extra"]["wall_s"] for r in lst)
+            meds = [r.get("tpot_p50_ms") for r in lst if r.get("tpot_p50_ms")]
+            rep["tpot_p50_ms"] = statistics.median(meds) if meds else None
+            rep["extra"]["repeats"] = len(lst)
+            groups[key][length] = rep
+        slots = {r["extra"].get("abba_slot"): r for r in mine
+                 if r["extra"].get("abba_slot") is not None}
+        if set(slots) == {0, 1, 2, 3}:
+            abba_pairs[key] = slots
 
     systems = sorted({k[0] for k in groups})
     points = sorted({(k[1], k[2]) for k in groups})
@@ -618,6 +692,15 @@ def _compare_rows(rows: list) -> None:
             continue
         base_row = base[max(base)]
         base_best = _best_decode(base, batch)
+        if ("vllm", batch, ctx) in abba_pairs:
+            sl = abba_pairs[("vllm", batch, ctx)]
+            n = (sl[0].get("extra") or {}).get("num_requests")
+            d_len = sl[1]["output_length"] - sl[0]["output_length"]
+            if n and d_len:
+                steps = d_len * n / batch
+                e1 = (sl[1]["extra"]["wall_s"] - sl[0]["extra"]["wall_s"]) / steps * 1000
+                e2 = (sl[2]["extra"]["wall_s"] - sl[3]["extra"]["wall_s"]) / steps * 1000
+                base_best = dict(base_best, decode=(e1 + e2) / 2, method="abba")
         base_decode = base_best["decode"]
         for system in systems:
             g = groups.get((system, batch, ctx))
@@ -631,6 +714,22 @@ def _compare_rows(rows: list) -> None:
                     print(f"{batch:>5} {ctx:>6}  {system:<26}  SKIPPED — {e}")
                     continue
             best = _best_decode(g, batch)
+            pair_note = ""
+            if (system, batch, ctx) in abba_pairs:
+                sl = abba_pairs[(system, batch, ctx)]
+                n = (sl[0].get("extra") or {}).get("num_requests")
+                d_len = sl[1]["output_length"] - sl[0]["output_length"]
+                if n and d_len:
+                    steps = d_len * n / batch
+                    e1 = (sl[1]["extra"]["wall_s"] - sl[0]["extra"]["wall_s"]) / steps * 1000
+                    e2 = (sl[2]["extra"]["wall_s"] - sl[3]["extra"]["wall_s"]) / steps * 1000
+                    # Under ABBA a linear drift cancels in the average, so the
+                    # differenced figure is the one to report even where the
+                    # two lengths' medians differ — that difference is the
+                    # drift ABBA exists to remove.
+                    best = {"decode": (e1 + e2) / 2, "method": "abba", "drift": best["drift"],
+                            "prefill": best["prefill"], "differenced": best["differenced"]}
+                    pair_note = f"  ABBA pairs {e1:.1f} / {e2:.1f}"
             decode_ms, prefill = best["decode"], best["prefill"]
             tput = row["throughput_tokens_sec"]
             decode_tput = batch / decode_ms * 1000 if decode_ms else None
@@ -646,7 +745,7 @@ def _compare_rows(rows: list) -> None:
                   f"{(f'{median_gap:.1f}' if median_gap else '-'):>12}"
                   f"{(f'{decode_tput:.0f}' if decode_tput else '-'):>14}"
                   f"{(f'{prefill:.0f}' if prefill else '-'):>15}"
-                  f"{tput:>11.1f}{flag}")
+                  f"{tput:>11.1f}{flag}{pair_note}")
             if system != "vllm":
                 base_prefill = base_best["prefill"]
                 verdict[system][(batch, ctx)] = (
