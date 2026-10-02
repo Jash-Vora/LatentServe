@@ -278,7 +278,10 @@ def run_latentserve_arm(args, load_reference) -> dict:
         # turned into logits `args.score_slice` positions at a time and
         # scored before the next slice is made. Every position's score
         # depends only on its own logits, so slicing changes no number.
-        for chunk in data["chunks"]:
+        print(f"[1/3] text: scoring {len(data['chunks'])} chunks x 4 systems", flush=True)
+        for ci, chunk in enumerate(data["chunks"]):
+            if ci and ci % 4 == 0:
+                print(f"      chunk {ci}/{len(data['chunks'])}", flush=True)
             t = torch.tensor(chunk, device=device)
             hidden = {"hf_fp32": _hf_hidden(ref32.model, t),
                       "hf_fp16": _hf_hidden(ref16.model, t)}
@@ -315,7 +318,10 @@ def run_latentserve_arm(args, load_reference) -> dict:
 
         # --- task ---
         preds = {s: [] for s in SYSTEMS[:-1]}
-        for item in data["mc"]:
+        print(f"[2/3] ARC-Easy: {len(data['mc'])} questions x 4 systems", flush=True)
+        for qi, item in enumerate(data["mc"]):
+            if qi and qi % 50 == 0:
+                print(f"      question {qi}/{len(data['mc'])}", flush=True)
             scores = {s: [] for s in SYSTEMS[:-1]}
             for choice in item["choices"]:
                 seq = item["context"] + choice
@@ -334,6 +340,8 @@ def run_latentserve_arm(args, load_reference) -> dict:
 
         # --- generation ---
         n = data["gen_new_tokens"]
+        print(f"[3/3] generation: {len(data['gen_prompts'])} prompts x {n} tokens "
+              "(HF fp16 one token at a time, then LatentServe both ways)", flush=True)
         gens = {"hf_fp16": [_greedy_hf(ref16.model, p, n, device) for p in data["gen_prompts"]]}
         del ref32
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
