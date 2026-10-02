@@ -458,6 +458,11 @@ if HAS_TRITON:  # pragma: no cover - requires a GPU
 # shape so a changing batch or split count just gets a new entry.
 _SCRATCH: dict = {}
 _SM_COUNT: dict = {}
+# The most recent compiled handle of each kernel. Triton returns it from a
+# launch, and it carries what the compiler decided: registers per thread,
+# values spilled to local memory, shared memory per program. Phase 12 reads
+# these to explain the kernel's ~47 GB/s ceiling without a profiler.
+LAST_COMPILED: dict = {}
 
 
 def _scratch(key, shape, dtype, device, fill=None):
@@ -725,7 +730,7 @@ def paged_decode_attention(
     stages = NUM_STAGES if num_stages is None else num_stages
     kernel = _paged_decode_tiled if ppi > 1 else _paged_decode_kernel
     extra = {"PPI": ppi} if ppi > 1 else {}
-    kernel[(b, num_splits, h_kv)](
+    LAST_COMPILED["decode"] = kernel[(b, num_splits, h_kv)](
         q, k_pool, v_pool,
         k_scale if k_scale is not None else dummy,
         v_scale if v_scale is not None else dummy,
@@ -752,7 +757,7 @@ def paged_decode_attention(
             partial_acc[:, :, 0, :n_rep] / partial_l[:, :, 0, :n_rep].clamp_min(1e-20)[..., None]
         ).to(q.dtype)
 
-    _combine_kernel[(b, h_kv)](
+    LAST_COMPILED["combine"] = _combine_kernel[(b, h_kv)](
         partial_acc, partial_m, partial_l, out,
         *partial_acc.stride(), *partial_m.stride(), *out.stride(),
         num_splits, N_REP=n_rep, BLOCK_M=16, BLOCK_D=d,
