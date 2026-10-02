@@ -458,13 +458,19 @@ def test_kernel_path_does_not_gather():
         ls.prefill(prompt)
         token = torch.zeros(1, 1, dtype=torch.long, device="cuda")
         ls.decode_step(token)                       # warm up
-        with torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CUDA]
-        ) as prof:
+        # CPU *and* CUDA activity. `aten::index` is a CPU-side op event, and
+        # with CUDA activity alone torch 2.13 records none — so this counted
+        # zero on both paths, and the control assertion below is what caught
+        # it. The gather's GPU kernel is counted too, so the test does not
+        # depend on either kind of event being reported.
+        with torch.profiler.profile(activities=[
+            torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA,
+        ]) as prof:
             ls.decode_step(token)
             torch.cuda.synchronize()
         return sum(
-            e.count for e in prof.key_averages() if e.key in ("aten::index", "aten::index_select")
+            e.count for e in prof.key_averages()
+            if e.key in ("aten::index", "aten::index_select") or "gather_kernel" in e.key
         )
 
     assert gather_calls("sdpa") > 0, "the SDPA path gathers, by construction"
