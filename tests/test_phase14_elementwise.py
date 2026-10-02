@@ -190,24 +190,28 @@ def test_triton_rope_on_a_strided_slice():
     got = fe.rope_qk(q, k, cos, sin, hq, hk, d)
     want = fe.rope_qk_ref(q, k, cos, sin, hq, hk, d)
     truth = fe.rope_qk_ref(q.float(), k.float(), cos.float(), sin.float(), hq, hk, d)
-    # Not "identical to Hugging Face". The first run of this test demanded
-    # that and failed on 25% of elements, by up to one fp16 step at the
-    # size of the *inputs*. HF's fp16 RoPE rounds each product and then the
-    # sum; where the products nearly cancel, the small result carries their
-    # rounding error. Triton folded the intermediate roundings and rounded
-    # once — closer to the true value, different from HF's exactly where
-    # cancellation occurs.
+    # Neither "identical to Hugging Face" (failed on 25% of elements) nor
+    # "never further from exact than HF, element by element" (failed on 28).
+    # Between them those rule out both exact replication of HF's three
+    # roundings and a single rounding at the end; the compiler fused part of
+    # the expression, most likely one multiply into the add as an FMA.
     #
-    # The property that matters either way: never further from the true
-    # value than the model's own fp16 computation, beyond the one rounding
-    # every fp16 result pays.
-    for g, w, t in zip(got, want, truth):
-        err_kernel = (g.float() - t).abs()
-        err_model = (w.float() - t).abs()
-        one_rounding = t.abs().clamp_min(2**-14) * 2**-10
-        assert (err_kernel <= err_model + one_rounding).all(), (
-            f"kernel further from exact than the model at "
-            f"{(err_kernel > err_model + one_rounding).sum().item()} elements")
+    # What holds for every such choice is the model's own error budget: each
+    # output is a sum of two products, and HF's fp16 computation is only
+    # guaranteed to half a step at each product's size plus half a step at
+    # the result's. Any subset of those roundings stays inside it; a wrong
+    # index, sign or half does not. Checked on CPU against simulated exact,
+    # single-rounding and FMA kernels (accepted) and against added noise and
+    # swapped halves (rejected).
+    for g, t, x, h in zip(got, truth, (q, k), (hq, hk)):
+        x4 = x.float().reshape(b, s, h, d)
+        c = cos.float().reshape(b, s, 1, d)
+        sn = sin.float().reshape(b, s, 1, d)
+        products = (x4.abs() * c.abs() + fe._rotate_half(x4).abs() * sn.abs()).reshape(b, s, h * d)
+        bound = 2**-11 * (products + t.abs()) + 2**-24
+        err = (g.float() - t).abs()
+        assert (err <= bound).all(), (
+            f"outside the model's own rounding budget at {(err > bound).sum().item()} elements")
 
 
 @requires_gpu

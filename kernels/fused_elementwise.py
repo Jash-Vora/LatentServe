@@ -31,15 +31,14 @@ weight, as `Qwen2RMSNorm` does, and the residual add is one fp32 add
 rounded once, which equals an fp16 add exactly.
 
 Written is not compiled. On the T4, RoPE differed from Hugging Face in 25%
-of elements, by up to one fp16 step at the size of its *inputs*. HF's fp16
-RoPE rounds each product and then their sum; where the products nearly
-cancel, the small result carries their rounding error. Triton evidently
-folded the intermediate roundings into one, which is closer to the true
-value and differs from HF's precisely where cancellation occurs. So the
-GPU test asks the property that holds either way: never further from the
-exact value than the model's own fp16 computation, beyond the one
-rounding every fp16 result pays. The RMSNorm also differs by the order of
-the sum inside its variance.
+of elements, by up to one fp16 step at the size of its *inputs*, and in 28
+elements it landed further from the exact value than HF did. That rules out
+both an exact replication of HF's three roundings and a single rounding at
+the end: the compiler fused part of the expression, most likely one
+multiply into the add. So the GPU test checks the model's own error budget
+— half a step at each product's size plus half a step at the result's —
+which every legitimate choice of roundings satisfies and a real bug does
+not. The RMSNorm also differs by the order of the sum inside its variance.
 
 ## References run on CPU
 
