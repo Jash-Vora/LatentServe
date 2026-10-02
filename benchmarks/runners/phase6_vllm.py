@@ -124,6 +124,24 @@ def run_latentserve(cfg, ref, requests, batch_size: int, block_size: int,
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
+    # Refuse to time a model whose outputs are not finite. From Phase 11 to
+    # Phase 14 every LatentServe logit on the real model was NaN — prefill
+    # under triton_paged fell through to an fp16 path that overflowed — and
+    # this harness timed it for three phases without noticing, because
+    # kernel time barely depends on the values. One short forward settles it.
+    import torch as _torch
+
+    probe = _torch.tensor([requests[0].prompt_ids[:64]], device=model.device)
+    model.allocate_cache(1, probe.shape[1] + 8, paged=True, block_size=block_size,
+                         kv_dtype=kv_dtype)
+    model.cache.reset()
+    with _torch.no_grad():
+        if not _torch.isfinite(model.forward_logits_all(probe)).all():
+            raise RuntimeError(
+                "LatentServe produces non-finite logits in this configuration; timing it "
+                "would measure a broken model. Check attention routing and dtype."
+            )
+
     engine = ServingEngine(
         model, max_running=batch_size, max_seq_len=max_seq_len,
         block_size=block_size, scheduler="fifo", use_cuda_graphs=cuda_graphs,

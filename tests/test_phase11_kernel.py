@@ -469,3 +469,46 @@ def test_kernel_path_does_not_gather():
 
     assert gather_calls("sdpa") > 0, "the SDPA path gathers, by construction"
     assert gather_calls("triton_paged") == 0, "the kernel path must not gather"
+
+
+@pytest.mark.parametrize("impl", ["sdpa", "triton_paged"])
+def test_prefill_attention_survives_fp16_scale_activations(impl):
+    """triton_paged replaces *decode* attention only; prefill must use SDPA.
+
+    Testing `attn_impl == "sdpa"` let triton_paged's prefill fall through to
+    the explicit math path, which forms q.k in fp16 before scaling. Qwen2.5's
+    massive activations overflow that to inf, and the softmax turns it into
+    NaN: every LatentServe logit on the real model was NaN from Phase 11 to
+    Phase 14, while every test here — tiny random models, small activations,
+    fp32 on CPU — passed. These inputs are scaled so q.k overflows fp16.
+    """
+    from model.attention import gqa as g
+
+    torch.manual_seed(0)
+    q = (torch.randn(1, 12, 64, 128) * 60).half()
+    k = (torch.randn(1, 12, 64, 128) * 60).half()
+    v = torch.randn(1, 12, 64, 128).half()
+
+    class A:
+        scaling = 128 ** -0.5
+        attn_impl = impl
+
+    out = g.GQAAttention._attend(A(), q, k, v, mask=None, is_causal=True)
+    assert torch.isfinite(out).all()
+
+
+def test_the_math_path_is_the_one_that_overflows():
+    """Pins the mechanism: if this ever stops producing NaN, the test above
+    is no longer exercising the overflow it exists to catch."""
+    from model.attention import gqa as g
+
+    torch.manual_seed(0)
+    q = (torch.randn(1, 12, 64, 128) * 60).half()
+    k = (torch.randn(1, 12, 64, 128) * 60).half()
+    v = torch.randn(1, 12, 64, 128).half()
+
+    class A:
+        scaling = 128 ** -0.5
+        attn_impl = "math"
+
+    assert torch.isnan(g.GQAAttention._attend(A(), q, k, v, mask=None, is_causal=True)).any()

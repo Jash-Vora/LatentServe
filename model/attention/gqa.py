@@ -162,7 +162,16 @@ class GQAAttention(nn.Module):
         mask: Optional[torch.Tensor],
         is_causal: bool,
     ) -> torch.Tensor:
-        if self.attn_impl == "sdpa":
+        # Only "math" takes the explicit path below. "triton_paged" replaces
+        # *decode* attention (forward() returns before reaching here for
+        # it); prefill and anything else it does not handle must use SDPA,
+        # as "sdpa" does. Testing `== "sdpa"` here instead let triton_paged's
+        # prefill fall through to the math path from Phase 11 to Phase 14:
+        # it computes q.k in fp16 before scaling, Qwen2.5's massive
+        # activations overflow that to inf, and the softmax made NaN of
+        # every logit on the real model — while fp32 CPU tests, where
+        # nothing overflows, passed. It also halved prefill throughput.
+        if self.attn_impl != "math":
             return F.scaled_dot_product_attention(
                 q, k, v, attn_mask=mask, is_causal=is_causal, scale=self.scaling
             )
