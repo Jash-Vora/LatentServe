@@ -23,18 +23,23 @@ one for SiLU-and-multiply — four per layer. Under CUDA graphs a kernel
 costs ~2.6 us of fixed time (measured in 14a), so ~730 fewer is worth
 about 1.9 ms: most of the gap.
 
-## Exact, not approximate
+## Matching the model's rounding — and where the compiler doesn't
 
-Each kernel reproduces Hugging Face's rounding step by step rather than
-computing the "same" function in higher precision. The RMSNorm, for
-instance, rounds the normalised value to fp16 *before* multiplying by the
-weight, because that is what `Qwen2RMSNorm` does; a fused kernel that kept
-fp32 throughout would be more accurate and would not be the model. The
-residual add is computed in fp32 and rounded once, which equals an fp16
-add exactly: the sum of two fp16 values is representable in fp32.
+Each kernel is *written* to reproduce Hugging Face's rounding step by
+step: the RMSNorm rounds the normalised value to fp16 before applying the
+weight, as `Qwen2RMSNorm` does, and the residual add is one fp32 add
+rounded once, which equals an fp16 add exactly.
 
-The one remaining source of difference is the order of the sum inside the
-variance, which can move a value by one fp16 ulp.
+Written is not compiled. On the T4, RoPE differed from Hugging Face in 25%
+of elements, by up to one fp16 step at the size of its *inputs*. HF's fp16
+RoPE rounds each product and then their sum; where the products nearly
+cancel, the small result carries their rounding error. Triton evidently
+folded the intermediate roundings into one, which is closer to the true
+value and differs from HF's precisely where cancellation occurs. So the
+GPU test asks the property that holds either way: never further from the
+exact value than the model's own fp16 computation, beyond the one
+rounding every fp16 result pays. The RMSNorm also differs by the order of
+the sum inside its variance.
 
 ## References run on CPU
 

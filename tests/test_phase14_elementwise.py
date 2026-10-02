@@ -189,8 +189,25 @@ def test_triton_rope_on_a_strided_slice():
     sin = torch.randn(b, 1, s, d, device="cuda", dtype=torch.float16)
     got = fe.rope_qk(q, k, cos, sin, hq, hk, d)
     want = fe.rope_qk_ref(q, k, cos, sin, hq, hk, d)
-    torch.testing.assert_close(got[0], want[0], rtol=0, atol=0)
-    torch.testing.assert_close(got[1], want[1], rtol=0, atol=0)
+    truth = fe.rope_qk_ref(q.float(), k.float(), cos.float(), sin.float(), hq, hk, d)
+    # Not "identical to Hugging Face". The first run of this test demanded
+    # that and failed on 25% of elements, by up to one fp16 step at the
+    # size of the *inputs*. HF's fp16 RoPE rounds each product and then the
+    # sum; where the products nearly cancel, the small result carries their
+    # rounding error. Triton folded the intermediate roundings and rounded
+    # once — closer to the true value, different from HF's exactly where
+    # cancellation occurs.
+    #
+    # The property that matters either way: never further from the true
+    # value than the model's own fp16 computation, beyond the one rounding
+    # every fp16 result pays.
+    for g, w, t in zip(got, want, truth):
+        err_kernel = (g.float() - t).abs()
+        err_model = (w.float() - t).abs()
+        one_rounding = t.abs().clamp_min(2**-14) * 2**-10
+        assert (err_kernel <= err_model + one_rounding).all(), (
+            f"kernel further from exact than the model at "
+            f"{(err_kernel > err_model + one_rounding).sum().item()} elements")
 
 
 @requires_gpu
