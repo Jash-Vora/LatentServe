@@ -61,3 +61,69 @@ def test_labels_keep_the_default_arm_named_vllm():
 ])
 def test_reads_the_graph_mode_vllm_printed(line, mode):
     assert reported_graph_mode(line) == mode
+
+
+from benchmarks.runners.vllm_backend_probe import same_backend  # noqa: E402
+from comparisons.vllm.runner import construct_engine  # noqa: E402
+
+
+@pytest.mark.parametrize("requested, reported, same", [
+    ("TRITON_ATTN", ["Triton"], True),                       # 'Using Triton Attention backend'
+    ("TRITON_ATTN", ["AttentionBackendEnum.TRITON_ATTN"], True),
+    ("FLASHINFER", ["FlashInfer"], True),
+    ("FLASHINFER", ["TRITON_ATTN"], False),                  # what the first probe saw
+    ("FLASH_ATTN", ["FlashInfer"], False),                   # a substring test says True
+    ("TORCH_SDPA", ["TORCH_SDPA"], True),
+])
+def test_backend_names_compare_after_normalising(requested, reported, same):
+    assert same_backend(requested, reported) is same
+
+
+def _fake_llm(unknown=(), fail=None):
+    """An engine that rejects the named options the way vLLM's EngineArgs does."""
+    class FakeLLM:
+        def __init__(self, **kw):
+            for key in unknown:
+                if key in kw:
+                    raise TypeError(f"EngineArgs.__init__() got an unexpected keyword argument '{key}'")
+            if fail:
+                raise fail
+            self.kw = kw
+    return FakeLLM
+
+
+def test_first_route_the_engine_accepts_is_used():
+    llm, info = construct_engine(_fake_llm(), {"model": "m"}, False, "FLASHINFER")
+    assert info["attention_backend_route"] == "attention_backend"
+    assert llm.kw["attention_backend"] == "FLASHINFER" and info["attention_backend_rejected"] == {}
+
+
+def test_unknown_routes_are_skipped_and_recorded():
+    llm, info = construct_engine(_fake_llm(unknown=("attention_backend",)), {"model": "m"},
+                                 False, "FLASHINFER")
+    assert info["attention_backend_route"] == "attention_config"
+    assert llm.kw["attention_config"] == {"backend": "FLASHINFER"}
+    assert "attention_backend" in info["attention_backend_rejected"]
+    _, info = construct_engine(_fake_llm(unknown=("attention_backend", "attention_config")),
+                               {"model": "m"}, False, "FLASHINFER")
+    assert info["attention_backend_route"] == "environment"
+
+
+def test_an_unrelated_unknown_argument_is_never_dropped():
+    """The old fallback caught any TypeError and retried with fewer arguments:
+    an unknown knob would vanish and the run would carry on without it."""
+    with pytest.raises(TypeError, match="async_scheduling"):
+        construct_engine(_fake_llm(unknown=("async_scheduling",)),
+                         {"model": "m", "async_scheduling": True}, False, None)
+
+
+def test_prefix_caching_fallback_fires_only_for_its_own_argument():
+    _, info = construct_engine(_fake_llm(unknown=("enable_prefix_caching",)), {"model": "m"},
+                               False, None)
+    assert info["prefix_caching_control"] == "unsupported_by_this_version"
+
+
+def test_a_backend_that_fails_to_start_is_an_error_not_a_fallback():
+    with pytest.raises(RuntimeError, match="not supported"):
+        construct_engine(_fake_llm(fail=RuntimeError("FLASHINFER not supported on sm_75")),
+                         {"model": "m"}, False, "FLASHINFER")

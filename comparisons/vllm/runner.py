@@ -118,6 +118,60 @@ def variant_label(variant: str) -> str:
     return "vllm_" + variant.lower().replace("+", "_")
 
 
+def construct_engine(LLM, kwargs: dict, enable_prefix_caching: bool,
+                     attention_backend: str | None) -> tuple:
+    """Build the engine, choosing the attention backend through whichever
+    route this vLLM accepts, and never dropping an argument silently.
+
+    The first backend probe asked for FLASHINFER, FLEX_ATTENTION, TORCH_SDPA
+    and XFORMERS through VLLM_ATTENTION_BACKEND, and vLLM's log reported
+    TRITON_ATTN for every one: this build no longer reads the variable. The
+    newer routes are engine options whose names have moved between releases,
+    so each is tried in turn, and a route is skipped only when the engine
+    says *that option* is unknown. Every rejection is kept and printed.
+    The log, not the route, says what actually ran.
+
+    The prefix-caching fallback used to catch *any* TypeError and retry with
+    fewer arguments — which would also have swallowed an unknown attention
+    option and quietly started Triton. It now fires only when
+    enable_prefix_caching itself is the complaint.
+    """
+    import sys
+
+    def build(kw):
+        # disable_log_stats=False asks V1 to populate per-request metrics:
+        # V0 filled RequestOutput.metrics unconditionally, V1 does not, and
+        # without it TTFT comes back empty.
+        try:
+            return LLM(enable_prefix_caching=enable_prefix_caching, disable_log_stats=False,
+                       **kw), "applied"
+        except TypeError as e:
+            if "enable_prefix_caching" not in str(e):
+                raise
+            return LLM(disable_log_stats=False, **kw), "unsupported_by_this_version"
+
+    routes = [("not requested", {})]
+    if attention_backend:
+        routes = [("attention_backend", {"attention_backend": attention_backend}),
+                  ("attention_config", {"attention_config": {"backend": attention_backend}}),
+                  ("environment", {})]
+    rejected: dict = {}
+    for name, extra in routes:
+        try:
+            llm, prefix = build({**kwargs, **extra})
+        except (TypeError, ValueError) as e:
+            key = next(iter(extra), None)
+            if key and key in str(e):
+                rejected[name] = str(e).strip().splitlines()[0][:200]
+                print(f"[VLLMRunner] attention route {name!r} rejected: {rejected[name]}",
+                      file=sys.stderr, flush=True)
+                continue
+            raise
+        return llm, {"prefix_caching_control": prefix, "attention_backend_route": name,
+                     "attention_backend_rejected": rejected}
+    raise RuntimeError(f"no route accepted attention backend {attention_backend!r}: {rejected}")
+
+
 class VLLMRunner:
     """Offline vLLM engine, configured to match LatentServe's conditions."""
 
@@ -170,22 +224,8 @@ class VLLMRunner:
             tensor_parallel_size=1,
         )
         kwargs.update(engine_args or {})
-        # enable_prefix_caching has moved and been renamed across releases;
-        # if this build does not accept it, fall back rather than fail, and
-        # record that the control could not be applied.
-        # disable_log_stats=False asks V1 to populate per-request metrics.
-        # V0 filled RequestOutput.metrics unconditionally; V1 does not, and
-        # without this TTFT comes back empty.
-        try:
-            self.llm = LLM(
-                enable_prefix_caching=enable_prefix_caching,
-                disable_log_stats=False,
-                **kwargs,
-            )
-            self.config["prefix_caching_control"] = "applied"
-        except TypeError:
-            self.llm = LLM(**kwargs)
-            self.config["prefix_caching_control"] = "unsupported_by_this_version"
+        self.llm, info = construct_engine(LLM, kwargs, enable_prefix_caching, attention_backend)
+        self.config.update(info)
 
     def describe(self) -> dict:
         """Everything that must travel with the numbers."""
