@@ -36,7 +36,12 @@ requires_gpu = pytest.mark.skipif(
 @pytest.mark.parametrize("arch", ["sm_75", "sm_80"])
 def test_compiles_without_spills_or_shared_memory(arch):
     _, log = pdc.compile_cubin(arch)
-    regs = int(re.search(r"Used (\d+) registers", log).group(1))
+    used = re.search(r"Used (\d+) registers", log)
+    # On Kaggle the sm_75 log once came back without this line while sm_80's
+    # had it. Show the log rather than crash on the missing match: the log
+    # is the evidence for why.
+    assert used, f"no register report in NVRTC's log for {arch}:\n{log or '(empty log)'}"
+    regs = int(used.group(1))
     assert "0 bytes spill stores" in log and "0 bytes spill loads" in log, log
     assert regs <= 200, f"{regs} registers: heading back toward the Triton kernel's 255"
     smem = re.search(r"(\d+) bytes smem", log)

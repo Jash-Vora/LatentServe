@@ -314,9 +314,22 @@ def cuda_section(torch) -> None:
         print(f"  cannot build it here: {str(e).splitlines()[0]}\n"
               f"  pip install {pdc.cupy_package()}")
         return
+    import cupy
+
+    nvrtc_version = "?"
+    try:
+        from cupy_backends.cuda.libs import nvrtc as _nv
+
+        nvrtc_version = ".".join(map(str, _nv.getVersion()))
+    except Exception:  # noqa: BLE001
+        pass
+    print(f"  CuPy {cupy.__version__}, NVRTC {nvrtc_version}")
     report = [l.strip() for l in log.splitlines() if "registers" in l or "spill" in l]
     for line in report:
         print(f"  ptxas: {line}")
+    if not report:
+        print("  ptxas: no register report in NVRTC's log; the full log follows")
+        print("\n".join(f"    | {l}" for l in (log or "(empty log)").splitlines()))
 
     args, _, _ = build_inputs(torch, 5, 1024, False, ragged=[1024, 300, 61, 17, 1], seed=3)
     want = pd.paged_decode_reference(*args, num_splits=1)
