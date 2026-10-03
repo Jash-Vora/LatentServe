@@ -177,3 +177,42 @@ what would fit them — the Phase 16 combination.)
 Fixed along the way: `phase14_fusion` named the loop variable `on`, which
 overwrote the column label, so every saved row since the per-toggle labels
 were added was recorded as `..._True`. Printed tables were unaffected.
+
+## Result: whole decode steps (25% of pages, T4, dense on the CUDA kernel)
+
+Step time saved by sparse decode; round spreads mostly under 0.1 ms.
+
+| batch | 2K | 4K | 8K | 16K | 32K |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1.1% | 1.3% | -0.8% | 1.9% | 8.9% |
+| 2 | 3.4% | 3.8% | 1.7% | 6.2% | 25.3% |
+| 4 | 8.7% | 8.4% | 8.6% | 16.1% | 27.7% |
+| 8 | 5.6% | 8.6% | 17.9% | 29.0% | 41.2% |
+| 16 | 8.5% | 18.2% | 30.0% | 41.6% | does not fit |
+| 32 | 15.9% | 27.3% | 38.3% | does not fit | does not fit |
+
+Largest: batch 8 / 32K 48.83 -> 28.73 ms, batch 16 / 16K 49.08 -> 28.67,
+batch 32 / 8K 52.31 -> 32.25 — 1.6-1.7x faster steps. With sparsity on,
+context barely matters: at batch 16, 2K -> 16K adds 9 ms instead of 28.
+Batch 1 gains least, as every step there is dominated by reading the 3 GB of
+weights. 112 more kernels per step (four per layer: the bound update, the
+indexer, top-k and its index conversion).
+
+## Result: quality through the real GPU path (`phase14_oracle --gpu --quick`)
+
+| budget | KL, reference bounds | KL, GPU path | needles, reference | needles, GPU |
+| ---: | ---: | ---: | ---: | ---: |
+| 50% | 0.0014 | 0.0015 | 9/9 | 9/9 |
+| 25% | 0.0086 | 0.0086 | 9/9 | 9/9 |
+| 12.5% | 0.0339 | 0.0335 | 8/9 | 8/9 |
+| 6.25% | 0.0830 | 0.0830 | 9/9 | 9/9 |
+| 3.1% | 0.1766 | 0.1778 | 5/9 | 6/9 |
+
+fp16 bounds and the per-call budget change nothing measurable: KL agrees to
+two or three significant figures, and at 12.5% both miss the same 16K
+needle. Top-1 agreement is ~1 point lower on the GPU path — one token in
+126, each mode against its own dense baseline.
+
+**Phase 14 operating point: 25% of pages — KL 0.009 and every needle found,
+for up to 1.7x faster decode steps.** 12.5% remains borderline pending the
+full quality run.
