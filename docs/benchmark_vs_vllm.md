@@ -74,3 +74,81 @@ SPEED = ("--abba --throwaway-first --num-requests 16 --batch-sizes 1 4 16 "
 Rough time on a T4: speed ~30 min for LatentServe and ~60 for vLLM (its 8K
 prefill is ~3x slower, and it builds an engine per run); quality ~10 min in
 total. To halve the speed half, drop batch 4 and use `--num-requests 8`.
+
+## A bug the quality benchmark caught
+
+The first quality run returned NaN for every LatentServe metric — perplexity,
+ARC (24%, i.e. always choosing the first option), and generations differing
+at the first token — in both the unfused and fused variants. vLLM's column
+was on par with HF fp16, which showed the harness itself was sound.
+
+**Cause.** `GQAAttention._attend` sent only `attn_impl == "sdpa"` to PyTorch's
+fused attention; anything else fell through to the explicit math path, the
+reference implementation. Phase 11 added `"triton_paged"`, whose Triton
+kernel handles *decode* and returns early — but *prefill* fell through. The
+math path forms q·k in fp16 before scaling; Qwen2.5's massive activations
+(measured in Phase 7) overflow that to inf, and the softmax turns inf into
+NaN. Phase 11's design said prefill stays on SDPA; the code did not.
+
+**Why nothing caught it for three phases.**
+
+* Every test since Phase 11 used a tiny random model, whose activations
+  never overflow, or ran in fp32 on CPU, where nothing does. On CPU the only
+  trace was a 6e-7 difference from Hugging Face where `sdpa` gave exactly 0.
+* The speed harness never checked outputs, and kernel time barely depends on
+  the values it computes.
+* Prefill throughput fell from 5,238 tok/s at 8K (Phase 6, SDPA) to ~2,400
+  in every run since — the math path materialising score matrices — and
+  that drop was never questioned.
+
+**Fix.** Only `"math"` takes the explicit path. Two guards so the class of bug
+cannot hide again: a test at fp16 scale where q·k overflows (mutation-checked:
+reintroducing the bug makes it fail), and the speed harness now refuses to
+time a model whose logits are not finite.
+
+**What survives.** Decode timings are unaffected: decode runs the Triton
+kernel, which never reaches `_attend`, and NaN arithmetic takes the same time
+as any other. LatentServe's prefill and end-to-end figures since Phase 11
+measured the math path and are understated. vLLM's quality results are
+unaffected and reused.
+
+## Results (T4, torch 2.13, vLLM 0.30, same host per table)
+
+### Speed — decode per step, short-long-long-short, both on CUDA graphs
+
+| batch | ctx | LatentServe | vLLM | |
+| ---: | ---: | ---: | ---: | --- |
+| 1 | 2048 | 18.3 ms | 17.6 | 3% slower — LatentServe's own halves differ by 0.6 ms |
+| 1 | 8192 | 21.3 | 23.3 | 9% faster |
+| 4 | 2048 | 22.2 | 23.9 | 7% faster |
+| 4 | 8192 | 35.1 | 42.1 | 17% faster |
+| 16 | 2048 | 38.5 | 42.2 | 9% faster |
+| 16 | 8192 | 81.4 | 107.3 | 24% faster |
+
+Prefill was 2.0-3.3x vLLM's, measured on the math-path bug above, so the
+true figure is higher; it needs one rerun of the LatentServe speed arm to
+state. Decode is unaffected by that bug.
+
+Elementwise fusion is what moved the short-context rows: batch 1 / 2K went
+from 12% behind to 3%, and batch 4 / 2K from 18% behind to 7% ahead.
+
+### Quality — fidelity to the fp32 model
+
+| system | perplexity | KL vs fp32 | top-1 agree | ARC answers changed | gens identical to HF fp16 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HF fp32 | 9.7015 | 0 | 100% | 0 / 300 | — |
+| HF fp16 | 9.7019 | 1.74e-5 | 99.71% | 0 / 300 | — |
+| LatentServe, unfused | 9.7022 | 1.77e-5 | 99.65% | 0 / 300 | 26 / 32 |
+| LatentServe, fused | 9.7015 | 1.76e-5 | 99.69% | 0 / 300 | 26 / 32 |
+| vLLM | 9.7022 | n/a | 99.66% | 1 / 300 | 28 / 32 |
+
+16,368 tokens of Wikitext-2 test; 300 ARC-Easy questions (73.3% acc,
+74.7% acc_norm for every system); 32 prompts x 128 greedy tokens.
+
+**Verdict: on par on every measure, and elementwise fusion costs nothing.**
+KL — the most sensitive measure — is the same across systems to two
+significant figures. The fused variant's perplexity landing exactly on
+fp32's is not evidence of extra accuracy: deviations cancel in an average,
+which is why KL is the number to read. 26 versus 28 identical generations
+out of 32 is within what 32 prompts can resolve, and a divergence between
+two correct fp16 implementations is a near-tie flipping, not an error.

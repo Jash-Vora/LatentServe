@@ -387,7 +387,6 @@ class Int8PagedKVCache:
         self._read_slots = None
         self._write_plan = None
         self._set_finalized(index, 0)
-        self._table_state = [None] * self.spec.max_batch_size
 
     # ------------------------------------------------------------------
     # Allocation — identical to PagedKVCache, plus the K write plan.
@@ -533,7 +532,7 @@ class Int8PagedKVCache:
         self._res_rows_buf[:b].copy_(torch.tensor(active, dtype=torch.int32))
         for row, i in enumerate(active):
             blocks = self.tables[i].blocks
-            state = (i, len(blocks))
+            state = (i, self.tables[i].version)
             if self._table_state[row] != state:
                 if len(blocks) > self._capacity_pages:
                     raise RuntimeError(

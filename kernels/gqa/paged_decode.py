@@ -481,6 +481,22 @@ _SM_COUNT: dict = {}
 # these to explain the kernel's ~47 GB/s ceiling without a profiler.
 LAST_COMPILED: dict = {}
 
+# Which kernel serves eligible fp16 decode: "triton" (this file) or "cuda"
+# (kernels/cuda, Phase 12's CUDA-core kernel). Default from the environment,
+# switchable at runtime. CUDA graphs record whichever ran at capture, so a
+# switch takes effect at the next capture.
+_BACKEND = {"decode": os.environ.get("LATENTSERVE_DECODE_BACKEND", "triton")}
+
+
+def set_decode_backend(name: str) -> None:
+    if name not in ("triton", "cuda"):
+        raise ValueError(f"unknown decode backend {name!r}")
+    _BACKEND["decode"] = name
+
+
+def decode_backend() -> str:
+    return _BACKEND["decode"]
+
 
 def _scratch(key, shape, dtype, device, fill=None):
     """Persistent scratch, one buffer per (name, shape).
@@ -731,6 +747,15 @@ def paged_decode_attention(
     # length as a Python int, so it passes it in.
     if max_seq_len is None:
         max_seq_len = int(seq_lens.max().item())
+    if _BACKEND["decode"] == "cuda":
+        from kernels.cuda import paged_decode_cuda as pdc
+
+        if pdc.eligible(q, k_pool, k_scale, k_residual):
+            # Its own split count: the caller's is tuned for this file's
+            # kernel. Derived from (batch, heads, capacity), so it is fixed
+            # per captured graph.
+            return pdc.paged_decode_cuda(q, k_pool, v_pool, block_tables, seq_lens,
+                                         max_seq_len, softmax_scale=softmax_scale)
     num_pages = (max_seq_len + page - 1) // page
     if num_splits is None:
         # Two constraints, not one. Enough programs to fill the SMs

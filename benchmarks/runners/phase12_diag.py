@@ -265,6 +265,97 @@ def print_census(label, compiled):
           + f"{mma:>9}")
 
 
+def time_in_graph(torch, fn, reps=20, iters=10) -> float:
+    """Milliseconds per call, from replaying `reps` calls captured in one
+    CUDA graph. Production decodes under graphs, so this is the time that
+    matters — and it charges neither backend for Python launch overhead,
+    which for CuPy's argument packing would otherwise swamp a 0.16 ms
+    batch-1 kernel."""
+    fn()
+    torch.cuda.synchronize()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        fn()
+        fn()
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(reps):
+            fn()
+    graph.replay()
+    torch.cuda.synchronize()
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        graph.replay()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / (iters * reps)
+
+
+class _Cubin:
+    """Adapter so the census can read a cubin that did not come from Triton."""
+
+    def __init__(self, cubin):
+        self.asm = {"cubin": cubin, "ptx": ""}
+
+
+def cuda_section(torch) -> None:
+    from kernels.cuda import paged_decode_cuda as pdc
+    from kernels.gqa import paged_decode as pd
+
+    print("\n[5] the CUDA-core kernel (kernels/cuda) against the Triton production kernel\n",
+          flush=True)
+    try:
+        cubin, log = pdc.compile_cubin(
+            "sm_{}{}".format(*torch.cuda.get_device_capability()))
+    except Exception as e:  # noqa: BLE001
+        print(f"  cannot build it here: {str(e).splitlines()[0]}\n"
+              f"  pip install {pdc.cupy_package()}")
+        return
+    report = [l.strip() for l in log.splitlines() if "registers" in l or "spill" in l]
+    for line in report:
+        print(f"  ptxas: {line}")
+
+    args, _, _ = build_inputs(torch, 5, 1024, False, ragged=[1024, 300, 61, 17, 1], seed=3)
+    want = pd.paged_decode_reference(*args, num_splits=1)
+    worst = 0.0
+    for splits in (None, 1, 3, 64):
+        got = pdc.paged_decode_cuda(*args, 1024, num_splits=splits)
+        worst = max(worst, float((got.float() - want.float()).abs().max()))
+    print(f"  correctness (ragged batch, 4 split counts): max abs error {worst:.2e} -> "
+          + ("OK" if worst < 5e-3 else "WRONG - timings below mean nothing"), flush=True)
+
+    print(f"\n  {'batch':>5}{'ctx':>6}  {'triton ms':>10}{'GB/s':>7}   {'cuda ms':>9}{'GB/s':>7}"
+          f"{'splits':>8}   speedup")
+    for batch, ctx in ((1, 2048), (1, 8192), (4, 8192), (16, 8192), (16, 2048)):
+        args, _, kv_bytes = build_inputs(torch, batch, ctx, False)
+        t_ms = time_in_graph(torch, lambda: pd.paged_decode_attention(*args, max_seq_len=ctx))
+        best = None
+        num_pages = -(-ctx // 16)
+        for splits in sorted({pdc.choose_splits(batch, 2, num_pages), 16, 32, 64, 128}):
+            if splits > num_pages:
+                continue
+            c_ms = time_in_graph(torch, lambda s=splits: pdc.paged_decode_cuda(
+                *args, ctx, num_splits=s))
+            if best is None or c_ms < best[0]:
+                best = (c_ms, splits)
+        c_ms, splits = best
+        auto = " (auto)" if splits == pdc.choose_splits(batch, 2, num_pages) else ""
+        print(f"  {batch:>5}{ctx:>6}  {t_ms:>10.3f}{kv_bytes / t_ms / 1e6:>7.0f}   "
+              f"{c_ms:>9.3f}{kv_bytes / c_ms / 1e6:>7.0f}{splits:>8}{auto:<7}{t_ms / c_ms:>6.2f}x",
+              flush=True)
+
+    print("\n  census of the CUDA kernel's machine code:")
+    print(f"  {'kernel':<26}" + "".join(f"{k.replace(' ', ''):>8}" for k in CENSUS)
+          + f"{'PTX mma':>9}")
+    print_census("cuda fp16", _Cubin(cubin))
+    print("\n  Loads-only reached ~243 GB/s at batch 16 / 8K: that is the ceiling to\n"
+          "  compare the CUDA column against. Splits shown are the fastest of those\n"
+          "  tried; '(auto)' means the kernel's own choice was already the best.")
+
+
 def child(variant: str) -> int:
     import torch
 
@@ -308,6 +399,8 @@ def main() -> int:
     p.add_argument("--child", default=None, help=argparse.SUPPRESS)
     p.add_argument("--skip-ncu", action="store_true")
     p.add_argument("--ctx", type=int, default=8192)
+    p.add_argument("--cuda", action="store_true",
+                   help="just section [5], the CUDA-core kernel against Triton: about a minute")
     p.add_argument("--census-only", action="store_true",
                    help="just the machine-code census: seconds, not minutes")
     args = p.parse_args()
@@ -322,7 +415,7 @@ def main() -> int:
     print(f"device: {torch.cuda.get_device_name(0)}  torch {torch.__version__}", flush=True)
     ctx = args.ctx
 
-    if args.census_only:
+    if args.census_only or args.cuda:
         args.skip_ncu = True
     status, ncu = ("skipped", None) if args.skip_ncu else ncu_status()
     print(f"\n[0/4] Nsight Compute: {status}" + (f" ({ncu})" if ncu else ""), flush=True)
@@ -332,6 +425,9 @@ def main() -> int:
 
     if args.census_only:
         _census_section(torch, pd, ab)
+        return 0
+    if args.cuda:
+        cuda_section(torch)
         return 0
 
     print("\n[1/4] correctness of every variant against the reference (ragged batch)", flush=True)
@@ -371,6 +467,7 @@ def main() -> int:
         print(flush=True)
 
     _census_section(torch, pd, ab)
+    cuda_section(torch)
     _reading()
     if status == "usable":
         profile_with_ncu(ncu)

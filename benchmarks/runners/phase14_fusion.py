@@ -104,7 +104,7 @@ def main() -> int:
     p.add_argument("--context-lengths", type=int, nargs="+", default=[2048, 8192])
     p.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4, 16])
     p.add_argument("--block-size", type=int, default=16)
-    p.add_argument("--toggle", choices=["projections", "elementwise", "int8"],
+    p.add_argument("--toggle", choices=["projections", "elementwise", "int8", "cuda_decode"],
                    default="projections",
                    help="which fusion to A/B. 'elementwise' keeps projections fused on both "
                    "sides, so it measures elementwise fusion alone, on top of 14a.")
@@ -134,12 +134,22 @@ def main() -> int:
     def set_int8(on: bool) -> None:
         MODE["kv_dtype"] = "int8" if on else "fp16"
 
-    if args.toggle == "int8":
-        # INT8 is measured on the best model there is: projections and
-        # elementwise both fused, on both sides.
+    def set_cuda_decode(on: bool) -> None:
+        from kernels.gqa.paged_decode import set_decode_backend
+
+        set_decode_backend("cuda" if on else "triton")
+
+    if args.toggle in ("int8", "cuda_decode"):
+        # Measured on the best model there is: projections and elementwise
+        # both fused, on both sides.
         model.set_elementwise(True)
     switch = {"projections": model.set_fused, "elementwise": model.set_elementwise,
-              "int8": set_int8}[args.toggle]
+              "int8": set_int8, "cuda_decode": set_cuda_decode}[args.toggle]
+    # Column names that say what is compared. Every toggle used to print
+    # "unfused / fused", which for --toggle int8 meant fp16 / INT8 cache and
+    # read as something else entirely.
+    off, on = {"projections": ("unfused", "fused"), "elementwise": ("unfused", "fused"),
+               "int8": ("fp16", "int8"), "cuda_decode": ("triton", "cuda")}[args.toggle]
     writer = ResultWriter(results_dir=args.results_dir)
 
     # The mechanism, before the timing: if the kernel count does not fall
@@ -150,9 +160,9 @@ def main() -> int:
     switch(True)
     k_fused = kernels_per_step(model, 1, ctx0, args.block_size)
     print(f"CUDA kernels per decode step (batch 1, ctx {ctx0}): "
-          f"unfused {k_unfused}, fused {k_fused}  ({k_unfused - k_fused} fewer)\n")
+          f"{off} {k_unfused}, {on} {k_fused}  ({k_unfused - k_fused} fewer)\n")
 
-    print(f"{'batch':>5}{'ctx':>7}{'unfused ms':>12}{'fused ms':>10}{'saved ms':>10}"
+    print(f"{'batch':>5}{'ctx':>7}{off + ' ms':>12}{on + ' ms':>10}{'saved ms':>10}"
           f"{'saved':>8}{'round spread ms':>17}")
     for batch in args.batch_sizes:
         for ctx in args.context_lengths:
@@ -168,20 +178,22 @@ def main() -> int:
             u_med, f_med = statistics.median(unfused), statistics.median(fused)
             print(f"{batch:>5}{ctx:>7}{u_med:>12.2f}{f_med:>10.2f}{saved:>10.2f}"
                   f"{saved / u_med:>8.1%}{spread:>17.2f}")
-            for label, value in (("unfused", u_med), ("fused", f_med)):
+            for label, value in ((off, u_med), (on, f_med)):
                 writer.write(BenchmarkResult(
                     system=f"latentserve_kernel_graphed_{args.toggle}_{label}",
                     tag="phase14_fusion",
                     attention="gqa", model=cfg.model.name, batch_size=batch,
                     context_length=ctx, output_length=args.steps, num_gpus=1,
                     tpot_ms=value, seed=0,
-                    extra={"status": "ok", "fused": label == "fused", "rounds": args.rounds,
+                    extra={"status": "ok", "fused": label == on, "rounds": args.rounds,
                            "saved_ms_median": saved, "saved_ms_spread": spread,
                            "kernels_unfused": k_unfused, "kernels_fused": k_fused},
                 ))
-    switch(True)
-    print("\nA saving smaller than its round spread is not a saving. The prediction was\n"
-          "most of a ~1.5 ms gap at batch 1, roughly constant in ms across contexts.")
+    if args.toggle == "cuda_decode":
+        switch(False)       # leave the process on the default backend
+    else:
+        switch(True)
+    print("\nA saving smaller than its round spread is not a saving.")
     return 0
 
 

@@ -202,7 +202,6 @@ class PagedKVCache:
         batch — and the reason paging survives churn."""
         self.tables[index].free()
         self._read_slots_dirty = True
-        self._table_state[index] = None
 
     # ------------------------------------------------------------------
     # Allocation
@@ -284,7 +283,7 @@ class PagedKVCache:
         b = len(active)
         for row, i in enumerate(active):
             blocks = self.tables[i].blocks
-            state = (i, len(blocks))
+            state = (i, self.tables[i].version)
             # A row changes only when its sequence gains a page (every
             # block_size tokens) or the slot is reassigned to a different
             # sequence — not on every token.

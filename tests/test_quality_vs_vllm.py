@@ -28,6 +28,23 @@ def test_nll_top1_kl_against_hand_computation():
     assert kl == pytest.approx([0.0, 0.0], abs=1e-6)        # identical to itself
 
 
+def test_slicing_changes_no_score():
+    """Scoring in slices must give exactly what scoring the whole sequence
+    gives — that is what makes the memory fix free."""
+    torch.manual_seed(4)
+    logits, ids = torch.randn(9, 7), torch.randint(0, 7, (9,))
+    ref = torch.log_softmax(torch.randn(8, 7), -1)
+    whole = q.nll_top1_kl(logits, ids, ref)
+    parts = [[], [], []]
+    for a in range(0, 8, 3):
+        b = min(a + 3, 8)
+        n, t1, kl, _ = q.score_positions(logits[a:b], ids[a + 1 : b + 1], ref[a:b])
+        for acc, piece in zip(parts, (n, t1, kl)):
+            acc += piece
+    for got, want in zip(parts, whole):
+        assert got == pytest.approx(want)
+
+
 def test_continuation_logprob_scores_only_the_continuation():
     logits = torch.zeros(4, 5)
     logits[1, 3] = 10.0                                     # predicts token 3 at pos 2
@@ -71,7 +88,7 @@ def test_latentserve_arm_and_compare_end_to_end(tmp_path, capsys):
             self.shape = ModelShape(2, 8, 2, 16, 128, 128, 2048, "torch.float32")
 
     class Args:
-        chunks, chunk_len, mc_items = 2, 48, 4
+        chunks, chunk_len, mc_items, score_slice = 2, 48, 4, 10
         gen_prompts, gen_prompt_len, gen_new_tokens, gen_batch = 3, 10, 12, 2
         synthetic, results_dir = True, str(tmp_path)
 
@@ -93,3 +110,4 @@ def test_latentserve_arm_and_compare_end_to_end(tmp_path, capsys):
     assert "synthetic data" in out
     for section in ("perplexity", "ARC-Easy", "Generation", "fused vs vllm"):
         assert section in out
+

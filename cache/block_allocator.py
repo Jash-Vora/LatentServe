@@ -156,6 +156,15 @@ class BlockTable:
     allocator: BlockAllocator
     blocks: list[int] = field(default_factory=list)
     length: int = 0
+    # Bumped on every change to `blocks`. Consumers that mirror the table
+    # elsewhere — the kernel's persistent block-table rows — key on it.
+    # Keying on (slot, number of blocks) instead was a real bug: a finished
+    # request's slot, reused by a new request with the same block count in
+    # the same batch row, kept the old request's blocks, and the kernel
+    # attended over the previous request's cache. The allocator's LIFO free
+    # list even handed back the same ids in reverse order, so it looked
+    # plausible. A uniform burst workload — every benchmark — triggers it.
+    version: int = 0
 
     @property
     def capacity(self) -> int:
@@ -175,6 +184,7 @@ class BlockTable:
         needed = self.allocator.blocks_for_tokens(self.length + num_tokens)
         if needed > len(self.blocks):
             self.blocks.extend(self.allocator.allocate(needed - len(self.blocks)))
+            self.version += 1
 
     def append(self, num_tokens: int) -> None:
         self.reserve(num_tokens)
@@ -195,3 +205,4 @@ class BlockTable:
         self.allocator.free(self.blocks)
         self.blocks = []
         self.length = 0
+        self.version += 1
