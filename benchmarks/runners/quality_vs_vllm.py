@@ -356,9 +356,11 @@ def run_latentserve_arm(args, load_reference) -> dict:
             done = {r.request_id: r.output_ids for r in engine.run()}
             gens[name] = [done[i][:n] for i in range(len(data["gen_prompts"]))]
 
+    from kernels.gqa import paged_decode as _pd
+
     summary = {"argmax32": argmax32, "mc_preds": preds, "generations": gens,
                "metrics": {s: _metrics(res[s]) for s in res},
-               "data_source": data["source"]}
+               "data_source": data["source"], "decode_backend": _pd.decode_backend()}
     (out_dir / RESULTS[1]).write_text(json.dumps(summary))
     _print_arm("latentserve arm", summary["metrics"])
     return summary
@@ -469,6 +471,8 @@ def compare(args) -> int:
 
     ref = metrics["hf_fp16"]
     ppl32 = metrics["hf_fp32"]["perplexity"]
+    print(f"LatentServe decode attention: {ls_side.get('decode_backend', 'triton (not recorded)')}"
+          " — only the generation test runs through it\n")
     print(f"Text: {metrics['hf_fp32']['tokens']} tokens of "
           f"{ls_side.get('data_source', {}).get('text', '?')}; "
           f"fp32 perplexity {ppl32:.4f}\n")
@@ -527,6 +531,8 @@ def main() -> int:
     p.add_argument("--score-slice", type=int, default=128,
                    help="positions turned into logits at a time; bounds peak memory")
     p.add_argument("--synthetic", action="store_true", help="random tokens; smoke test only")
+    p.add_argument("--decode-backend", default=None, choices=["triton", "cuda"],
+                   help="LatentServe's decode attention kernel; recorded with the results")
     p.add_argument("--results-dir", default="results/raw/quality")
     args = p.parse_args()
 
@@ -537,6 +543,10 @@ def main() -> int:
         return 0
     if args.system == "latentserve":
         from config import load_config
+        from kernels.gqa import paged_decode as _pd
+
+        if args.decode_backend:
+            _pd.set_decode_backend(args.decode_backend)
         from model.qwen import QwenReference
 
         cfg = load_config(args.config)

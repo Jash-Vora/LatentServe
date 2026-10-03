@@ -319,6 +319,10 @@ def main() -> int:
                    help="per-phase breakdown of every LatentServe decode step")
     p.add_argument("--fuse-elementwise", action="store_true",
                    help="Phase 14a step 2: fused norms, RoPE and SiLU-and-multiply")
+    p.add_argument("--decode-backend", default=None, choices=["triton", "cuda"],
+                   help="LatentServe's decode attention kernel. Defaults to the "
+                   "LATENTSERVE_DECODE_BACKEND environment variable, else triton. 'cuda' "
+                   "(kernels/cuda) appends _cudadecode to the system label.")
     p.add_argument("--kv-dtype", default="fp16", choices=["fp16", "int8"],
                    help="Phase 14c: INT8 KV cache (graph-capturable in deferred mode)")
     p.add_argument("--fuse-projections", action="store_true",
@@ -348,6 +352,24 @@ def main() -> int:
     }[(args.attn_impl, args.cuda_graphs)] + ("_fused" if args.fuse_projections else "") + (
         "_elementwise" if args.fuse_elementwise else "") + (
         "_int8" if args.kv_dtype == "int8" else "")
+
+    from kernels.gqa import paged_decode as _pd
+
+    if args.decode_backend:
+        _pd.set_decode_backend(args.decode_backend)
+    # The label must say which attention kernel produced the row: a row from
+    # the CUDA kernel under the Triton label would be compared, and written
+    # up, as something it is not. INT8 caches stay on Triton (the CUDA kernel
+    # is fp16-only), so they keep the plain label.
+    if _pd.decode_backend() == "cuda" and args.system != "vllm":
+        if args.kv_dtype == "fp16":
+            from kernels.cuda import paged_decode_cuda as _pdc
+
+            _pdc.compile_cubin()          # fail now, loudly, if CuPy/NVRTC are missing
+            ls_label += "_cudadecode"
+        else:
+            print("[WARN] --decode-backend cuda with an INT8 cache: INT8 runs on Triton",
+                  file=sys.stderr)
 
     import torch
 
