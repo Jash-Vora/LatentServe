@@ -152,3 +152,121 @@ fp32's is not evidence of extra accuracy: deviations cancel in an average,
 which is why KL is the number to read. 26 versus 28 identical generations
 out of 32 is within what 32 prompts can resolve, and a divergence between
 two correct fp16 implementations is a near-tie flipping, not an error.
+
+## Default vLLM, and the best vLLM that runs
+
+The comparison above is against vLLM's defaults, with two fairness pins:
+`max_num_seqs` equal to the batch size, and prefix caching off. Everything
+else — scheduler, compilation, CUDA graphs, memory utilisation, and the
+attention backend — is vLLM's own choice. On a T4 that last one matters most:
+FlashAttention needs Ampere, so vLLM falls back to a Triton backend, and
+Phase 12 found Triton compiles attention without tensor cores on this GPU.
+LatentServe's high-batch, long-context lead is largely its CUDA-core kernel
+against that fallback, so a better vLLM backend could shrink it.
+
+`benchmarks/runners/vllm_backend_probe.py` starts vLLM once per candidate
+backend, records whether it runs and what vLLM's log says it used, and times
+decode at two points. The fastest that runs becomes a second vLLM arm:
+
+    --vllm-attention-backend NAME     rows labelled vllm_<name>
+    --compare --baseline vllm_<name>  LatentServe measured against that arm
+
+A tuned arm must be compared with LatentServe rows from the same machine and
+session: rows from different hosts are never paired.
+
+### Knobs besides the backend
+
+Most of vLLM's settings cannot move per-step decode time in this benchmark:
+memory utilisation sizes a KV pool that never fills (the largest case needs
+~3.8 GB of ~8-9 GB), `max_num_seqs` is pinned to the batch, prefix caching
+has nothing to share, and chunked-prefill limits shape prefill, which the
+decode measurement cancels. Two could move batch-1 latency, so the probe
+tests them as variants — `BACKEND[+knob...]`:
+
+| knob | engine setting | why it might matter |
+| --- | --- | --- |
+| `full_graphs` | `cudagraph_mode=FULL_DECODE_ONLY` | whole decode step in one graph, attention included |
+| `piecewise` | `cudagraph_mode=PIECEWISE` | attention eager between graph pieces: shows what the default does |
+| `async` | `async_scheduling=True` | next step prepared on the CPU while the GPU runs this one |
+
+The probe also reads the graph mode vLLM printed at startup, so the default
+is reported rather than assumed. The winner runs in the full comparison as
+`--vllm-variant <variant>`, labelled `vllm_<variant>`.
+
+## Results with the CUDA-core decode kernel (same session, default vLLM)
+
+| | vs vLLM |
+| --- | --- |
+| decode latency, batch 1 / 2K | parity (0%) |
+| decode latency, batch 1 / 8K | 22% faster |
+| decode throughput, batch 16 / 2K | 1.91x |
+| decode throughput, batch 16 / 8K | 2.78x |
+| prefill | 2.7-6.0x (on the corrected SDPA path; was 2.0-3.3x on the math path) |
+| end-to-end, batch 16 | 2.29x at 2K, 5.16x at 8K — mostly a prefill result |
+
+Quality with the CUDA kernel: unchanged on text and ARC, which do not run
+through decode; greedy generation matches HF fp16 on 26 of 32 prompts (26
+before, with Triton; vLLM 28). On par.
+
+## What the first backend probe showed
+
+vLLM's default on a T4 is TRITON_ATTN, as its log reports. The probe asked
+for FLASHINFER, FLEX_ATTENTION, TORCH_SDPA and XFORMERS through the
+`VLLM_ATTENTION_BACKEND` variable, every one ran, and vLLM's log reported
+TRITON_ATTN for all of them: this version no longer reads the variable.
+Without reading the log, those rows would have been reported as four other
+backends. They are repeat measurements of Triton.
+
+The runner now tries each route this vLLM might accept — an
+`attention_backend` engine option, then `attention_config`, then the
+variable — skips a route only when the engine says that option is unknown,
+and records every rejection. Rows where vLLM still runs something other than
+what was asked are marked IGNORED and can never be chosen as a winner. The
+old prefix-caching fallback, which retried on *any* TypeError and would have
+dropped an unknown attention option silently, now fires only for its own
+argument.
+
+## The first probe's table, read correctly
+
+All eleven rows ran TRITON_ATTN (the environment variable was ignored), so
+six of them were the identical configuration measured six times: 44.2-48.0
+ms at batch 16 / 2K and 22.4-24.5 ms at batch 1 / 8K, an 8-9% spread. The
+`auto` row's 27.0 ms at batch 16 / 2K was the same configuration again — an
+outlier, not a winner. The rows that measured fastest were the ones whose
+startup took longest (221 s and 173 s, compiling while the GPU idled and
+cooled): the boost-clock artifact once more, in a tool that had none of the
+main benchmark's protections.
+
+What holds: vLLM's default on a T4 is TRITON_ATTN with FULL_AND_PIECEWISE
+graphs, which already captures whole decode steps, so the graph knobs have
+nothing to add, and async scheduling showed nothing beyond the noise. The
+probe now settles the GPU before each variant, measures each point
+short-long-long-short, brackets the run with the default first and last,
+and reports the noise it measured instead of assuming one.
+
+## Backend probe, with settling and bracketing (T4, vLLM 0.30)
+
+| variant | batch 16 / 2K | batch 1 / 8K | vLLM's log |
+| --- | ---: | ---: | --- |
+| default (first) | 42.7 ms | 22.8 | TRITON_ATTN |
+| FLASHINFER | failed at engine start | | — |
+| FLEX_ATTENTION | 290.4 | 84.2 | FLEX_ATTENTION (via `attention_backend`) |
+| default (last) | 39.0 | 23.6 | TRITON_ATTN |
+
+Measured noise: a row's two halves differ by up to 6.6%; the default drifted
+8.7% between its first and last run. The `attention_backend` engine option
+is the route this vLLM accepts. FLEX_ATTENTION runs and is about 7x slower
+at batch 16 / 2K. FlashInfer (0.6.18.post1, the version vLLM pins) failed
+during engine start-up; its root cause was not captured by that probe run,
+which now saves every variant's full log to results/probe_logs/.
+
+FlashInfer's root cause, from the engine log: `ValueError: Selected backend
+AttentionBackendEnum.FLASHINFER is not valid for this configuration. Reason:
+['compute capability not supported']` — vLLM's own support check, raised
+while building the attention layers, before any kernel is compiled. vLLM
+0.30 does not offer FlashInfer on Turing; there is nothing to fix.
+
+On a T4, then: TRITON_ATTN (the default) runs; FLEX_ATTENTION runs about 7x
+slower; FLASHINFER is refused; FLASH_ATTN needs Ampere. XFORMERS and
+TORCH_SDPA, and the graph and async knobs, remain to be measured through the
+working route and the settled probe.

@@ -750,12 +750,16 @@ def paged_decode_attention(
     if _BACKEND["decode"] == "cuda":
         from kernels.cuda import paged_decode_cuda as pdc
 
-        if pdc.eligible(q, k_pool, k_scale, k_residual):
+        if pdc.eligible(q, k_pool, k_scale, k_residual, v_scale=v_scale, k_zero=k_zero,
+                        v_zero=v_zero, res_rows=res_rows):
             # Its own split count: the caller's is tuned for this file's
             # kernel. Derived from (batch, heads, capacity), so it is fixed
-            # per captured graph.
+            # per captured graph. INT8 pages go to the INT8 variant.
             return pdc.paged_decode_cuda(q, k_pool, v_pool, block_tables, seq_lens,
-                                         max_seq_len, softmax_scale=softmax_scale)
+                                         max_seq_len, softmax_scale=softmax_scale,
+                                         k_scale=k_scale, v_scale=v_scale, k_zero=k_zero,
+                                         v_zero=v_zero, k_residual=k_residual,
+                                         res_rows=res_rows)
     num_pages = (max_seq_len + page - 1) // page
     if num_splits is None:
         # Two constraints, not one. Enough programs to fill the SMs

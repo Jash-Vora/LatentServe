@@ -104,6 +104,9 @@ def main() -> int:
     p.add_argument("--context-lengths", type=int, nargs="+", default=[2048, 8192])
     p.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4, 16])
     p.add_argument("--block-size", type=int, default=16)
+    p.add_argument("--decode-backend", default=None, choices=["triton", "cuda"],
+                   help="decode attention kernel for both sides; with --toggle int8 and "
+                   "cuda, fp16 and INT8 caches are compared on the CUDA kernel")
     p.add_argument("--toggle", choices=["projections", "elementwise", "int8", "cuda_decode"],
                    default="projections",
                    help="which fusion to A/B. 'elementwise' keeps projections fused on both "
@@ -133,6 +136,12 @@ def main() -> int:
     # projections-fused.
     def set_int8(on: bool) -> None:
         MODE["kv_dtype"] = "int8" if on else "fp16"
+
+    if args.decode_backend:
+        from kernels.gqa.paged_decode import set_decode_backend as _sdb
+
+        _sdb(args.decode_backend)
+        print(f"decode attention kernel: {args.decode_backend}")
 
     def set_cuda_decode(on: bool) -> None:
         from kernels.gqa.paged_decode import set_decode_backend
@@ -180,7 +189,8 @@ def main() -> int:
                   f"{saved / u_med:>8.1%}{spread:>17.2f}")
             for label, value in ((off, u_med), (on, f_med)):
                 writer.write(BenchmarkResult(
-                    system=f"latentserve_kernel_graphed_{args.toggle}_{label}",
+                    system=(f"latentserve_kernel_graphed_{args.toggle}_{label}"
+                            + (f"_{args.decode_backend}decode" if args.decode_backend else "")),
                     tag="phase14_fusion",
                     attention="gqa", model=cfg.model.name, batch_size=batch,
                     context_length=ctx, output_length=args.steps, num_gpus=1,

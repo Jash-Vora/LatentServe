@@ -132,10 +132,21 @@ def reported_graph_mode(log: str) -> str | None:
     return m.group(1) if m else None
 
 
+GENERIC = ("Engine core initialization failed", "See root cause above")
+
+
 def failure_reason(log: str) -> str:
-    for line in reversed(log.strip().splitlines()):
-        if re.search(r"(Error|Exception|error:|not supported|Invalid)", line):
-            return line.strip()[:110]
+    """The most specific error line. vLLM's last line is often a wrapper
+    ("Engine core initialization failed. See root cause above") pointing
+    back at the real cause, so wrappers are skipped when anything else
+    matches."""
+    errors = [line.strip() for line in log.strip().splitlines()
+              if re.search(r"(Error|Exception|error:|not supported|Invalid)", line)]
+    specific = [e for e in errors if not any(g in e for g in GENERIC)]
+    if specific:
+        return specific[-1][:160]
+    if errors:
+        return errors[-1][:160]
     tail = log.strip().splitlines()
     return tail[-1][:110] if tail else "(no output)"
 
@@ -147,6 +158,8 @@ def main() -> int:
                    help="variants: BACKEND[+knob...], knobs: full_graphs, piecewise, async")
     p.add_argument("--config", default="configs/phase6_vllm.yaml")
     p.add_argument("--timeout", type=int, default=1200)
+    p.add_argument("--log-dir", default="results/probe_logs",
+                   help="each variant's full log is saved here")
     p.add_argument("--settle", type=float, default=30.0,
                    help="seconds of sustained GPU load before each variant is timed")
     args = p.parse_args()
@@ -159,6 +172,8 @@ def main() -> int:
         variants.append("auto")
 
     rows = []
+    os.makedirs(args.log_dir, exist_ok=True)
+    seen: dict = {}
     for backend in variants:
         print(f"[probe] {backend} ...", flush=True)
         env = dict(os.environ)
@@ -172,6 +187,14 @@ def main() -> int:
             log = out.stdout + "\n" + out.stderr
         except subprocess.TimeoutExpired as e:
             log = f"{e.stdout or ''}\n{e.stderr or ''}\nTIMEOUT after {args.timeout}s"
+        # The full log, always: FlashInfer's first failure reported only
+        # "Engine core initialization failed. See root cause above", and the
+        # root cause above was not kept anywhere.
+        seen[backend] = seen.get(backend, 0) + 1
+        name = backend.replace("+", "_") + (f"_{seen[backend]}" if seen[backend] > 1 else "")
+        log_path = os.path.join(args.log_dir, f"{name}.log")
+        with open(log_path, "w") as f:
+            f.write(log)
         result = None
         for line in log.splitlines():
             if line.startswith("PROBE_RESULT "):
@@ -186,7 +209,8 @@ def main() -> int:
         print(f"        {'ran' if r['ok'] else 'FAILED'} in {r['seconds']:.0f}s; vLLM reported: "
               f"{', '.join(r['reported']) or '(nothing)'}"
               + (f"; backend set via {route}" if route and route != "not requested" else "")
-              + ("" if r["ok"] else f"\n        {r['reason']}"), flush=True)
+              + ("" if r["ok"] else f"\n        {r['reason']}\n        full log: {log_path}"),
+              flush=True)
         for line in log.splitlines():
             if "attention route" in line and "rejected" in line:
                 print(f"        {line.split('] ', 1)[-1][:150]}", flush=True)
@@ -216,6 +240,9 @@ def main() -> int:
             best = min(ran, key=lambda r: r["result"]["decode_ms"][k])
             auto = next((r for r in ran if r["backend"] == "auto"), None)
             gain = ""
+            if best["backend"] == "auto":
+                print(f"fastest at {k}: the default (auto)")
+                continue
             if auto and best is not auto:
                 a, b = auto["result"]["decode_ms"][k], best["result"]["decode_ms"][k]
                 gain = f"  ({(a - b) / a:.1%} faster than the default)"

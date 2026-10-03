@@ -127,3 +127,16 @@ def test_a_backend_that_fails_to_start_is_an_error_not_a_fallback():
     with pytest.raises(RuntimeError, match="not supported"):
         construct_engine(_fake_llm(fail=RuntimeError("FLASHINFER not supported on sm_75")),
                          {"model": "m"}, False, "FLASHINFER")
+
+
+def test_failure_reason_skips_the_generic_wrapper_for_the_real_cause():
+    log = ("(EngineCore) ValueError: FlashInfer requires compute capability >= 8.0, got 7.5\n"
+           "Traceback (most recent call last):\n"
+           "RuntimeError: Engine core initialization failed. See root cause above. "
+           "Failed core proc(s): {}")
+    assert "compute capability" in failure_reason(log)
+
+
+def test_failure_reason_falls_back_to_the_wrapper_when_it_is_all_there_is():
+    log = "RuntimeError: Engine core initialization failed. See root cause above."
+    assert failure_reason(log).startswith("RuntimeError: Engine core")

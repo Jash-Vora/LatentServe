@@ -221,7 +221,14 @@ def sass_census(compiled) -> dict | None:
         out = subprocess.run([tool, "-c", path], capture_output=True, text=True, timeout=60)
     finally:
         os.unlink(path)
-    return parse_sass(out.stdout)
+    counts = parse_sass(out.stdout)
+    if not counts.get("total"):
+        # nvdisasm 12.8 cannot read a cubin from NVRTC 13.0: it prints nothing
+        # and the first census of the CUDA kernel came out as a row of zeros —
+        # which looks like data. Say why instead.
+        reason = (out.stderr or "").strip().splitlines()
+        return {"error": reason[0][:70] if reason else f"nvdisasm read nothing (exit {out.returncode})"}
+    return counts
 
 
 def parse_sass(text: str) -> dict:
@@ -258,6 +265,9 @@ def print_census(label, compiled):
     c = sass_census(compiled)
     if c is None:
         print(f"  {label:<26} (no cubin or nvdisasm)")
+        return
+    if "error" in c:
+        print(f"  {label:<26} (unreadable: {c['error']})")
         return
     ptx = (getattr(compiled, "asm", None) or {}).get("ptx", "") or ""
     mma = ptx.count("mma.sync") + ptx.count("wgmma") + ptx.count("mma.")
@@ -369,6 +379,61 @@ def cuda_section(torch) -> None:
     print("\n  Loads-only reached ~243 GB/s at batch 16 / 8K: that is the ceiling to\n"
           "  compare the CUDA column against. Splits shown are the fastest of those\n"
           "  tried; '(auto)' means the kernel's own choice was already the best.")
+    int8_section(torch)
+
+
+def int8_section(torch) -> None:
+    """The INT8 CUDA kernel against Triton INT8 and against CUDA fp16.
+
+    Production layout: symmetric, the last page's K in the fp16 residual.
+    Both register bounds are timed — unbounded (no spills, 10 warps/SM) and
+    bounded to fp16's 168 registers (12 warps, small spills) — because which
+    wins depends on the GPU, not on the compiler's report.
+    """
+    from kernels.cuda import paged_decode_cuda as pdc
+    from kernels.gqa import paged_decode as pd
+
+    print("\n[6] INT8 cache on the CUDA kernel (symmetric, last page in the fp16 residual)\n",
+          flush=True)
+    for mb in (1, 12):
+        try:
+            r = pdc.kernel_resources(variant="int8", has_res=True, min_blocks=mb)
+            print(f"  min_blocks {mb:>2}: driver reports {r['regs']} registers, "
+                  f"{r['local_bytes']} bytes local (spill) memory, {r['shared_bytes']} bytes shared")
+        except Exception as e:  # noqa: BLE001
+            print(f"  min_blocks {mb:>2}: cannot build: {str(e).splitlines()[0][:90]}")
+            return
+
+    args, extra, _ = build_inputs(torch, 5, 1024, True, ragged=[1024, 300, 61, 17, 1], seed=4)
+    want = pd.paged_decode_reference(*args, num_splits=1, **extra)
+    worst = 0.0
+    for mb in (1, 12):
+        for splits in (None, 3, 64):
+            got = pdc.paged_decode_cuda(*args, 1024, num_splits=splits, min_blocks=mb, **extra)
+            worst = max(worst, float((got.float() - want.float()).abs().max()))
+    print(f"  correctness (ragged, 2 bounds x 3 split counts): max abs error {worst:.2e} -> "
+          + ("OK" if worst < 5e-3 else "WRONG - timings below mean nothing"), flush=True)
+
+    print(f"\n  {'batch':>5}{'ctx':>6}  {'triton int8':>12}  {'cuda int8 b1':>13}  "
+          f"{'cuda int8 b12':>14}  {'cuda fp16':>10}   int8 vs fp16 (cuda)")
+    before = pd.decode_backend()
+    try:
+        for batch, ctx in ((1, 2048), (1, 8192), (4, 8192), (16, 8192), (16, 2048)):
+            a8, e8, _ = build_inputs(torch, batch, ctx, True)
+            a16, _, _ = build_inputs(torch, batch, ctx, False)
+            pd.set_decode_backend("triton")
+            tri = time_in_graph(torch, lambda: pd.paged_decode_attention(*a8, max_seq_len=ctx, **e8))
+            c1 = time_in_graph(torch, lambda: pdc.paged_decode_cuda(*a8, ctx, min_blocks=1, **e8))
+            c12 = time_in_graph(torch, lambda: pdc.paged_decode_cuda(*a8, ctx, min_blocks=12, **e8))
+            f16 = time_in_graph(torch, lambda: pdc.paged_decode_cuda(*a16, ctx))
+            best = min(c1, c12)
+            print(f"  {batch:>5}{ctx:>6}  {tri:>10.3f}ms  {c1:>11.3f}ms  {c12:>12.3f}ms  "
+                  f"{f16:>8.3f}ms   {f16 / best:>5.2f}x  (best bound: {'b1' if c1 <= c12 else 'b12'})",
+                  flush=True)
+    finally:
+        pd.set_decode_backend(before)
+    print("\n  'int8 vs fp16' above 1.00x means INT8 decodes faster than fp16 on the same\n"
+          "  kernel design: the bytes it saves now buy time, not just memory.")
 
 
 def child(variant: str) -> int:
@@ -414,6 +479,8 @@ def main() -> int:
     p.add_argument("--child", default=None, help=argparse.SUPPRESS)
     p.add_argument("--skip-ncu", action="store_true")
     p.add_argument("--ctx", type=int, default=8192)
+    p.add_argument("--int8", action="store_true",
+                   help="just section [6], the INT8 CUDA kernel: about a minute")
     p.add_argument("--cuda", action="store_true",
                    help="just section [5], the CUDA-core kernel against Triton: about a minute")
     p.add_argument("--census-only", action="store_true",
@@ -430,7 +497,7 @@ def main() -> int:
     print(f"device: {torch.cuda.get_device_name(0)}  torch {torch.__version__}", flush=True)
     ctx = args.ctx
 
-    if args.census_only or args.cuda:
+    if args.census_only or args.cuda or args.int8:
         args.skip_ncu = True
     status, ncu = ("skipped", None) if args.skip_ncu else ncu_status()
     print(f"\n[0/4] Nsight Compute: {status}" + (f" ({ncu})" if ncu else ""), flush=True)
@@ -443,6 +510,9 @@ def main() -> int:
         return 0
     if args.cuda:
         cuda_section(torch)
+        return 0
+    if args.int8:
+        int8_section(torch)
         return 0
 
     print("\n[1/4] correctness of every variant against the reference (ragged batch)", flush=True)

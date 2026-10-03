@@ -25,9 +25,17 @@ from typing import Optional
 
 import torch
 
-SOURCE = pathlib.Path(__file__).with_name("paged_decode_fp16.cu")
-KERNEL = "paged_decode_fp16"
+SOURCES = {"fp16": pathlib.Path(__file__).with_name("paged_decode_fp16.cu"),
+           "int8": pathlib.Path(__file__).with_name("paged_decode_int8.cu")}
+KERNELS = {"fp16": "paged_decode_fp16", "int8": "paged_decode_int8"}
+SOURCE, KERNEL = SOURCES["fp16"], KERNELS["fp16"]      # kept for older callers
 TOKG = 4            # tokens per half-warp per softmax group: 168 registers, no spills
+# INT8 register bound (see MIN_BLOCKS in paged_decode_int8.cu): 1 leaves the
+# compiler free — 199 registers, no spills, 10 warps/SM for the production
+# variant — and 12 holds it to fp16's 168 registers and 12 warps at the
+# cost of small spills (12 B stored, 24 B loaded). Which wins is measured,
+# not assumed: phase12_diag --cuda times both.
+INT8_MIN_BLOCKS = int(os.environ.get("LATENTSERVE_INT8_MIN_BLOCKS", "1"))
 TARGET_WARPS = 960  # ~2 waves of 12 resident single-warp programs on 40 SMs
 MAX_SPLITS = 128
 
@@ -65,7 +73,8 @@ def include_dirs() -> list[str]:
 
 
 def compile_cubin(arch: str = "sm_75", head_dim: int = 128, n_rep: int = 6, page: int = 16,
-                  tokg: int = TOKG) -> tuple[bytes, str]:
+                  tokg: int = TOKG, variant: str = "fp16", asym: bool = False,
+                  has_res: bool = False, min_blocks: int = 1) -> tuple[bytes, str]:
     """NVRTC-compile the kernel for `arch`. Host-only: needs no GPU.
 
     Returns the cubin and the assembler's report, which carries registers
@@ -78,9 +87,11 @@ def compile_cubin(arch: str = "sm_75", head_dim: int = 128, n_rep: int = 6, page
     incs = include_dirs()
     if not incs:
         raise RuntimeError("no CUDA headers (cuda_fp16.h) found for NVRTC")
-    prog = nvrtc.createProgram(SOURCE.read_text(), SOURCE.name, [], [])
+    src = SOURCES[variant]
+    prog = nvrtc.createProgram(src.read_text(), src.name, [], [])
     opts = [f"--gpu-architecture={arch}", "--ptxas-options=-v", "-std=c++17",
             f"-DHEAD_DIM={head_dim}", f"-DNREP={n_rep}", f"-DPAGE={page}", f"-DTOKG={tokg}",
+            f"-DASYM={int(asym)}", f"-DHAS_RES={int(has_res)}", f"-DMIN_BLOCKS={min_blocks}",
             *[f"-I{p}" for p in incs]]
     try:
         nvrtc.compileProgram(prog, opts)
@@ -89,42 +100,68 @@ def compile_cubin(arch: str = "sm_75", head_dim: int = 128, n_rep: int = 6, page
     return nvrtc.getCUBIN(prog), nvrtc.getProgramLog(prog)
 
 
-def eligible(q: torch.Tensor, k_pool: torch.Tensor, k_scale=None, k_residual=None) -> bool:
-    """What this kernel handles: fp16 cache, head_dim 128, <= 16 query rows
-    per KV head, pages divisible by the token grouping. Everything else —
-    INT8 included, for now — stays on Triton."""
-    if not (k_pool.dtype == torch.float16 and q.dtype == torch.float16 and k_scale is None
-            and k_residual is None and q.shape[-1] == 128 and q.shape[2] <= 16
-            and k_pool.shape[1] % (2 * TOKG) == 0 and q.is_cuda):
+def _aligned(t: torch.Tensor, nbytes: int) -> bool:
+    """Unit-stride last dim, and base and every row stride `nbytes`-aligned:
+    what a vector load of that width needs."""
+    return (t.stride(-1) == 1 and t.data_ptr() % nbytes == 0
+            and all((st * t.element_size()) % nbytes == 0 for st in t.stride()[:-1]))
+
+
+def eligible(q: torch.Tensor, k_pool: torch.Tensor, k_scale=None, k_residual=None,
+             v_scale=None, k_zero=None, v_zero=None, res_rows=None) -> bool:
+    """What these kernels handle: fp16 or INT8 cache, head_dim 128, <= 16
+    query rows per KV head, pages divisible by the token grouping, and the
+    alignments their vector loads need. Anything else stays on Triton
+    rather than faulting."""
+    if not (q.dtype == torch.float16 and q.shape[-1] == 128 and q.shape[2] <= 16
+            and k_pool.shape[1] % (2 * TOKG) == 0 and q.is_cuda and _aligned(q, 16)):
         return False
-    # Every row is read with 16-byte vector loads: base pointers and row
-    # strides must be 16-byte aligned, and head dims unit-stride. A view
-    # that is not falls back to Triton rather than faulting.
-    for t in (q, k_pool):
-        if t.stride(-1) != 1 or t.data_ptr() % 16:
-            return False
-        if any((st * t.element_size()) % 16 for st in t.stride()[:-1]):
-            return False
+    if k_pool.dtype == torch.float16:
+        return k_scale is None and k_residual is None and _aligned(k_pool, 16)
+    if k_pool.dtype != torch.int8:
+        return False
+    # INT8 rows are 8-byte loads; K's scales and zero points are read eight
+    # channels at a time as two 16-byte loads; V's are scalars per token.
+    if k_scale is None or v_scale is None or not _aligned(k_pool, 8):
+        return False
+    if k_scale.dtype != torch.float32 or v_scale.dtype != torch.float32 or not _aligned(k_scale, 16):
+        return False
+    if (k_zero is None) != (v_zero is None):
+        return False
+    if k_zero is not None and (k_zero.dtype != torch.float32 or k_zero.stride() != k_scale.stride()
+                               or v_zero.stride() != v_scale.stride() or not _aligned(k_zero, 16)):
+        return False
+    if (k_residual is None) != (res_rows is None):
+        return False
+    if k_residual is not None and (k_residual.dtype != torch.float16 or not _aligned(k_residual, 16)
+                                   or res_rows.dtype != torch.int32):
+        return False
     return True
 
 
-def _function(device: torch.device, head_dim: int, n_rep: int, page: int):
+def _function(device: torch.device, head_dim: int, n_rep: int, page: int,
+              variant: str = "fp16", asym: bool = False, has_res: bool = False,
+              min_blocks: Optional[int] = None):
     import cupy
 
     major, minor = torch.cuda.get_device_capability(device)
-    key = (device.index or 0, head_dim, n_rep, page, TOKG)
+    mb = (INT8_MIN_BLOCKS if min_blocks is None else min_blocks) if variant == "int8" else 1
+    key = (device.index or 0, head_dim, n_rep, page, TOKG, variant, asym, has_res, mb)
     if key not in _MODULES:
-        cubin, log = compile_cubin(f"sm_{major}{minor}", head_dim, n_rep, page)
+        cubin, log = compile_cubin(f"sm_{major}{minor}", head_dim, n_rep, page,
+                                   variant=variant, asym=asym, has_res=has_res, min_blocks=mb)
         with cupy.cuda.Device(device.index or 0):
             mod = cupy.cuda.Module()
             mod.load(cubin)
-            _MODULES[key] = (mod, mod.get_function(KERNEL))
+            _MODULES[key] = (mod, mod.get_function(KERNELS[variant]))
         LAST_BUILD.update(cubin=cubin, log=log, key=key)
     return _MODULES[key][1]
 
 
 def kernel_resources(device: Optional[torch.device] = None, head_dim: int = 128,
-                     n_rep: int = 6, page: int = 16) -> dict:
+                     n_rep: int = 6, page: int = 16, variant: str = "fp16",
+                     asym: bool = False, has_res: bool = False,
+                     min_blocks: Optional[int] = None) -> dict:
     """Registers, local memory and static shared memory of the *loaded*
     kernel, as the GPU driver reports them.
 
@@ -136,7 +173,7 @@ def kernel_resources(device: Optional[torch.device] = None, head_dim: int = 128,
     from cupy_backends.cuda.api import driver as drv
 
     dev = device or torch.device("cuda", torch.cuda.current_device())
-    fn = _function(dev, head_dim, n_rep, page)
+    fn = _function(dev, head_dim, n_rep, page, variant, asym, has_res, min_blocks)
 
     def get(attr):
         return int(drv.funcGetAttribute(attr, fn.ptr))
@@ -162,7 +199,10 @@ def choose_splits(batch: int, kv_heads: int, num_pages: int) -> int:
 
 def paged_decode_cuda(q, k_pool, v_pool, block_tables, seq_lens, max_seq_len: int,
                       num_splits: Optional[int] = None,
-                      softmax_scale: Optional[float] = None) -> torch.Tensor:
+                      softmax_scale: Optional[float] = None,
+                      k_scale=None, v_scale=None, k_zero=None, v_zero=None,
+                      k_residual=None, res_rows=None,
+                      min_blocks: Optional[int] = None) -> torch.Tensor:
     import numpy as np
 
     from kernels.gqa import paged_decode as pd
@@ -182,19 +222,28 @@ def paged_decode_cuda(q, k_pool, v_pool, block_tables, seq_lens, max_seq_len: in
     l = pd._scratch("cuda_l", (b, h_kv, splits, 16), torch.float32, q.device, fill=0.0)
     out = pd._scratch("cuda_out", (b, h_kv, 16, d), q.dtype, q.device)
 
-    fn = _function(q.device, d, n_rep, page)
-    ptr = lambda t: np.uint64(t.data_ptr())  # noqa: E731
+    ptr = lambda t: np.uint64(0 if t is None else t.data_ptr())  # noqa: E731
     i64 = np.int64
-    fn((b, splits, h_kv), (32, 1, 1),
-       (ptr(q), ptr(k_pool), ptr(v_pool), ptr(block_tables), ptr(seq_lens),
-        ptr(acc), ptr(m), ptr(l),
-        np.int32(block_tables.shape[1]), np.int32(splits),
-        i64(q.stride(0)), i64(q.stride(1)), i64(q.stride(2)),
-        i64(k_pool.stride(0)), i64(k_pool.stride(1)), i64(k_pool.stride(2)),
-        i64(acc.stride(0)), i64(acc.stride(1)), i64(acc.stride(2)), i64(acc.stride(3)),
-        i64(m.stride(0)), i64(m.stride(1)), i64(m.stride(2)),
-        np.float32(scale)),
-       stream=_stream(q.device))
+    head = (ptr(q), ptr(k_pool), ptr(v_pool), ptr(block_tables), ptr(seq_lens),
+            ptr(acc), ptr(m), ptr(l))
+    q_k = (np.int32(block_tables.shape[1]), np.int32(splits),
+           i64(q.stride(0)), i64(q.stride(1)), i64(q.stride(2)),
+           i64(k_pool.stride(0)), i64(k_pool.stride(1)), i64(k_pool.stride(2)))
+    tail = (i64(acc.stride(0)), i64(acc.stride(1)), i64(acc.stride(2)), i64(acc.stride(3)),
+            i64(m.stride(0)), i64(m.stride(1)), i64(m.stride(2)), np.float32(scale))
+    if k_pool.dtype == torch.int8:
+        asym, has_res = k_zero is not None, k_residual is not None
+        fn = _function(q.device, d, n_rep, page, "int8", asym, has_res, min_blocks)
+        res_st = k_residual.stride()[:3] if has_res else (0, 0, 0)
+        args = (*head, ptr(k_scale), ptr(v_scale), ptr(k_zero), ptr(v_zero),
+                ptr(k_residual), ptr(res_rows), *q_k,
+                i64(k_scale.stride(0)), i64(k_scale.stride(1)),
+                i64(v_scale.stride(0)), i64(v_scale.stride(1)), i64(v_scale.stride(2)),
+                *(i64(x) for x in res_st), *tail)
+    else:
+        fn = _function(q.device, d, n_rep, page)
+        args = (*head, *q_k, *tail)
+    fn((b, splits, h_kv), (32, 1, 1), args, stream=_stream(q.device))
     pd.LAST_COMPILED["combine"] = pd._combine_kernel[(b, h_kv)](
         acc, m, l, out, *acc.stride(), *m.stride(), *out.stride(), splits,
         N_REP=n_rep, BLOCK_M=16, BLOCK_D=d)
