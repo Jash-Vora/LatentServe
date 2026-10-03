@@ -23,6 +23,27 @@ class CharTok:
         return "".join(chr(i) for i in ids)
 
 
+def _tiny_model():
+    """A two-layer Qwen2 on CPU, built here rather than imported from another
+    test file: importing test modules only works where the tests folder is
+    an importable package, which it is not in every pytest setup."""
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
+    from model.latentserve_qwen import LatentServeQwen
+    from model.qwen import ModelShape
+
+    torch.manual_seed(0)
+    cfg = Qwen2Config(vocab_size=128, hidden_size=128, intermediate_size=256,
+                      num_hidden_layers=2, num_attention_heads=8, num_key_value_heads=2,
+                      max_position_embeddings=4096)
+    hf = Qwen2ForCausalLM(cfg).eval()
+    shape = ModelShape(2, 8, 2, 16, 128, 128, 4096, "torch.float32")
+    ls = LatentServeQwen(hf_model=hf, tokenizer=None, shape=shape, device="cpu",
+                         attn_impl="triton_paged", max_seq_len_hint=1024)
+    ls._gpu_mode = True
+    return ls
+
+
 def _filler(n=200_000):
     rng = random.Random(1)
     return pq.Filler([rng.randrange(97, 123) for _ in range(n)])
@@ -129,10 +150,7 @@ def test_curves_writes_a_summary_with_verdicts(tmp_path, capsys):
 
 
 def test_cases_run_under_every_policy_on_a_tiny_model():
-    from tests.test_phase14_integration import _model
-
-    ls = _model()
-    ls._gpu_mode = True
+    ls = _tiny_model()
     tok = CharTok()
     cases = pq.build_needles(tok, _filler(), [400], [0.5], 1, random.Random(0))
     rows = pq.eval_cases(ls, cases, pq.cfg_list([0.5, 0.25]), 2, tok, "cpu",
@@ -145,10 +163,7 @@ def test_cases_run_under_every_policy_on_a_tiny_model():
 
 
 def test_generation_rows_compare_against_dense():
-    from tests.test_phase14_integration import _model
-
-    ls = _model()
-    ls._gpu_mode = True
+    ls = _tiny_model()
     rows = pq.eval_gen(ls, [list(range(1, 90))], pq.cfg_list([0.25], oracle=False), 2, 6, "cpu",
                        log=lambda m: None)
     dense = [r for r in rows if r["policy"] == "dense"][0]
