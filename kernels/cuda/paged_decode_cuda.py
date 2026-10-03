@@ -123,6 +123,29 @@ def _function(device: torch.device, head_dim: int, n_rep: int, page: int):
     return _MODULES[key][1]
 
 
+def kernel_resources(device: Optional[torch.device] = None, head_dim: int = 128,
+                     n_rep: int = 6, page: int = 16) -> dict:
+    """Registers, local memory and static shared memory of the *loaded*
+    kernel, as the GPU driver reports them.
+
+    The compiler's own report (ptxas -v) reaches NVRTC's log on some
+    installs and not others — on Kaggle's the log came back empty — so the
+    driver is the authority. Local memory is where spilled registers live:
+    zero local bytes means zero spills.
+    """
+    from cupy_backends.cuda.api import driver as drv
+
+    dev = device or torch.device("cuda", torch.cuda.current_device())
+    fn = _function(dev, head_dim, n_rep, page)
+
+    def get(attr):
+        return int(drv.funcGetAttribute(attr, fn.ptr))
+
+    return {"regs": get(drv.CU_FUNC_ATTRIBUTE_NUM_REGS),
+            "local_bytes": get(drv.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES),
+            "shared_bytes": get(drv.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)}
+
+
 def _stream(device: torch.device):
     import cupy
 

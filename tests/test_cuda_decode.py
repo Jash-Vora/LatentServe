@@ -34,18 +34,28 @@ requires_gpu = pytest.mark.skipif(
 
 @requires_nvrtc
 @pytest.mark.parametrize("arch", ["sm_75", "sm_80"])
-def test_compiles_without_spills_or_shared_memory(arch):
-    _, log = pdc.compile_cubin(arch)
-    used = re.search(r"Used (\d+) registers", log)
-    # On Kaggle the sm_75 log once came back without this line while sm_80's
-    # had it. Show the log rather than crash on the missing match: the log
-    # is the evidence for why.
-    assert used, f"no register report in NVRTC's log for {arch}:\n{log or '(empty log)'}"
-    regs = int(used.group(1))
-    assert "0 bytes spill stores" in log and "0 bytes spill loads" in log, log
-    assert regs <= 200, f"{regs} registers: heading back toward the Triton kernel's 255"
-    smem = re.search(r"(\d+) bytes smem", log)
-    assert smem is None or int(smem.group(1)) == 0, log
+def test_compiles(arch):
+    """A binary comes out. The register report is checked only where NVRTC
+    passes the assembler's output through: on Kaggle its log came back
+    empty, so the authoritative check is the next test, on the driver."""
+    cubin, log = pdc.compile_cubin(arch)
+    assert len(cubin) > 1000
+    used = re.search(r"Used (\d+) registers", log or "")
+    if used:
+        assert int(used.group(1)) <= 200
+        assert "0 bytes spill stores" in log
+
+
+@requires_gpu
+def test_loaded_kernel_has_no_spills_or_shared_memory():
+    """Phase 12's diagnosis, as the driver reports it for the loaded kernel:
+    the Triton kernel used 255 registers, spilled 90 values, and took 40 KB of
+    shared memory, leaving room for 4 warps per SM. Zero local bytes means
+    zero spills."""
+    res = pdc.kernel_resources()
+    assert res["local_bytes"] == 0, f"spilling: {res}"
+    assert res["shared_bytes"] == 0, f"using shared memory: {res}"
+    assert res["regs"] <= 200, f"heading back toward the Triton kernel's 255: {res}"
 
 
 def test_ineligible_inputs_stay_on_triton():
