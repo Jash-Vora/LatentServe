@@ -108,3 +108,72 @@ at 12.5% — so the full run (`phase14_oracle` without `--quick`) settles 12.5%.
 sparse pipeline at 50/25/12.5/6.25%, batch 1/4/16, 4K-32K, under graph
 replay, with the indexer's share and the write-side cost reported on their
 own.
+
+## Time benchmark (T4, per layer-call, graph replay; correctness 3.8e-6 vs dense)
+
+Whole sparse pipeline (indexer + top-k + attention + merge) against dense:
+
+| batch | ctx | dense | 50% | 25% | 12.5% | 6.25% | indexer @25% |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 4096 | 0.154 ms | 0.82x | 1.14x | 1.41x | 1.59x | 0.052 ms |
+| 1 | 8192 | 0.196 | 1.53x | 1.85x | 2.61x | 3.25x | 0.031 |
+| 1 | 16384 | 0.158 | 1.00x | 1.44x | 1.73x | 2.48x | 0.030 |
+| 1 | 32768 | 0.214 | 1.16x | 1.49x | 1.81x | 2.04x | 0.041 |
+| 4 | 4096 | 0.168 | 1.04x | 1.67x | 3.16x | 4.18x | 0.023 |
+| 4 | 8192 | 0.238 | 1.12x | 1.40x | 2.26x | 3.66x | 0.026 |
+| 4 | 16384 | 0.384 | 1.27x | 1.74x | 2.14x | 3.21x | 0.044 |
+| 4 | 32768 | 0.703 | 1.48x | 2.14x | 2.83x | 3.43x | 0.073 |
+| 16 | 4096 | 0.342 | 1.31x | 1.98x | 2.60x | 3.50x | 0.038 |
+| 16 | 8192 | 0.623 | 1.43x | 2.31x | 3.33x | 3.90x | 0.060 |
+| 16 | 16384 | 1.305 | 1.61x | 2.71x | 4.11x | 5.35x | 0.118 |
+| 16 | 32768 | 2.515 | 1.62x | 2.81x | 4.38x | 6.02x | 0.207 |
+
+Write side: page-bound update 2.0 us per layer at batch 16, 0.056 ms per step.
+
+**The plan's question — does the GPU benefit, or does irregular access
+destroy the speedup? It benefits, with no irregular-access penalty.** The
+indexer reads two bound vectors per page, 6.25% of dense's bytes, so a
+budget r cannot read less than r + 6.25% and cannot run faster than
+1 / (r + 0.0625): 3.2x at 25%, 5.3x at 12.5%, 8x at 6.25%. Batch 16 / 32K
+reaches 88%, 82% and 75% of those ceilings. A selected page is read exactly
+as any page, and the sparse kernel has the dense kernel's 168 registers.
+
+The indexer costs what its bytes predict: 22-24% of the 25% pipeline at
+batch 4-16, against ~20% of its bytes. Efficient, but it is the ceiling: as
+budgets shrink, its fixed share becomes most of the work.
+
+Batch 1 gains least (1.1-1.9x at 25%) — too little work to hide fixed costs
+— and its dense timings are the least reliable (16K measured faster than
+8K), as in every batch-1 kernel timing so far. At 50%, batch 1 / 4K is a
+loss (0.82x).
+
+## Integration (stage 4, wired into the model)
+
+* **Cache.** `PagedKVCache.enable_page_bounds()` keeps per-block K min/max
+  per layer (+6.25% memory). Decode writes update them with one kernel
+  launch per layer, inside the CUDA graph; prefill recomputes the touched
+  blocks over *written rows only* (a prompt's last page is usually partly
+  empty, and its stale rows would loosen the bound); enabling after a
+  prefill rebuilds from what is written; `rewind` recomputes the page it
+  lands in.
+* **Model.** `LatentServeQwen.set_sparse(ratio, recent=2)`; `None` is dense.
+  fp16 paged cache only — INT8 is refused, not silently mishandled.
+* **Attention.** In the kernel branch: index, select, attend when a ratio is
+  set. The budget follows `cache.max_len` — the context — not the block
+  table's width, which is the cache's capacity: 25% of a 32K-capacity cache
+  serving a 4K context is more pages than exist, and the step would run
+  dense while paying for the indexer.
+
+Measurements:
+
+    phase14_fusion --toggle sparse --sparse-ratio 0.25    whole decode steps
+    phase14_oracle --gpu                                  quality, real path
+
+On a T4 the KV cache costs ~28 KB per token, leaving room for roughly 390K
+cached tokens after the weights: batch 16 x 32K and batch 32 x 16K and above
+do not fit in fp16 and are reported as skipped. (INT8's 1.8x capacity is
+what would fit them — the Phase 16 combination.)
+
+Fixed along the way: `phase14_fusion` named the loop variable `on`, which
+overwrote the column label, so every saved row since the per-toggle labels
+were added was recorded as `..._True`. Printed tables were unaffected.

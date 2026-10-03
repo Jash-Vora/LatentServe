@@ -107,7 +107,12 @@ def main() -> int:
     p.add_argument("--decode-backend", default=None, choices=["triton", "cuda"],
                    help="decode attention kernel for both sides; with --toggle int8 and "
                    "cuda, fp16 and INT8 caches are compared on the CUDA kernel")
-    p.add_argument("--toggle", choices=["projections", "elementwise", "int8", "cuda_decode"],
+    p.add_argument("--sparse-ratio", type=float, default=0.25,
+                   help="--toggle sparse: fraction of pages each decode step attends to")
+    p.add_argument("--sparse-recent", type=int, default=2,
+                   help="--toggle sparse: most recent pages always kept")
+    p.add_argument("--toggle", choices=["projections", "elementwise", "int8", "cuda_decode",
+                                        "sparse"],
                    default="projections",
                    help="which fusion to A/B. 'elementwise' keeps projections fused on both "
                    "sides, so it measures elementwise fusion alone, on top of 14a.")
@@ -148,17 +153,29 @@ def main() -> int:
 
         set_decode_backend("cuda" if on else "triton")
 
-    if args.toggle in ("int8", "cuda_decode"):
+    def set_sparse(on: bool) -> None:
+        model.set_sparse(args.sparse_ratio if on else None, recent=args.sparse_recent)
+
+    if args.toggle == "sparse" and args.decode_backend != "cuda":
+        # Sparse is measured against the best dense path there is, not Triton.
+        from kernels.gqa.paged_decode import set_decode_backend as _sdb
+
+        _sdb("cuda")
+        args.decode_backend = "cuda"
+        print("--toggle sparse: dense side on the CUDA kernel (--decode-backend cuda)")
+    if args.toggle in ("int8", "cuda_decode", "sparse"):
         # Measured on the best model there is: projections and elementwise
         # both fused, on both sides.
         model.set_elementwise(True)
     switch = {"projections": model.set_fused, "elementwise": model.set_elementwise,
-              "int8": set_int8, "cuda_decode": set_cuda_decode}[args.toggle]
+              "int8": set_int8, "cuda_decode": set_cuda_decode,
+              "sparse": set_sparse}[args.toggle]
     # Column names that say what is compared. Every toggle used to print
     # "unfused / fused", which for --toggle int8 meant fp16 / INT8 cache and
     # read as something else entirely.
     off, on = {"projections": ("unfused", "fused"), "elementwise": ("unfused", "fused"),
-               "int8": ("fp16", "int8"), "cuda_decode": ("triton", "cuda")}[args.toggle]
+               "int8": ("fp16", "int8"), "cuda_decode": ("triton", "cuda"),
+               "sparse": ("dense", f"sparse{args.sparse_ratio:.4g}")}[args.toggle]
     writer = ResultWriter(results_dir=args.results_dir)
 
     # The mechanism, before the timing: if the kernel count does not fall
@@ -176,11 +193,21 @@ def main() -> int:
     for batch in args.batch_sizes:
         for ctx in args.context_lengths:
             unfused, fused = [], []
-            for _ in range(args.rounds):
-                for on, bucket in ((False, unfused), (True, fused)):
-                    switch(on)
-                    bucket.append(time_graphed(model, batch, ctx, args.block_size,
-                                               args.steps, args.warmup))
+            try:
+                for _ in range(args.rounds):
+                    # `state`, not `on`: reusing `on` here overwrote the column
+                    # label above, and every saved row was named "..._True".
+                    for state, bucket in ((False, unfused), (True, fused)):
+                        switch(state)
+                        bucket.append(time_graphed(model, batch, ctx, args.block_size,
+                                                   args.steps, args.warmup))
+            except torch.cuda.OutOfMemoryError:
+                # batch x context past what this GPU's memory holds: say so
+                # and go on, rather than end the sweep at its first big shape.
+                model.cache = None
+                torch.cuda.empty_cache()
+                print(f"{batch:>5}{ctx:>7}   does not fit in GPU memory: skipped", flush=True)
+                continue
             deltas = [u - f for u, f in zip(unfused, fused)]
             saved = statistics.median(deltas)
             spread = max(deltas) - min(deltas)
@@ -199,8 +226,8 @@ def main() -> int:
                            "saved_ms_median": saved, "saved_ms_spread": spread,
                            "kernels_unfused": k_unfused, "kernels_fused": k_fused},
                 ))
-    if args.toggle == "cuda_decode":
-        switch(False)       # leave the process on the default backend
+    if args.toggle in ("cuda_decode", "sparse"):
+        switch(False)       # leave the process on the default backend / dense
     else:
         switch(True)
     print("\nA saving smaller than its round spread is not a saving.")

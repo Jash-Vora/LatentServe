@@ -165,12 +165,22 @@ def sparse_decode(q, k_pool, v_pool, block_tables, seq_lens, sel,
 
 def sparse_attention(q, k_pool, v_pool, block_tables, seq_lens, kmin, kmax,
                      ratio: float = 0.25, recent: int = 2,
-                     num_splits: Optional[int] = None) -> torch.Tensor:
+                     num_splits: Optional[int] = None, max_seq_len: Optional[int] = None,
+                     softmax_scale: Optional[float] = None) -> torch.Tensor:
     """Index, select, attend. ratio >= 1 still runs all three: a check that
-    the sparse path reproduces dense, not a shortcut to it."""
-    k = budget(ratio, block_tables.shape[1], recent)
+    the sparse path reproduces dense, not a shortcut to it.
+
+    The budget follows `max_seq_len` — the context — when given. The block
+    table's width is the cache's *capacity*: budgeting from it, 25% of a
+    32K-capacity cache serving a 4K context is more pages than exist, and
+    the step runs dense while paying for the indexer.
+    """
+    pages = block_tables.shape[1] if max_seq_len is None else min(
+        block_tables.shape[1], -(-max_seq_len // k_pool.shape[1]))
+    k = budget(ratio, pages, recent)
     sel = select(page_scores(q, kmin, kmax, block_tables, seq_lens, recent), k)
-    return sparse_decode(q, k_pool, v_pool, block_tables, seq_lens, sel, num_splits)
+    return sparse_decode(q, k_pool, v_pool, block_tables, seq_lens, sel, num_splits,
+                         softmax_scale)
 
 
 def kernel_resources(device: Optional[torch.device] = None) -> dict:

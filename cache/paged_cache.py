@@ -264,6 +264,16 @@ class PagedKVCache:
             if not 0 <= length <= table.length:
                 raise ValueError(f"cannot rewind slot {i} from {table.length} to {length}")
             table.length = length
+            # The page the rewind lands in keeps bounds widened by tokens
+            # past `length`; recompute it from its remaining rows, or each
+            # configuration would inherit the previous one's.
+            if getattr(self, "_bounds_on", False) and length % self.block_size:
+                bs = self.block_size
+                start = (length // bs) * bs
+                flat = torch.tensor([table.slot(p) for p in range(start, length)],
+                                    dtype=torch.long, device=self.device)
+                for layer in range(len(self.k_pool)):
+                    self._recompute_bounds(layer, flat)
         self._read_slots_dirty = True
         self._rebuild_kernel_inputs()
 
@@ -375,6 +385,78 @@ class PagedKVCache:
         flat = slots[:b].reshape(-1)
         self._flat_k[layer_idx].index_copy_(0, flat, k.permute(0, 2, 1, 3).reshape(-1, h, d))
         self._flat_v[layer_idx].index_copy_(0, flat, v.permute(0, 2, 1, 3).reshape(-1, h, d))
+        if getattr(self, "_bounds_on", False):
+            if n == 1:
+                self._update_bounds(layer_idx, k[:, :, 0], flat)
+            else:
+                self._recompute_bounds(layer_idx, flat)
+
+    # ---------------------------------------------------------------
+    # Phase 14: per-page bounds of K for the sparse indexer.
+
+    def enable_page_bounds(self) -> None:
+        """Keep each block's per-channel min and max of K, per layer, for
+        the sparse indexer. +6.25% of the K/V memory (two head_dim vectors
+        per block against 16 K and 16 V rows).
+
+        Safe to call after tokens are already written: bounds are rebuilt
+        from what the active sequences hold, so turning sparsity on after a
+        prefill cannot leave zeros that silently scramble the selection.
+        """
+        if getattr(self, "_bounds_on", False):
+            return
+        nb, _, h, d = self.k_pool[0].shape
+        self.kmin = [torch.zeros(nb, h, d, dtype=self.k_pool[0].dtype, device=self.device)
+                     for _ in self.k_pool]
+        self.kmax = [torch.zeros_like(t) for t in self.kmin]
+        self._bounds_on = True
+        for i in self._active:
+            table = self.tables[i]
+            if table.length == 0:
+                continue
+            flat = torch.tensor(table.slots(), dtype=torch.long, device=self.device)
+            for layer in range(len(self.k_pool)):
+                self._recompute_bounds(layer, flat)
+
+    def page_bounds(self, layer_idx: int):
+        """(kmin, kmax) [num_blocks, kv_heads, head_dim] for a layer, or None."""
+        if not getattr(self, "_bounds_on", False):
+            return None
+        return self.kmin[layer_idx], self.kmax[layer_idx]
+
+    def _update_bounds(self, layer_idx: int, k_new: torch.Tensor, flat: torch.Tensor) -> None:
+        """One token per sequence just written at `flat`: the CUDA kernel on
+        a GPU (one launch, graph-capturable), the same rule in torch on CPU:
+        a page's first token resets its bounds, later tokens widen them."""
+        kmin, kmax = self.kmin[layer_idx], self.kmax[layer_idx]
+        if k_new.is_cuda:
+            from kernels.cuda import paged_sparse as ps
+
+            ps.update_bounds(k_new, flat, kmin, kmax, page=self.block_size)
+            return
+        blk, off = flat // self.block_size, flat % self.block_size
+        fresh = (off == 0)[:, None, None]
+        kmin[blk] = torch.where(fresh, k_new, torch.minimum(kmin[blk], k_new))
+        kmax[blk] = torch.where(fresh, k_new, torch.maximum(kmax[blk], k_new))
+
+    def _recompute_bounds(self, layer_idx: int, flat: torch.Tensor) -> None:
+        """Bounds of every block touched by `flat`, over its *written* rows.
+
+        Sequences fill a block from row 0, so a block's written rows are
+        0..(largest offset written so far). A prompt's last page is usually
+        partly empty; its unwritten rows hold stale values that would
+        silently loosen the bound. Eager (prefill, rewind): a host sync in
+        torch.unique is fine here.
+        """
+        bs = self.block_size
+        blocks, inverse = torch.unique(flat // bs, return_inverse=True)
+        top = torch.zeros(len(blocks), dtype=torch.long, device=flat.device)
+        top.scatter_reduce_(0, inverse, flat % bs, reduce="amax", include_self=False)
+        # Rows before this write's first offset were written earlier: also valid.
+        rows = self.k_pool[layer_idx][blocks]                                  # [n, bs, H, D]
+        valid = (torch.arange(bs, device=flat.device)[None, :] <= top[:, None])[..., None, None]
+        self.kmin[layer_idx][blocks] = rows.masked_fill(~valid, float("inf")).amin(dim=1)
+        self.kmax[layer_idx][blocks] = rows.masked_fill(~valid, float("-inf")).amax(dim=1)
 
     def read(
         self, layer_idx: int, batch_size: int, length: Optional[int] = None

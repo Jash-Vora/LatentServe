@@ -58,6 +58,35 @@ def configs(policies, ratios) -> list:
     return [("dense", 1.0)] + [(p, r) for p in policies for r in ratios]
 
 
+def _apply(ls, cfg, recent: int):
+    """Put the model in configuration `cfg`; return the study (or None).
+
+    ("gpu", r) runs the real path — CUDA indexer, top-k and sparse kernel,
+    fp16 bounds, budget from the context — through ls.set_sparse(r). Every
+    other policy installs the reference study (model/attention/sparse.py).
+    """
+    from model.attention import sparse as sp
+
+    if cfg[0] == "gpu":
+        sp.install(ls, None)
+        ls.set_sparse(cfg[1], recent=recent)
+        return None
+    if hasattr(ls, "set_sparse") and getattr(ls, "sparse_ratio", None) is not None:
+        ls.set_sparse(None)
+    if getattr(ls, "_gpu_mode", False) and cfg[0] == "dense":
+        sp.install(ls, None)          # dense on the CUDA kernel: the real baseline
+        return None
+    study = sp.SparseStudy(cfg[0], cfg[1], recent=recent)
+    sp.install(ls, study)
+    return study
+
+
+def _record(r, study):
+    nan = float("nan")
+    r["captured"].append(statistics.fmean(study.captured) if study and study.captured else nan)
+    r["kept"].append(statistics.fmean(study.kept) if study and study.kept else nan)
+
+
 def _step(ls, token: int, device):
     import torch
 
@@ -82,8 +111,7 @@ def eval_text(ls, windows, cfgs, ctx: int, recent: int, device, log=print) -> di
             dense_logp = []
             for c in cfgs:
                 ls.cache.rewind(ctx)
-                study = sp.SparseStudy(c[0], c[1], recent=recent)
-                sp.install(ls, study)
+                study = _apply(ls, c, recent)
                 r = out[c]
                 for t in range(len(ids) - ctx - 1):
                     logp = torch.log_softmax(_step(ls, ids[ctx + t], device).float(), -1)
@@ -96,8 +124,7 @@ def eval_text(ls, windows, cfgs, ctx: int, recent: int, device, log=print) -> di
                         ref = dense_logp[t].float()
                         r["kl"].append(max(0.0, float((ref.exp() * (ref - logp)).sum())))
                         r["agree"].append(float(int(logp.argmax()) == int(ref.argmax())))
-                r["captured"].append(statistics.fmean(study.captured))
-                r["kept"].append(statistics.fmean(study.kept))
+                _record(r, study)
                 sp.install(ls, None)
         log(f"      text window {wi + 1}/{len(windows)} done in {time.perf_counter() - t0:.0f}s")
     return out
@@ -129,8 +156,7 @@ def eval_needles(ls, cases, cfgs, recent: int, answer_tokens: int, tokenizer, de
             ls.prefill(torch.tensor([case.context], device=device))
             for c in cfgs:
                 ls.cache.rewind(n)
-                study = sp.SparseStudy(c[0], c[1], recent=recent)
-                sp.install(ls, study)
+                study = _apply(ls, c, recent)
                 logits = None
                 for tok in case.question:
                     logits = _step(ls, tok, device)
@@ -140,7 +166,8 @@ def eval_needles(ls, cases, cfgs, recent: int, answer_tokens: int, tokenizer, de
                     gen.append(nxt)
                     logits = _step(ls, nxt, device)
                 out[c]["correct"].append((case.length, judge(case, gen, tokenizer)))
-                out[c]["captured"].append(statistics.fmean(study.captured))
+                out[c]["captured"].append(statistics.fmean(study.captured)
+                                          if study and study.captured else float("nan"))
                 sp.install(ls, None)
         log(f"      needle {ci + 1}/{len(cases)} ({case.length // 1024}K, depth {case.depth:.0%}) "
             f"done in {time.perf_counter() - t0:.0f}s")
@@ -201,7 +228,8 @@ def print_table(rows, lengths) -> None:
         line = f"{r['policy']:<8}{r['ratio']:>7.1%}"
         if "ppl" in r:
             line += f"{r['ppl']:>9.3f}{r['kl']:>13.4f}{r['agree']:>13.1%}"
-        line += f"{r['captured']:>11.3f}"
+        cap = r["captured"]
+        line += f"{'-':>11}" if cap != cap else f"{cap:>11.3f}"
         if "needle" in r:
             for L in lengths:
                 ok = r["needle"][L]
@@ -217,6 +245,10 @@ def main() -> int:
     p.add_argument("--ratios", type=float, nargs="+", default=list(RATIOS))
     p.add_argument("--policies", nargs="+", default=list(POLICY_ORDER))
     p.add_argument("--recent", type=int, default=2, help="recent pages always kept")
+    p.add_argument("--gpu", action="store_true",
+                   help="the real path: CUDA indexer + sparse kernel at each ratio, against "
+                   "dense on the CUDA kernel. 'mass kept' is not measurable there (no full "
+                   "scores are computed) and prints as '-'")
     p.add_argument("--text-windows", type=int, default=4)
     p.add_argument("--text-ctx", type=int, default=8192)
     p.add_argument("--text-cont", type=int, default=128)
@@ -252,7 +284,16 @@ def main() -> int:
     device = "cuda:0"
     ref = QwenReference(model_name=cfg.model.name, dtype="fp16", device=device).load()
     longest = max([args.text_ctx + args.text_cont] + args.needle_lengths) + 128
-    ls = LatentServeQwen.from_reference(ref, attn_impl="sdpa", max_seq_len_hint=longest)
+    if args.gpu:
+        from kernels.gqa.paged_decode import set_decode_backend
+
+        set_decode_backend("cuda")
+        ls = LatentServeQwen.from_reference(ref, attn_impl="triton_paged",
+                                            max_seq_len_hint=longest)
+        ls._gpu_mode = True
+        args.policies = ["gpu"]
+    else:
+        ls = LatentServeQwen.from_reference(ref, attn_impl="sdpa", max_seq_len_hint=longest)
     tok = ref.tokenizer
 
     wiki = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")

@@ -255,9 +255,27 @@ class LatentServeQwen:
             )
         elif paged:
             self.cache = PagedKVCache(spec, block_size=block_size, num_blocks=num_blocks)
+            if getattr(self, "sparse_ratio", None) is not None:
+                self.cache.enable_page_bounds()
         else:
             self.cache = ContiguousKVCache(spec)
         return self.cache
+
+    def set_sparse(self, ratio: Optional[float], recent: int = 2) -> None:
+        """Phase 14: sparse decode attention at `ratio` of the pages (None:
+        dense). Needs the fp16 paged cache and attn_impl="triton_paged";
+        the sparse kernels themselves are CUDA (kernels/cuda/paged_sparse).
+        Enables page bounds on the current cache — rebuilt from whatever it
+        already holds — and on every cache allocated after."""
+        self.sparse_ratio = ratio
+        for layer in self.layers:
+            layer.attn.sparse_ratio = ratio
+            layer.attn.sparse_recent = recent
+        cache = getattr(self, "cache", None)
+        if ratio is not None and cache is not None:
+            if not hasattr(cache, "enable_page_bounds") or isinstance(cache, Int8PagedKVCache):
+                raise ValueError("sparse decode needs the fp16 paged cache (paged=True)")
+            cache.enable_page_bounds()
 
     def _require_cache(self):
         if self.cache is None:

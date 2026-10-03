@@ -292,6 +292,25 @@ class GQAAttention(nn.Module):
             cached_kv_heads = k.shape[1]
             n_rep = self.num_attention_heads // cached_kv_heads
             q_folded = q.reshape(b, cached_kv_heads, n_rep, self.head_dim)
+            ratio = getattr(self, "sparse_ratio", None)
+            bounds = cache.page_bounds(self.layer_idx) if (
+                ratio is not None and hasattr(cache, "page_bounds")) else None
+            if bounds is not None:
+                # Phase 14: index, select, attend over the chosen pages only.
+                from kernels.cuda import paged_decode_cuda as pdc
+                from kernels.cuda import paged_sparse as ps
+
+                k_pool = cache.k_pool[self.layer_idx]
+                if pdc.eligible(q_folded, k_pool):
+                    out = ps.sparse_attention(
+                        q_folded, k_pool, cache.v_pool[self.layer_idx],
+                        cache.block_tables_tensor(b), cache.seq_lens_tensor(b),
+                        bounds[0], bounds[1], ratio=ratio,
+                        recent=getattr(self, "sparse_recent", 2),
+                        max_seq_len=cache.max_len, softmax_scale=self.scaling)
+                    attn_out = out.reshape(b, self.num_attention_heads, 1, self.head_dim)
+                    attn_out = attn_out.transpose(1, 2).contiguous().view(b, s, -1)
+                    return self.o_proj(attn_out)
             out = paged_decode_attention(
                 q_folded,
                 cache.k_pool[self.layer_idx],
