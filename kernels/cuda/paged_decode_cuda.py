@@ -30,12 +30,14 @@ SOURCES = {"fp16": pathlib.Path(__file__).with_name("paged_decode_fp16.cu"),
 KERNELS = {"fp16": "paged_decode_fp16", "int8": "paged_decode_int8"}
 SOURCE, KERNEL = SOURCES["fp16"], KERNELS["fp16"]      # kept for older callers
 TOKG = 4            # tokens per half-warp per softmax group: 168 registers, no spills
-# INT8 register bound (see MIN_BLOCKS in paged_decode_int8.cu): 1 leaves the
+# INT8 register bound (see MIN_BLOCKS in paged_decode_int8.cu). 1 leaves the
 # compiler free — 199 registers, no spills, 10 warps/SM for the production
-# variant — and 12 holds it to fp16's 168 registers and 12 warps at the
-# cost of small spills (12 B stored, 24 B loaded). Which wins is measured,
-# not assumed: phase12_diag --cuda times both.
-INT8_MIN_BLOCKS = int(os.environ.get("LATENTSERVE_INT8_MIN_BLOCKS", "1"))
+# variant; 12 holds it to fp16's 168 registers and 12 warps at the cost of
+# 16 bytes of spill memory. Measured on the T4 (phase12_diag --int8): 12 is
+# 11-13% faster at batch 4 and 16, 1-2% slower at batch 1. More warps means
+# more loads in flight, and this kernel is limited by memory latency, not
+# bytes — the same reason INT8's halved bytes did not buy time.
+INT8_MIN_BLOCKS = int(os.environ.get("LATENTSERVE_INT8_MIN_BLOCKS", "12"))
 TARGET_WARPS = 960  # ~2 waves of 12 resident single-warp programs on 40 SMs
 MAX_SPLITS = 128
 
