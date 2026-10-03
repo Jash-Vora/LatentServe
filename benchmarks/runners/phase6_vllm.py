@@ -211,7 +211,7 @@ def run_latentserve(cfg, ref, requests, batch_size: int, block_size: int,
 
 
 def run_vllm(cfg, requests, batch_size: int, max_seq_len: int,
-             attention_backend: str | None = None) -> dict:
+             attention_backend: str | None = None, engine_args: dict | None = None) -> dict:
     """vLLM sizes its KV pool from *free* VRAM at construction
     (`gpu_memory_utilization`), so anything LatentServe left resident
     silently shrinks vLLM's cache and hands it a worse configuration.
@@ -227,6 +227,7 @@ def run_vllm(cfg, requests, batch_size: int, max_seq_len: int,
         enable_prefix_caching=False,
         seed=cfg.generation.seed,
         attention_backend=attention_backend,
+        engine_args=engine_args,
     )
     prompts = [r.prompt_ids for r in requests]
     counts = [r.max_new_tokens for r in requests]
@@ -324,6 +325,10 @@ def main() -> int:
     p.add_argument("--vllm-attention-backend", default=None,
                    help="vLLM's attention backend (e.g. FLASHINFER, TRITON_ATTN). Rows are "
                    "labelled vllm_<backend>; the default arm stays 'vllm'.")
+    p.add_argument("--vllm-variant", default=None,
+                   help="backend plus knobs, as the backend probe names them: e.g. "
+                   "auto+full_graphs+async or FLASHINFER+async. Rows are labelled "
+                   "vllm_<variant>.")
     p.add_argument("--baseline", default="vllm",
                    help="the vLLM arm everything is compared against, e.g. vllm_flashinfer")
     p.add_argument("--decode-backend", default=None, choices=["triton", "cuda"],
@@ -360,8 +365,13 @@ def main() -> int:
         "_elementwise" if args.fuse_elementwise else "") + (
         "_int8" if args.kv_dtype == "int8" else "")
 
-    vllm_label = ("vllm" if not args.vllm_attention_backend
-                  else f"vllm_{args.vllm_attention_backend.lower()}")
+    from comparisons.vllm.runner import parse_variant, variant_label
+
+    if args.vllm_variant and args.vllm_attention_backend:
+        p.error("give --vllm-variant or --vllm-attention-backend, not both")
+    variant = args.vllm_variant or args.vllm_attention_backend or "auto"
+    vllm_backend, vllm_engine_args = parse_variant(variant)
+    vllm_label = variant_label(variant)
 
     from kernels.gqa import paged_decode as _pd
 
@@ -488,7 +498,8 @@ def main() -> int:
                                     kv_dtype=args.kv_dtype)
                     if system.startswith("latentserve")
                     else run_vllm(cfg, fresh, batch_size, max_seq_len,
-                                  attention_backend=args.vllm_attention_backend)
+                                  attention_backend=vllm_backend,
+                                  engine_args=vllm_engine_args)
                 )
             summary.update(gpu.summary())
             if slot == "throwaway":

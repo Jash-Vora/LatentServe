@@ -70,6 +70,54 @@ def vllm_available() -> tuple[bool, str]:
         return False, ""
 
 
+# vLLM settings beyond the attention backend that could move *per-step*
+# decode time at fixed batch. Everything else (memory utilisation, prefix
+# caching, max_num_seqs) is pinned or cannot matter for this benchmark.
+VLLM_KNOBS = {
+    # Whole decode steps captured as one CUDA graph, attention included.
+    "full_graphs": {"compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY"}},
+    # Graphs in pieces with attention run eagerly between them: the
+    # comparison point that shows what the default actually does.
+    "piecewise": {"compilation_config": {"cudagraph_mode": "PIECEWISE"}},
+    # Prepare the next step on the CPU while the GPU runs this one.
+    "async": {"async_scheduling": True},
+}
+
+
+def parse_variant(variant: str) -> tuple:
+    """'BACKEND[+knob...]' -> (attention backend or None, engine kwargs).
+
+    'auto' leaves the backend to vLLM. Knobs merge; two that set the same
+    nested setting (full_graphs+piecewise) are refused, not silently
+    resolved in whichever order they happen to be applied.
+    """
+    parts = [x for x in variant.split("+") if x]
+    if not parts:
+        raise ValueError("empty variant")
+    backend = None if parts[0].lower() in ("auto", "default") else parts[0]
+    engine: dict = {}
+    for knob in parts[1:]:
+        if knob not in VLLM_KNOBS:
+            raise ValueError(f"unknown knob {knob!r}; known: {', '.join(VLLM_KNOBS)}")
+        for key, value in VLLM_KNOBS[knob].items():
+            if isinstance(value, dict):
+                into = engine.setdefault(key, {})
+                clash = set(into) & set(value)
+                if clash:
+                    raise ValueError(f"{knob!r} conflicts with an earlier knob on {sorted(clash)}")
+                into.update(value)
+            else:
+                engine[key] = value
+    return backend, engine
+
+
+def variant_label(variant: str) -> str:
+    """'auto' is the default arm, 'vllm'; anything else is named for itself."""
+    if variant.lower() in ("auto", "default"):
+        return "vllm"
+    return "vllm_" + variant.lower().replace("+", "_")
+
+
 class VLLMRunner:
     """Offline vLLM engine, configured to match LatentServe's conditions."""
 
@@ -83,6 +131,7 @@ class VLLMRunner:
         enable_prefix_caching: bool = False,
         seed: int = 0,
         attention_backend: str | None = None,
+        engine_args: dict | None = None,
     ):
         ok, version = vllm_available()
         if not ok:
@@ -107,6 +156,7 @@ class VLLMRunner:
         if attention_backend:
             os.environ["VLLM_ATTENTION_BACKEND"] = attention_backend
         self.config["attention_backend"] = os.environ.get("VLLM_ATTENTION_BACKEND", "auto")
+        self.config["engine_args"] = dict(engine_args or {})
 
         from vllm import LLM
 
@@ -119,6 +169,7 @@ class VLLMRunner:
             seed=seed,
             tensor_parallel_size=1,
         )
+        kwargs.update(engine_args or {})
         # enable_prefix_caching has moved and been renamed across releases;
         # if this build does not accept it, fall back rather than fail, and
         # record that the control could not be applied.

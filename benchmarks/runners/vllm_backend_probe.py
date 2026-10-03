@@ -36,21 +36,26 @@ import subprocess
 import sys
 import time
 
-CANDIDATES = ["auto", "TRITON_ATTN", "FLASHINFER", "FLEX_ATTENTION", "TORCH_SDPA",
-              "XFORMERS", "FLASH_ATTN"]
+CANDIDATES = [
+    # attention backends, with vLLM's other defaults
+    "auto", "TRITON_ATTN", "FLASHINFER", "FLEX_ATTENTION", "TORCH_SDPA", "XFORMERS", "FLASH_ATTN",
+    # the default backend with the knobs that could move batch-1 latency
+    "auto+piecewise", "auto+full_graphs", "auto+async", "auto+full_graphs+async",
+]
 POINTS = ((16, 2048), (1, 8192))
 SHORT, LONG = 16, 80
 
 
-def child(backend: str, config: str) -> int:
-    from comparisons.vllm.runner import VLLMRunner
+def child(variant: str, config: str) -> int:
+    from comparisons.vllm.runner import VLLMRunner, parse_variant
     from config import load_config
 
     cfg = load_config(config)
+    backend, engine_args = parse_variant(variant)
     max_len = max(ctx for _, ctx in POINTS) + LONG + 16
     runner = VLLMRunner(cfg.model.name, max_model_len=max_len,
                         max_num_seqs=max(b for b, _ in POINTS),
-                        attention_backend=None if backend == "auto" else backend)
+                        attention_backend=backend, engine_args=engine_args)
     from vllm import SamplingParams
 
     try:
@@ -64,7 +69,7 @@ def child(backend: str, config: str) -> int:
     llm = runner.llm
     llm.generate([wrap([rng.randrange(1000, 100000) for _ in range(64)])],
                  SamplingParams(max_tokens=8, temperature=0.0, ignore_eos=True), use_tqdm=False)
-    result = {"backend": backend, "decode_ms": {}}
+    result = {"variant": variant, "decode_ms": {}}
     for batch, ctx in POINTS:
         prompts = [wrap([rng.randrange(1000, 100000) for _ in range(ctx)]) for _ in range(batch)]
         walls = {}
@@ -91,6 +96,12 @@ def reported_backends(log: str) -> list[str]:
     return found
 
 
+def reported_graph_mode(log: str) -> str | None:
+    """The CUDA-graph mode vLLM printed in its startup config, if it did."""
+    m = re.search(r"cudagraph_mode['\"]?\s*[:=]\s*[<'\"]?(?:CUDAGraphMode\.)?([A-Z_]+)", log)
+    return m.group(1) if m else None
+
+
 def failure_reason(log: str) -> str:
     for line in reversed(log.strip().splitlines()):
         if re.search(r"(Error|Exception|error:|not supported|Invalid)", line):
@@ -102,7 +113,8 @@ def failure_reason(log: str) -> str:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--child", default=None, help=argparse.SUPPRESS)
-    p.add_argument("--backends", nargs="+", default=CANDIDATES)
+    p.add_argument("--backends", "--variants", dest="backends", nargs="+", default=CANDIDATES,
+                   help="variants: BACKEND[+knob...], knobs: full_graphs, piecewise, async")
     p.add_argument("--config", default="configs/phase6_vllm.yaml")
     p.add_argument("--timeout", type=int, default=1200)
     args = p.parse_args()
@@ -127,7 +139,8 @@ def main() -> int:
             if line.startswith("PROBE_RESULT "):
                 result = json.loads(line[len("PROBE_RESULT "):])
         rows.append({"backend": backend, "ok": result is not None,
-                     "reported": reported_backends(log), "result": result,
+                     "reported": reported_backends(log), "graph_mode": reported_graph_mode(log),
+                     "result": result,
                      "reason": None if result else failure_reason(log),
                      "seconds": time.perf_counter() - t0})
         r = rows[-1]
@@ -136,20 +149,28 @@ def main() -> int:
               + ("" if r["ok"] else f"\n        {r['reason']}"), flush=True)
 
     keys = [f"{b}x{c}" for b, c in POINTS]
-    print(f"\n{'requested':<16}{'status':<8}" + "".join(f"{'decode ms ' + k:>20}" for k in keys)
-          + "   vLLM reported")
+    print(f"\n{'variant':<26}{'status':<8}" + "".join(f"{'decode ms ' + k:>18}" for k in keys)
+          + f"{'graph mode':>20}   vLLM reported")
     for r in rows:
         ms = r["result"]["decode_ms"] if r["ok"] else {}
-        print(f"{r['backend']:<16}{'ok' if r['ok'] else 'failed':<8}"
-              + "".join(f"{(f'{ms[k]:.1f}' if k in ms else '-'):>20}" for k in keys)
-              + f"   {', '.join(r['reported']) or '-'}")
+        print(f"{r['backend']:<26}{'ok' if r['ok'] else 'failed':<8}"
+              + "".join(f"{(f'{ms[k]:.1f}' if k in ms else '-'):>18}" for k in keys)
+              + f"{(r['graph_mode'] or '-'):>20}   {', '.join(r['reported']) or '-'}")
     ran = [r for r in rows if r["ok"]]
     if ran:
-        best = min(ran, key=lambda r: r["result"]["decode_ms"][keys[0]])
-        print(f"\nFastest at {keys[0]}: {best['backend']}. For the full comparison:\n"
-              f"  --vllm-attention-backend {best['backend']}   (rows labelled "
-              f"vllm_{best['backend'].lower()})" if best["backend"] != "auto" else
-              f"\nThe default ('auto') is already the fastest that runs.")
+        # Per point: a knob that helps batch 1 need not help batch 16, and the
+        # backend that wins at batch 16 need not win at batch 1.
+        print()
+        for k in keys:
+            best = min(ran, key=lambda r: r["result"]["decode_ms"][k])
+            auto = next((r for r in ran if r["backend"] == "auto"), None)
+            gain = ""
+            if auto and best is not auto:
+                a, b = auto["result"]["decode_ms"][k], best["result"]["decode_ms"][k]
+                gain = f"  ({(a - b) / a:.1%} faster than the default)"
+            print(f"fastest at {k}: {best['backend']}{gain}")
+        print("\nDifferences under ~2% are within this probe's noise (one run per point).\n"
+              "For the full comparison: --vllm-variant <winner>")
     if any("flashinfer" in (r["reason"] or "").lower() for r in rows):
         print("\nFlashInfer failed on an import or build: `pip install flashinfer-python` and "
               "probe it again with --backends FLASHINFER.")
