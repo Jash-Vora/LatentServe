@@ -48,6 +48,8 @@ more useful framing than a win/loss.
 
 from __future__ import annotations
 
+import os
+
 import time
 from typing import Optional
 
@@ -80,6 +82,7 @@ class VLLMRunner:
         gpu_memory_utilization: float = 0.90,
         enable_prefix_caching: bool = False,
         seed: int = 0,
+        attention_backend: str | None = None,
     ):
         ok, version = vllm_available()
         if not ok:
@@ -94,6 +97,16 @@ class VLLMRunner:
             "enable_prefix_caching": enable_prefix_caching,
             "seed": seed,
         }
+        # Which attention kernel vLLM runs is its single biggest performance
+        # choice on a T4: FlashAttention needs Ampere, so the default falls
+        # back to a Triton backend — and Phase 12 found Triton compiles
+        # attention without tensor cores on this GPU. Set through the
+        # environment, which vLLM reads lazily and its engine-core process
+        # inherits. What vLLM *actually* used is in its startup log; the
+        # backend probe reads it from there.
+        if attention_backend:
+            os.environ["VLLM_ATTENTION_BACKEND"] = attention_backend
+        self.config["attention_backend"] = os.environ.get("VLLM_ATTENTION_BACKEND", "auto")
 
         from vllm import LLM
 

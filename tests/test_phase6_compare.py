@@ -176,3 +176,25 @@ def test_abba_averages_only_within_one_run(tmp_path):
     new = _abba_rows("latentserve_kernel_graphed", 19.0, 0.0)
     out = _run(tmp_path, old + new + _abba_rows("vllm", 17.0, 0.0))
     assert "19.0" in out and "30.0" not in out
+
+
+def test_baseline_selects_which_vllm_arm_everything_is_measured_against(tmp_path):
+    """A tuned vLLM arm is compared on its own terms. Here LatentServe beats
+    default vLLM but loses to the FlashInfer arm; each baseline must say so."""
+    rows = (_rows("latentserve_kernel_graphed", "hostA", "2026-10-03T10:00", 1.0, 1.8, 50)
+            + _rows("vllm", "hostA", "2026-10-03T10:30", 1.2, 2.2, 40)
+            + _rows("vllm_flashinfer", "hostA", "2026-10-03T11:00", 0.8, 1.4, 60))
+    cfg = load_config("configs/phase6_vllm.yaml")
+    (tmp_path / f"{cfg.tag}.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    outs = {}
+    for base in ("vllm", "vllm_flashinfer"):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            compare(cfg, str(tmp_path), baseline=base)
+        outs[base] = buf.getvalue()
+    ls_default = outs["vllm"].split("=== latentserve_kernel_graphed vs vllm ===")[1]
+    ls_tuned = outs["vllm_flashinfer"].split("=== latentserve_kernel_graphed vs vllm_flashinfer ===")[1]
+    assert "faster" in ls_default.split("decode latency")[1].splitlines()[0]
+    assert "slower" in ls_tuned.split("decode latency")[1].splitlines()[0]
+    # Against the default, the tuned arm is itself a challenger and gets a verdict.
+    assert "=== vllm_flashinfer vs vllm ===" in outs["vllm"]

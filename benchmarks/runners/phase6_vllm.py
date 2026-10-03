@@ -210,7 +210,8 @@ def run_latentserve(cfg, ref, requests, batch_size: int, block_size: int,
     }
 
 
-def run_vllm(cfg, requests, batch_size: int, max_seq_len: int) -> dict:
+def run_vllm(cfg, requests, batch_size: int, max_seq_len: int,
+             attention_backend: str | None = None) -> dict:
     """vLLM sizes its KV pool from *free* VRAM at construction
     (`gpu_memory_utilization`), so anything LatentServe left resident
     silently shrinks vLLM's cache and hands it a worse configuration.
@@ -225,6 +226,7 @@ def run_vllm(cfg, requests, batch_size: int, max_seq_len: int) -> dict:
         max_num_seqs=batch_size,
         enable_prefix_caching=False,
         seed=cfg.generation.seed,
+        attention_backend=attention_backend,
     )
     prompts = [r.prompt_ids for r in requests]
     counts = [r.max_new_tokens for r in requests]
@@ -319,6 +321,11 @@ def main() -> int:
                    help="per-phase breakdown of every LatentServe decode step")
     p.add_argument("--fuse-elementwise", action="store_true",
                    help="Phase 14a step 2: fused norms, RoPE and SiLU-and-multiply")
+    p.add_argument("--vllm-attention-backend", default=None,
+                   help="vLLM's attention backend (e.g. FLASHINFER, TRITON_ATTN). Rows are "
+                   "labelled vllm_<backend>; the default arm stays 'vllm'.")
+    p.add_argument("--baseline", default="vllm",
+                   help="the vLLM arm everything is compared against, e.g. vllm_flashinfer")
     p.add_argument("--decode-backend", default=None, choices=["triton", "cuda"],
                    help="LatentServe's decode attention kernel. Defaults to the "
                    "LATENTSERVE_DECODE_BACKEND environment variable, else triton. 'cuda' "
@@ -339,7 +346,7 @@ def main() -> int:
 
     cfg = load_config(args.config)
     if args.compare:
-        return compare(cfg, args.results_dir, host=args.host)
+        return compare(cfg, args.results_dir, host=args.host, baseline=args.baseline)
     if args.cuda_graphs:
         args.attn_impl = "triton_paged"
     # Each LatentServe variant is its own system, so the gather path, the
@@ -352,6 +359,9 @@ def main() -> int:
     }[(args.attn_impl, args.cuda_graphs)] + ("_fused" if args.fuse_projections else "") + (
         "_elementwise" if args.fuse_elementwise else "") + (
         "_int8" if args.kv_dtype == "int8" else "")
+
+    vllm_label = ("vllm" if not args.vllm_attention_backend
+                  else f"vllm_{args.vllm_attention_backend.lower()}")
 
     from kernels.gqa import paged_decode as _pd
 
@@ -455,10 +465,10 @@ def main() -> int:
             "prefix_caching": False, "num_requests": args.num_requests,
         }
 
-        for system in ([ls_label, "vllm"] if args.system == "both"
-                       else [ls_label if args.system == "latentserve" else "vllm"]):
+        for system in ([ls_label, vllm_label] if args.system == "both"
+                       else [ls_label if args.system == "latentserve" else vllm_label]):
             fresh = make()
-            if system == "vllm" and tok_ref.model is not None:
+            if system.startswith("vllm") and tok_ref.model is not None:
                 tok_ref.model = tok_ref.model.to("cpu")
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
                 torch.cuda.reset_peak_memory_stats() if torch.cuda.is_available() else None
@@ -477,7 +487,8 @@ def main() -> int:
                                     fuse_elementwise=args.fuse_elementwise,
                                     kv_dtype=args.kv_dtype)
                     if system.startswith("latentserve")
-                    else run_vllm(cfg, fresh, batch_size, max_seq_len)
+                    else run_vllm(cfg, fresh, batch_size, max_seq_len,
+                                  attention_backend=args.vllm_attention_backend)
                 )
             summary.update(gpu.summary())
             if slot == "throwaway":
@@ -608,7 +619,7 @@ def _best_decode(rows_by_out: dict, batch: int) -> dict:
             "prefill": prefill, "differenced": decode_ms}
 
 
-def compare(cfg, results_dir: str, host: str | None = None) -> int:
+def compare(cfg, results_dir: str, host: str | None = None, baseline: str = "vllm") -> int:
     """Run the comparison once per machine, never across machines.
 
     A results file accumulates rows from every session that wrote to it,
@@ -650,7 +661,7 @@ def compare(cfg, results_dir: str, host: str | None = None) -> int:
     usable = {
         h: rs for h, rs in by_host.items()
         if (host is None or h.split(" [")[0] == host)
-        and any(r["system"] == "vllm" for r in rs)
+        and any(r["system"] == baseline for r in rs)
         and any(r["system"].startswith("latentserve") for r in rs)
     }
     skipped = sorted(set(by_host) - set(usable))
@@ -666,12 +677,12 @@ def compare(cfg, results_dir: str, host: str | None = None) -> int:
         commits = sorted({r.get("git_commit", "?")[:7] for r in usable[h]})
         when = max(r.get("timestamp_utc", "") for r in usable[h])[:16]
         print(f"################ host {h}   commit {', '.join(commits)}   last run {when}")
-        _compare_rows(usable[h])
+        _compare_rows(usable[h], baseline)
         print()
     return 0
 
 
-def _compare_rows(rows: list) -> None:
+def _compare_rows(rows: list, baseline: str = "vllm") -> None:
     """Latency and throughput against vLLM, refusing unmatched pairs.
 
     Two questions, answered separately because they can disagree:
@@ -730,8 +741,8 @@ def _compare_rows(rows: list) -> None:
 
     systems = sorted({k[0] for k in groups})
     points = sorted({(k[1], k[2]) for k in groups})
-    if "vllm" not in systems:
-        print("No vLLM rows yet — run `--system vllm` in the same session.")
+    if baseline not in systems:
+        print(f"No {baseline} rows yet — run that arm in the same session.")
         return
 
     suspect: list = []
@@ -739,13 +750,13 @@ def _compare_rows(rows: list) -> None:
           f"{'median gap':>12}{'decode tok/s':>14}{'prefill tok/s':>15}{'e2e tok/s':>11}")
     verdict = defaultdict(dict)
     for batch, ctx in points:
-        base = groups.get(("vllm", batch, ctx))
+        base = groups.get((baseline, batch, ctx))
         if not base:
             continue
         base_row = base[max(base)]
         base_best = _best_decode(base, batch)
-        if ("vllm", batch, ctx) in abba_pairs:
-            sl = abba_pairs[("vllm", batch, ctx)]
+        if (baseline, batch, ctx) in abba_pairs:
+            sl = abba_pairs[(baseline, batch, ctx)]
             n = (sl[0].get("extra") or {}).get("num_requests")
             d_len = sl[1]["output_length"] - sl[0]["output_length"]
             if n and d_len:
@@ -759,7 +770,7 @@ def _compare_rows(rows: list) -> None:
             if not g:
                 continue
             row = g[max(g)]
-            if system != "vllm":
+            if system != baseline:
                 try:
                     assert_comparable(row, base_row)
                 except UnfairComparison as e:
@@ -798,7 +809,7 @@ def _compare_rows(rows: list) -> None:
                   f"{(f'{decode_tput:.0f}' if decode_tput else '-'):>14}"
                   f"{(f'{prefill:.0f}' if prefill else '-'):>15}"
                   f"{tput:>11.1f}{flag}{pair_note}")
-            if system != "vllm":
+            if system != baseline:
                 base_prefill = base_best["prefill"]
                 verdict[system][(batch, ctx)] = (
                     decode_ms, base_decode, tput / base_row["throughput_tokens_sec"],
@@ -807,7 +818,7 @@ def _compare_rows(rows: list) -> None:
         print()
 
     for system, pts in verdict.items():
-        print(f"=== {system} vs vLLM ===")
+        print(f"=== {system} vs {baseline} ===")
         # Three answers, kept apart. End-to-end throughput was the only one
         # reported at first, and at 8K it is 68-86% prefill — so a large
         # "throughput lead" can be entirely a prefill lead, which says
