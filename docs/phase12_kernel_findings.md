@@ -155,3 +155,56 @@ stored / 24 B loaded for the production variant, up to 148 B for others).
 `--maxrregcount` cannot do this: it is ignored for kernels that declare
 launch bounds. Which bound is faster is measured, not assumed:
 `phase12_diag --int8` times both, against Triton INT8 and CUDA fp16.
+
+### Result (T4, graph replay; correctness OK, max error 1.5e-5)
+
+| batch | ctx | INT8 Triton | INT8 CUDA b1 | INT8 CUDA b12 | fp16 CUDA | INT8 vs fp16 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 2048 | 0.143 ms | 0.135 | 0.137 | 0.129 | 0.96x |
+| 1 | 8192 | 0.326 | 0.168 | 0.171 | 0.147 | 0.87x |
+| 4 | 8192 | 0.877 | 0.280 | 0.248 | 0.244 | 0.99x |
+| 16 | 8192 | 2.981 | 0.837 | 0.724 | 0.690 | 0.95x |
+| 16 | 2048 | 0.818 | 0.240 | 0.207 | 0.200 | 0.97x |
+
+The prediction — INT8 faster than fp16 where attention is memory-bound — was
+wrong: INT8 is 1-13% slower everywhere. The goal of the step was met: INT8
+on the CUDA kernel is 3.4-4.1x faster than on Triton, so INT8 goes from
+roughly 3x slower than fp16 decode to a few percent, for ~1.8x the capacity.
+
+Why halving the bytes bought no time: both kernels issue the same number of
+load instructions per token (one per K row, one per V row, per lane); INT8's
+carry 8 bytes instead of 16. A kernel limited by memory latency, with a
+fixed number of loads in flight, moves half the bytes in the same time:
+INT8 reaches ~106 GB/s against fp16's 194. The per-token V-scale load and
+the conversions then make it slightly slower. Consistent with this, the
+bounded variant (b12) — more resident warps, more loads in flight — is
+11-13% faster at batch 4 and 16 despite its small spills, and is now the
+default. To make INT8 *faster* than fp16, each load must carry more: e.g.
+16 INT8 channels per lane, which costs registers this design does not have.
+
+### Whole decode steps, fp16 vs INT8 cache, both on the CUDA kernel
+
+| batch | ctx | fp16 | INT8 | INT8 cost |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 2048 | 16.60 ms | 17.67 | +6.5% |
+| 1 | 8192 | 17.70 | 19.04 | +7.5% |
+| 4 | 2048 | 18.42 | 19.53 | +6.0% |
+| 4 | 8192 | 21.51 | 23.97 | +11.4% |
+| 16 | 2048 | 20.98 | 23.61 | +12.5% |
+| 16 | 8192 | 33.05 | 39.40 | +19.4% |
+
+The prediction ("a few percent") counted only the attention kernel, whose
+extra cost is ~0.03 ms per layer at batch 16 / 8K, about 1 ms per step. The
+step is 6.4 ms slower. The rest is INT8's write side: 709 kernels per step
+against 429, the 280 extra being the per-token V quantization and residual
+copy, about ten small operations per layer — the cost Phase 14c identified,
+whose fix (one fused quantize-and-write kernel) was never built.
+
+Status: INT8 is correct, runs on the CUDA kernel (3.4-4.1x faster than on
+Triton), and gives ~1.8x capacity for 6-19% decode time. Parked in favour of
+Phase 14. The remaining cost is known, and so is its fix.
+
+A caution on reading kernel timings: fp16 at batch 1 / 8K measured 0.147 ms
+and 0.095 ms in two diagnostic runs. Batch-1 kernel timings in isolation are
+too noisy to rank variants; the batch 4 and 16 rows agree between runs to
+within 1%.

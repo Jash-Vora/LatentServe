@@ -247,6 +247,26 @@ class PagedKVCache:
         self._read_slots_dirty = True
         self._rebuild_kernel_inputs()
 
+    def rewind(self, length: int, slots: Optional[Sequence[int]] = None) -> None:
+        """Shorten the active sequences back to `length` tokens, keeping
+        their blocks.
+
+        Phase 14's oracle study prefills a long context once, then runs
+        sixteen policy x ratio configurations of decode steps from that same
+        state; re-prefilling 16K tokens per configuration would dominate
+        the run. Safe because a table only allocates when it grows past the
+        blocks it holds, and a position's slot depends only on the block
+        list: growing again reuses the same blocks and the same slots, and
+        the tokens written past `length` are simply overwritten.
+        """
+        for i in (self._active if slots is None else slots):
+            table = self.tables[i]
+            if not 0 <= length <= table.length:
+                raise ValueError(f"cannot rewind slot {i} from {table.length} to {length}")
+            table.length = length
+        self._read_slots_dirty = True
+        self._rebuild_kernel_inputs()
+
     def _build_read_slots(self) -> None:
         """Per-token slot index for the gather path, built on demand.
 

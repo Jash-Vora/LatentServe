@@ -280,10 +280,12 @@ class GQAAttention(nn.Module):
         # padding_mask() builds a tensor on the host per layer for the
         # gather path's benefit. That was a correctness-shaped caution
         # that kept continuous batching off the kernel entirely.
+        study = getattr(self, "sparse_study", None)
         if (
             s == 1
             and self.attn_impl == "triton_paged"
             and hasattr(cache, "block_tables_tensor")
+            and study is None          # a Phase 14 study replaces decode attention
         ):
             from kernels.gqa.paged_decode import paged_decode_attention
 
@@ -338,6 +340,16 @@ class GQAAttention(nn.Module):
 
         cached_kv_heads = k_all.shape[1]
         n_rep = self.num_attention_heads // cached_kv_heads
+
+        if s == 1 and study is not None:
+            # Phase 14 oracle study: decode attention through the sparse
+            # reference (model/attention/sparse.py), query heads folded onto
+            # their KV head so each group shares one page selection.
+            q_folded = q.reshape(b, cached_kv_heads, n_rep, self.head_dim)
+            out = study(q_folded, k_all, v_all, self.layer_idx, key_mask)
+            attn_out = out.reshape(b, self.num_attention_heads, 1, self.head_dim)
+            attn_out = attn_out.transpose(1, 2).contiguous().view(b, s, -1)
+            return self.o_proj(attn_out)
 
         if s == 1 and n_rep > 1 and self.kv_expansion == "fold":
             # Decode: no mask is needed (one query attends to everything),
