@@ -261,16 +261,24 @@ class LatentServeQwen:
             self.cache = ContiguousKVCache(spec)
         return self.cache
 
-    def set_sparse(self, ratio: Optional[float], recent: int = 2) -> None:
+    def set_sparse(self, ratio: Optional[float], recent: int = 2,
+                   scoring: Optional[str] = None) -> None:
         """Phase 14: sparse decode attention at `ratio` of the pages (None:
         dense). Needs the fp16 paged cache and attn_impl="triton_paged";
         the sparse kernels themselves are CUDA (kernels/cuda/paged_sparse).
         Enables page bounds on the current cache — rebuilt from whatever it
         already holds — and on every cache allocated after."""
         self.sparse_ratio = ratio
+        # "bounds" (max bound over the group) or "mass" (summed estimated
+        # attention mass, Phase 15). Persists until changed, so callers that
+        # only toggle the ratio keep the scoring they chose.
+        self.sparse_scoring = scoring or getattr(self, "sparse_scoring", "bounds")
+        if self.sparse_scoring not in ("bounds", "mass"):
+            raise ValueError(f"unknown sparse scoring {self.sparse_scoring!r}")
         for layer in self.layers:
             layer.attn.sparse_ratio = ratio
             layer.attn.sparse_recent = recent
+            layer.attn.sparse_scoring = self.sparse_scoring
         cache = getattr(self, "cache", None)
         if ratio is not None and cache is not None:
             if not hasattr(cache, "enable_page_bounds") or isinstance(cache, Int8PagedKVCache):

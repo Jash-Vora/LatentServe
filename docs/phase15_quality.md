@@ -145,3 +145,48 @@ and ~31K) is within 10% of the best. Paired failures are reported, not
 ranked on: ~25 dense-correct cases are too few to rank by. The winner is
 then built on the GPU path and judged on a fresh seed with the unchanged
 Phase 15 criteria. The 83 Phase 15 cases are never used for selection.
+
+## Bake-off result (seed 1, 25% of pages)
+
+| candidate | mass kept | KL 8K | KL ~31K | mean KL | paired fail / gain (of 32) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| oracle | 0.957 | 0.0022 | 0.0008 | 0.0015 | 0 / 1 |
+| rerank+dense2+window8 | 0.954 | 0.0034 | 0.0009 | 0.0022 | 0 / 1 |
+| rerank | 0.947 | 0.0034 | 0.0014 | 0.0024 | 0 / 1 |
+| mass+dense2+window8 | 0.942 | 0.0059 | 0.0020 | 0.0039 | 5 / 2 |
+| mass | 0.935 | 0.0059 | 0.0023 | 0.0041 | 3 / 1 |
+| bounds+dense2 | 0.923 | 0.0078 | 0.0039 | 0.0059 | 1 / 1 |
+| bounds+window8 | 0.916 | 0.0075 | 0.0043 | 0.0059 | 3 / 2 |
+| bounds | 0.914 | 0.0080 | 0.0045 | 0.0062 | 1 / 2 |
+| mean | 0.949 | 0.0204 | 0.0012 | 0.0108 | 3 / 1 |
+| mean+dense2+window8 | 0.956 | 0.0205 | 0.0012 | 0.0109 | 3 / 1 |
+
+Selected by the rule: **rerank+dense2+window8**, near the oracle. The
+prediction (mass+dense2+window8) was wrong: the two cheap tweaks barely
+help (-5% each), summed mass does real work (-34%), exact reranking most of
+it (-61%). Mean keys keep 95% of the mass yet fail badly at 8K: averaging a
+page erases the one spiky key that matters, so mass kept alone is not a
+sufficient measure.
+
+**A flaw in the rule:** "cost" meant build effort, not runtime. Reranking
+reads the keys of twice the budget to score them. Built simply, 25% with
+reranking reads ~56% of dense's bytes — the same as 50% with plain bounds,
+which already passes. Fused (scoring keeps its exact scores, attention
+reads only the selected pages' V), ~44%: about 1.45x at batch 8 / 32K
+against 50%'s 1.32x. Cost should have been bytes read.
+
+## Follow-up hypothesis — fixed before it is run
+
+Not the bake-off's selection, so tested on its own terms:
+
+* **Hypothesis:** summed-mass scoring makes 25% of pages pass the Phase 15
+  criteria, unchanged.
+* **Fresh data:** seed 2 — neither Phase 15's seed 0 nor the bake-off's seed
+  1 — at Phase 15's full sample sizes.
+* **Control on the same cases:** bounds scoring at 25%, seed 2. Without it a
+  pass could mean seed 2 is easier.
+* **Accepted either way;** no other seeds tried.
+
+GPU path: `page_index_heads` writes each query head's bound; summed mass is
+computed from them in torch, inside the CUDA graph
+(`set_sparse(..., scoring="mass")`, `phase15_quality --scoring mass`).

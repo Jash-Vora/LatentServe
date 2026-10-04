@@ -27,7 +27,8 @@ requires_gpu = pytest.mark.skipif(not (CAN_COMPILE and torch.cuda.is_available()
 def test_kernels_compile_without_spills():
     _, log = ps.compile_cubin("sm_75")
     if "registers" in (log or ""):
-        assert log.count("0 bytes spill stores") == 3, log
+        kernels = log.count("Compiling entry function")
+        assert kernels >= 4 and log.count("0 bytes spill stores") == kernels, log
         sparse = re.search(r"paged_sparse_fp16.*?Used (\d+) registers", log, re.S)
         assert sparse and int(sparse.group(1)) <= 200, log
 
@@ -166,3 +167,51 @@ def test_the_pipeline_survives_cuda_graph_capture():
 def test_kernels_load_without_spills_or_shared_memory():
     for name, r in ps.kernel_resources().items():
         assert r["local_bytes"] == 0 and r["shared_bytes"] == 0, (name, r)
+
+
+# ------------------------------------------- Phase 15 follow-up: mass ---
+
+
+@requires_gpu
+def test_mass_scores_match_the_reference_estimate():
+    from model.attention.sparse import estimated_mass, page_bounds, page_counts
+
+    lens = [700, 333]
+    q, k, v, tables, seq, kmin, kmax = _setup(lens, seed=11)
+    got = ps.page_scores_mass(q, kmin, kmax, tables, seq, recent=2).clone()
+    scale = 1.0 / math.sqrt(q.shape[-1])
+    for b, L in enumerate(lens):
+        np_ = -(-L // 16)
+        K = _gather(k, tables, b, np_ * 16)[None]                 # whole pages, as rebuilt
+        ref = estimated_mass(page_bounds(q[b:b + 1].float(), K, 16), page_counts(L, 16, "cuda"),
+                             scale)[0]                             # [H, P]
+        mid = slice(1, np_ - 2)
+        torch.testing.assert_close(got[b, :, mid], ref[:, mid], rtol=1e-3, atol=1e-6)
+        assert (got[b, :, 0] == float("inf")).all()
+        assert (got[b, :, np_ - 2:np_] == float("inf")).all()
+        assert (got[b, :, np_:] == float("-inf")).all()
+
+
+@requires_gpu
+def test_mass_scoring_at_full_budget_reproduces_dense():
+    from kernels.cuda import paged_decode_cuda as pdc
+
+    q, k, v, tables, seq, kmin, kmax = _setup([1024, 300], seed=12)
+    dense = pdc.paged_decode_cuda(q, k, v, tables, seq, 1024).clone()
+    got = ps.sparse_attention(q, k, v, tables, seq, kmin, kmax, ratio=1.0, scoring="mass")
+    torch.testing.assert_close(got.float(), dense.float(), atol=2e-3, rtol=1e-2)
+
+
+@requires_gpu
+def test_mass_scoring_survives_cuda_graph_capture():
+    q, k, v, tables, seq, kmin, kmax = _setup([1500, 900], seed=13)
+    ps.sparse_attention(q, k, v, tables, seq, kmin, kmax, ratio=0.25, scoring="mass")
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = ps.sparse_attention(q, k, v, tables, seq, kmin, kmax, ratio=0.25, scoring="mass")
+    q.copy_(torch.randn_like(q))
+    graph.replay()
+    torch.cuda.synchronize()
+    want = ps.sparse_attention(q, k, v, tables, seq, kmin, kmax, ratio=0.25, scoring="mass")
+    torch.testing.assert_close(out.float(), want.float(), atol=1e-3, rtol=1e-3)

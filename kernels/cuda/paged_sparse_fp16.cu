@@ -130,6 +130,66 @@ page_index(const __half* __restrict__ q, const __half* __restrict__ kmin,
 }
 
 // ------------------------------------------------------------------------
+// 2b. The indexer, per head: each query head's bound for every page, not
+// their maximum — for summed-mass scoring (Phase 15), which turns each head's
+// bounds into estimated attention weights and sums them over the group, as
+// the oracle ranks. Pages past the end get 0, a *finite* value: the scratch
+// buffer may hold stale bit patterns that read as NaN, and NaN + -inf is
+// still NaN, which would poison the head's softmax. Their token count of 0
+// (log 0 = -inf) removes them downstream.
+// grid (B, H_kv, ceil(max_pages / (4 * PAGES_PER_WARP))), block 128 threads.
+extern "C" __global__ void __launch_bounds__(128)
+page_index_heads(const __half* __restrict__ q, const __half* __restrict__ kmin,
+                 const __half* __restrict__ kmax, const int* __restrict__ block_tables,
+                 const int* __restrict__ seq_lens, float* __restrict__ heads,
+                 int max_pages,
+                 long long sq_b, long long sq_h, long long sq_m,
+                 long long sb_b, long long sb_h,
+                 long long sh_b, long long sh_h, long long sh_r) {
+    const int b = blockIdx.x, h = blockIdx.y;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int first = (blockIdx.z * 4 + warp) * PAGES_PER_WARP;
+    if (first >= max_pages) return;
+    const int d0 = lane * 4;
+
+    float qf[NREP][4];
+#pragma unroll
+    for (int r = 0; r < NREP; ++r) {
+        const __half2* p = reinterpret_cast<const __half2*>(q + b * sq_b + h * sq_h + r * sq_m + d0);
+        const float2 a = __half22float2(p[0]), c = __half22float2(p[1]);
+        qf[r][0] = a.x; qf[r][1] = a.y; qf[r][2] = c.x; qf[r][3] = c.y;
+    }
+    const int L = seq_lens[b];
+    const int np = (L + PAGE - 1) / PAGE;
+    float* out = heads + b * sh_b + h * sh_h;
+
+    for (int k = 0; k < PAGES_PER_WARP; ++k) {
+        const int p = first + k;
+        if (p >= max_pages) break;
+        if (p >= np) {
+            if (lane < NREP) out[lane * sh_r + p] = 0.f;
+            continue;
+        }
+        const int blk = block_tables[(long long)b * max_pages + p];
+        const __half2* mn = reinterpret_cast<const __half2*>(kmin + blk * sb_b + h * sb_h + d0);
+        const __half2* mx = reinterpret_cast<const __half2*>(kmax + blk * sb_b + h * sb_h + d0);
+        const float2 n0 = __half22float2(mn[0]), n1 = __half22float2(mn[1]);
+        const float2 x0 = __half22float2(mx[0]), x1 = __half22float2(mx[1]);
+        const float lo[4] = {n0.x, n0.y, n1.x, n1.y};
+        const float hi[4] = {x0.x, x0.y, x1.x, x1.y};
+#pragma unroll
+        for (int r = 0; r < NREP; ++r) {
+            float s = 0.f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) s += fmaxf(qf[r][j] * lo[j], qf[r][j] * hi[j]);
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) s += __shfl_xor_sync(FULL, s, off);
+            if (lane == 0) out[r * sh_r + p] = s;
+        }
+    }
+}
+
+// ------------------------------------------------------------------------
 // 3. Attention over the selected pages.
 static __device__ __forceinline__ void load8(const __half* p, float* f) {
     const uint4 raw = __ldg(reinterpret_cast<const uint4*>(p));

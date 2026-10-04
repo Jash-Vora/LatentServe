@@ -420,6 +420,12 @@ def curves(results_dir: Path, ratios) -> int:
         return 1
 
     lines = ["# Phase 15 results", ""]
+    for f in sorted(results_dir.glob("*.json")):
+        a = json.loads(f.read_text()).get("args", {})
+        if "scoring" in a:
+            lines += [f"GPU-path page scoring: **{a['scoring']}**, seed {a.get('seed', 0)}", ""]
+            print(lines[-2])
+            break
 
     def emit(s=""):
         print(s)
@@ -569,6 +575,9 @@ def main() -> int:
     p.add_argument("--oracle-max-ctx", type=int, default=16384,
                    help="the oracle's fp32 reference is slow; skip it above this context")
     p.add_argument("--no-oracle", action="store_true")
+    p.add_argument("--scoring", choices=["bounds", "mass"], default="bounds",
+                   help="the GPU path's page scoring: max bound over the group (Phase 15) or "
+                   "summed estimated mass (the follow-up hypothesis)")
     p.add_argument("--hops", type=int, default=2,
                    help="vartrack chain length. 4 hops left dense at 1/12 in the quick "
                    "pass: a test dense cannot do measures nothing about sparsity")
@@ -609,6 +618,7 @@ def main() -> int:
         model = LatentServeQwen.from_reference(ref, max_seq_len_hint=32768 + 512,
                                                attn_impl="triton_paged", fuse_projections=True)
         model.set_elementwise(True)
+        model.set_sparse(None, scoring=args.scoring)
         shapes = [(1, 8192), (8, 32768), (16, 16384)]
         rounds, steps = (1, 24) if args.quick else (3, 48)
         rows = []
@@ -634,6 +644,8 @@ def main() -> int:
     ls = LatentServeQwen.from_reference(ref, attn_impl="triton_paged",
                                         max_seq_len_hint=max(args.lengths) + 1024)
     ls._gpu_mode = True
+    ls.set_sparse(None, scoring=args.scoring)
+    log(f"GPU-path page scoring: {args.scoring}")
     wiki = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
     stream = _ids(tok, "\n\n".join(t for t in wiki["text"] if t.strip()))
     filler = Filler(stream[100_000:] + stream[:100_000], offset=args.seed * 50_021)

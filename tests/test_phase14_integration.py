@@ -167,3 +167,19 @@ def test_sparse_generation_is_identical_with_and_without_cuda_graphs():
         return {r.request_id: r.output_ids for r in engine.run()}
 
     assert run(True) == run(False)
+
+
+def test_scoring_persists_when_only_the_ratio_changes():
+    """The harness toggles configurations with set_sparse(ratio) alone; the
+    scoring chosen once must survive that, or a "mass" run silently becomes
+    a "bounds" run."""
+    ls = _model()
+    ls.set_sparse(None, scoring="mass")
+    ls.set_sparse(0.25)
+    assert ls.sparse_scoring == "mass"
+    assert all(layer.attn.sparse_scoring == "mass" for layer in ls.layers)
+    ls.set_sparse(None)
+    ls.set_sparse(0.5)
+    assert ls.layers[0].attn.sparse_scoring == "mass"
+    with pytest.raises(ValueError, match="unknown sparse scoring"):
+        ls.set_sparse(0.25, scoring="max")

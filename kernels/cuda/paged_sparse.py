@@ -66,7 +66,8 @@ def _functions(device: torch.device, head_dim: int, n_rep: int, page: int) -> di
             mod = cupy.cuda.Module()
             mod.load(cubin)
             _MODULES[key] = (mod, {n: mod.get_function(n) for n in
-                                   ("page_bounds_update", "page_index", "paged_sparse_fp16")})
+                                   ("page_bounds_update", "page_index", "page_index_heads",
+                                    "paged_sparse_fp16")})
     return _MODULES[key][1]
 
 
@@ -122,6 +123,44 @@ def page_scores(q, kmin, kmax, block_tables, seq_lens, recent: int = 2) -> torch
     return scores
 
 
+def page_scores_mass(q, kmin, kmax, block_tables, seq_lens, recent: int = 2,
+                     softmax_scale: Optional[float] = None, page: int = 16) -> torch.Tensor:
+    """Summed-mass scores [B, H, max_pages]: each query head's bounds turned
+    into estimated attention weights — a softmax over pages of
+    bound * scale + log(tokens in the page) — summed over the group, as the
+    oracle ranks by total mass. Sink and recent pages +inf, pages past the
+    end -inf. Matches model.attention.sparse.estimated_mass."""
+    import numpy as np
+
+    from kernels.gqa import paged_decode as pd
+
+    b, h, n_rep, d = q.shape
+    max_pages = block_tables.shape[1]
+    heads = pd._scratch("sparse_heads", (b, h, n_rep, max_pages), torch.float32, q.device)
+    fn = _functions(q.device, d, n_rep, page)["page_index_heads"]
+    i64 = np.int64
+    grid_z = -(-max_pages // (4 * PAGES_PER_WARP))
+    fn((b, h, grid_z), (128, 1, 1),
+       (np.uint64(q.data_ptr()), np.uint64(kmin.data_ptr()), np.uint64(kmax.data_ptr()),
+        np.uint64(block_tables.data_ptr()), np.uint64(seq_lens.data_ptr()),
+        np.uint64(heads.data_ptr()), np.int32(max_pages),
+        i64(q.stride(0)), i64(q.stride(1)), i64(q.stride(2)),
+        i64(kmin.stride(0)), i64(kmin.stride(1)),
+        i64(heads.stride(0)), i64(heads.stride(1)), i64(heads.stride(2))),
+       stream=pdc._stream(q.device))
+    scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(d)
+    idx = torch.arange(max_pages, device=q.device)
+    lens = seq_lens.to(torch.int64)[:, None]
+    counts = (lens - idx[None, :] * page).clamp(0, page).to(torch.float32)     # [B, P]
+    logits = heads * scale + torch.log(counts)[:, None, None, :]
+    score = torch.softmax(logits, dim=-1).sum(dim=2)                           # [B, H, P]
+    pages = (lens + page - 1) // page
+    forced = (idx[None, :] == 0) | ((idx[None, :] >= pages - recent) & (idx[None, :] < pages))
+    score = torch.where(forced[:, None, :], torch.full_like(score, float("inf")), score)
+    return torch.where((idx[None, :] >= pages)[:, None, :],
+                       torch.full_like(score, float("-inf")), score)
+
+
 def select(scores: torch.Tensor, k: int) -> torch.Tensor:
     """Top-k pages per (sequence, head), unsorted: online softmax does not
     care about order. -> int32 [B, H, k]."""
@@ -166,7 +205,8 @@ def sparse_decode(q, k_pool, v_pool, block_tables, seq_lens, sel,
 def sparse_attention(q, k_pool, v_pool, block_tables, seq_lens, kmin, kmax,
                      ratio: float = 0.25, recent: int = 2,
                      num_splits: Optional[int] = None, max_seq_len: Optional[int] = None,
-                     softmax_scale: Optional[float] = None) -> torch.Tensor:
+                     softmax_scale: Optional[float] = None,
+                     scoring: str = "bounds") -> torch.Tensor:
     """Index, select, attend. ratio >= 1 still runs all three: a check that
     the sparse path reproduces dense, not a shortcut to it.
 
@@ -178,7 +218,14 @@ def sparse_attention(q, k_pool, v_pool, block_tables, seq_lens, kmin, kmax,
     pages = block_tables.shape[1] if max_seq_len is None else min(
         block_tables.shape[1], -(-max_seq_len // k_pool.shape[1]))
     k = budget(ratio, pages, recent)
-    sel = select(page_scores(q, kmin, kmax, block_tables, seq_lens, recent), k)
+    if scoring == "mass":
+        scores = page_scores_mass(q, kmin, kmax, block_tables, seq_lens, recent, softmax_scale,
+                                  page=k_pool.shape[1])
+    elif scoring == "bounds":
+        scores = page_scores(q, kmin, kmax, block_tables, seq_lens, recent)
+    else:
+        raise ValueError(f"unknown scoring {scoring!r}")
+    sel = select(scores, k)
     return sparse_decode(q, k_pool, v_pool, block_tables, seq_lens, sel, num_splits,
                          softmax_scale)
 

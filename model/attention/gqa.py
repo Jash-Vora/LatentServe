@@ -307,7 +307,8 @@ class GQAAttention(nn.Module):
                         cache.block_tables_tensor(b), cache.seq_lens_tensor(b),
                         bounds[0], bounds[1], ratio=ratio,
                         recent=getattr(self, "sparse_recent", 2),
-                        max_seq_len=cache.max_len, softmax_scale=self.scaling)
+                        max_seq_len=cache.max_len, softmax_scale=self.scaling,
+                        scoring=getattr(self, "sparse_scoring", "bounds"))
                     attn_out = out.reshape(b, self.num_attention_heads, 1, self.head_dim)
                     attn_out = attn_out.transpose(1, 2).contiguous().view(b, s, -1)
                     return self.o_proj(attn_out)
