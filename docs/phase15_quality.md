@@ -44,3 +44,104 @@ Every case keeps context + question + answer within its stated length, and
 the "32K" text windows shrink to fit their continuation: Qwen2.5-1.5B was
 trained on 32,768 positions, and going past them would mix position
 extrapolation into the sparsity measurement.
+
+## Quick pass (`--quick`, ~20 min): what it showed, and two instrument fixes
+
+Verdicts on the quick sample: **50% PASS, 25% PASS (1 paired failure of 29
+dense-correct — exactly the limit), 12.5% FAIL (4 of 29, ~14% against 2%),
+6.25% and 3.1% FAIL.** The oracle failed once at 12.5%: perfect selection
+would still pass there, so 12.5%'s failures belong to the indexer, not to
+sparsity itself. Multikey matched dense down to 6.25% (7/8) — the prediction
+that it would break first was wrong; needle and QA broke first.
+
+Whole steps (batch 8 / 32K): 1.32x at 50%, 1.70x at 25%, 1.97x at 12.5%,
+2.14x at 6.25%, 2.24x at 3.1%. At batch 1 / 8K, 0.97x-1.08x.
+
+Two instruments needed fixing before the full run:
+
+1. **vartrack: dense scored 1/12.** A 1.5B model could not follow a four-hop
+   chain with distractors, so the task contributed almost no dense-correct
+   cases and multi-hop was untested. It now defaults to two hops
+   (`--hops`), and its difficulty is calibrated on **dense alone**
+   (`--dense-only`) before any sparse run. These quick results include
+   sparse numbers, so the change rests only on dense's failure; the pass
+   criteria are untouched.
+2. **gen had no control.** Even 50% matched dense on 1 of 4 outputs, first
+   difference at a median of 12 tokens — uninterpretable without knowing how
+   fast two *correct* dense implementations drift apart on the same
+   high-entropy Wikitext prompts. The gen task now also runs dense through
+   the Triton kernel, as that control.
+
+`curves` now also breaks paired failures down by context length.
+
+## vartrack: dropped
+
+Calibrated on dense alone at two hops (`--dense-only --quick`): **0/12**. By
+the rule set before calibrating — if dense still fails at two hops, drop the
+task rather than simplify it into a second needle test — it is out of the
+full run. The pass criteria are unaffected: vartrack supplied one of the
+quick pass's 29 dense-correct cases. **Limitation:** sparsity's effect on
+multi-hop retrieval is unmeasured here, because Qwen2.5-1.5B cannot do
+multi-hop variable tracking even with full attention; answering it needs a
+larger model.
+
+## Full run: results
+
+Needle 40 cases, multikey 24, QA 36; dense correct on 39, 22 and 22 (83
+total). Text: 4 windows x 256 tokens at 8K, 2 at ~31K. Gen: 16 prompts.
+
+| budget | paired failures / gains (of 83; 1 allowed) | KL 8K | KL 31K | verdict |
+| ---: | ---: | ---: | ---: | --- |
+| 50% | 0 / 0 | 0.0032 | 0.0007 | **PASS** |
+| 25% | 4 / 1 | 0.0146 | 0.0051 | **FAIL** (both criteria) |
+| 12.5% | 11 / 3 | 0.0453 | 0.0163 | FAIL |
+| 6.25% | 25 / 0 | 0.0943 | 0.0381 | FAIL |
+| 3.1% | 54 / 1 | 0.1804 | 0.0701 | FAIL |
+
+Paired failures by context at 25%: 1/21 at 4K, 1/23 at 8K, 0/19 at 16K,
+2/20 at 32K — not confined to long contexts. With ~20 cases per cell, 0/19
+is consistent with true failure rates up to ~15%; choosing a per-length
+policy from these cells after seeing them would be the post-hoc slicing the
+fixed criteria exist to prevent.
+
+**The indexer, not sparsity, is what fails.** Up to 16K the oracle loses
+nothing at 25% (0 failures) and one case at 12.5%; the GPU path loses two at
+25% over the same lengths. Perfect page selection would pass at 25%.
+
+**Generation control:** dense on the Triton kernel matches dense on the CUDA
+kernel on 14/16 outputs for all 128 tokens. Sparse divergence — median first
+difference 19 tokens even at 50% — is a real change in behaviour, not
+numerical noise. Whether the divergent text is worse is not measured.
+
+Whole steps (batch 8 / 32K, batch 16 / 16K): 1.32x at 50%, 1.71x at 25%,
+1.97x at 12.5%, 2.16x at 6.25%, 2.27x at 3.1%. Batch 1 / 8K: 0.97x at 50%.
+
+**Phase 15 result: sparse decode is validated at 50% of pages — ~1.3x where
+attention dominates the step, nothing at batch 1. 25% buys 1.7x but loses
+retrieval and language-modelling quality with this indexer; the oracle
+shows the loss is in page selection.** The prediction that 25% would pass
+was wrong.
+
+## Indexer bake-off — protocol fixed before any result
+
+`benchmarks/runners/phase15_bakeoff.py`. At 25% of pages, in reference math:
+
+| candidate | change | build cost |
+| --- | --- | ---: |
+| bounds | today's indexer (baseline) | 0 |
+| bounds+window8 | 8 recent pages kept, not 2 | 0 |
+| bounds+dense2 | first 2 layers dense (Quest) | 0 |
+| mass | bounds as estimated attention mass, summed over the group (oracle-like ranking) | 1 |
+| mean | the same estimate from q . mean(K): an estimate, one vector per page | 2 |
+| rerank | bounds pick 2x the budget; exact key scores keep the best | 3 |
+| mass / mean / rerank + dense2 + window8 | each with both cheap tweaks | 1 / 2 / 3 |
+| oracle | the ceiling; never selected | - |
+
+**Rule.** A development set from a new seed (default 1) — new text, new
+questions; the starting points of filler and text windows depend on the
+seed, so a new seed is genuinely new data (seed 0 keeps Phase 15's). The
+winner is the *cheapest* buildable candidate whose mean development KL (8K
+and ~31K) is within 10% of the best. Paired failures are reported, not
+ranked on: ~25 dense-correct cases are too few to rank by. The winner is
+then built on the GPU path and judged on a fresh seed with the unchanged
+Phase 15 criteria. The 83 Phase 15 cases are never used for selection.

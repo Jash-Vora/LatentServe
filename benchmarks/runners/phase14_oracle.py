@@ -93,7 +93,8 @@ def _step(ls, token: int, device):
     return ls.decode_step(torch.tensor([[token]], device=device))[0, -1]
 
 
-def eval_text(ls, windows, cfgs, ctx: int, recent: int, device, log=print) -> dict:
+def eval_text(ls, windows, cfgs, ctx: int, recent: int, device, log=print,
+              apply_fn=None) -> dict:
     """Prefill each window's first `ctx` tokens densely, then teacher-force
     the rest through sparse decode steps."""
     import torch
@@ -111,7 +112,7 @@ def eval_text(ls, windows, cfgs, ctx: int, recent: int, device, log=print) -> di
             dense_logp = []
             for c in cfgs:
                 ls.cache.rewind(ctx)
-                study = _apply(ls, c, recent)
+                study = (apply_fn or _apply)(ls, c, recent)
                 r = out[c]
                 for t in range(len(ids) - ctx - 1):
                     logp = torch.log_softmax(_step(ls, ids[ctx + t], device).float(), -1)

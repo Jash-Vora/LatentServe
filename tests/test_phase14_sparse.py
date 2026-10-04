@@ -203,3 +203,56 @@ def test_the_study_runs_end_to_end_on_a_tiny_model(capsys):
 
 def statistics_mean(xs):
     return sum(xs) / len(xs)
+
+
+# ------------------------------------------------------- Phase 15 bake-off ---
+
+
+@pytest.mark.parametrize("policy", sp.BAKEOFF_POLICIES)
+def test_bakeoff_policies_at_full_budget_are_dense(policy):
+    q, k, v = _qkv(seed=6)
+    torch.testing.assert_close(sp.SparseStudy(policy, 1.0)(q, k, v), _dense(q, k, v),
+                               atol=1e-5, rtol=1e-5)
+
+
+def test_page_means_average_only_written_tokens():
+    k = torch.arange(2 * 20, dtype=torch.float32).reshape(1, 1, 40, 1).expand(1, 2, 40, 3)[:, :, :20]
+    means = sp.page_means(k.contiguous(), 16)                     # pages: 16 tokens, then 4
+    torch.testing.assert_close(means[0, 0, :, 0], torch.tensor([7.5, 17.5]))
+
+
+def test_estimated_mass_gives_each_head_a_total_of_one():
+    logits = torch.randn(1, 2, 6, 9)
+    est = sp.estimated_mass(logits, torch.full((9,), 16.0), 0.1)
+    torch.testing.assert_close(est.sum(-1), torch.full((1, 2), 6.0))
+
+
+@pytest.mark.parametrize("policy", sp.BAKEOFF_POLICIES)
+def test_bakeoff_policies_keep_the_sink_and_recent_pages(policy):
+    q, k, v = _qkv(t=320, seed=7)
+    study = sp.SparseStudy(policy, 0.25, recent=3)
+    study(q, k, v)
+    assert study.kept[-1] == pytest.approx(5 / 20)                # budget honoured
+    keep = study._select_bakeoff(policy, q, k, sp.page_mass(
+        torch.softmax(q @ k.transpose(-1, -2) / math.sqrt(32), -1), 16), 20, 320, 32)
+    assert keep[..., 0].all() and keep[..., 17:].all()
+
+
+def test_rerank_never_keeps_less_mass_than_bounds():
+    """Bounds' top pages are always among rerank's candidates, so choosing
+    by exact scores from that superset cannot do worse."""
+    for seed in range(5):
+        q, k, v = _qkv(t=640, seed=10 + seed)
+        got = {}
+        for policy in ("bounds", "rerank"):
+            study = sp.SparseStudy(policy, 0.125)
+            study(q, k, v)
+            got[policy] = study.captured[-1]
+        assert got["rerank"] >= got["bounds"] - 1e-6
+
+
+def test_dense_layers_attend_densely():
+    q, k, v = _qkv(t=320, seed=8)
+    study = sp.SparseStudy("bounds", 0.1, dense_layers=2)
+    torch.testing.assert_close(study(q, k, v, layer_idx=1), _dense(q, k, v), atol=1e-5, rtol=1e-5)
+    assert not torch.allclose(study(q, k, v, layer_idx=2), _dense(q, k, v), atol=1e-3)

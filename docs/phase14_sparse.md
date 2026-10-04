@@ -216,3 +216,15 @@ needle. Top-1 agreement is ~1 point lower on the GPU path — one token in
 **Phase 14 operating point: 25% of pages — KL 0.009 and every needle found,
 for up to 1.7x faster decode steps.** 12.5% remains borderline pending the
 full quality run.
+
+
+## Correction (Phase 15)
+
+The operating point above — "25% of pages: KL 0.009, every needle found,
+quality on par with dense" — rested on 9 needles and 126 tokens of text.
+Phase 15's pre-registered study (83 dense-correct retrieval and QA cases,
+~1,500 tokens of text) overturns it: at 25% the GPU path loses 4 answers
+dense got right (gaining 1) and its KL at 8K is 0.0146, failing both
+criteria. Only 50% passes. Up to 16K the oracle loses nothing at 25%, so
+the loss is the bound-based indexer's, not sparsity's. See
+docs/phase15_quality.md.

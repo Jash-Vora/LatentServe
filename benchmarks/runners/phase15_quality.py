@@ -107,8 +107,11 @@ def _with_inserts(filler: list, inserts) -> list:
 class Filler:
     """Wikitext tokens handed out in order, wrapping: each case gets fresh text."""
 
-    def __init__(self, stream):
-        self.stream, self.offset = stream, 0
+    def __init__(self, stream, offset: int = 0):
+        # The starting point depends on the seed: a new seed alone would only
+        # change the passkeys, leaving nearly the same contexts. Seed 0 starts
+        # at 0, so the published Phase 15 run is reproducible.
+        self.stream, self.offset = stream, offset % max(1, len(stream))
 
     def take(self, n: int) -> list:
         n = max(0, n)
@@ -233,7 +236,14 @@ def cfg_list(ratios, oracle=True) -> list:
     return out + ([("oracle", r) for r in ratios] if oracle else [])
 
 
-def eval_cases(ls, cases, cfgs, recent, tok, device, oracle_max_ctx, log=print) -> list:
+def circular(stream, start: int, n: int) -> list:
+    start %= len(stream)
+    out = stream[start:start + n]
+    return out + stream[:n - len(out)] if len(out) < n else out
+
+
+def eval_cases(ls, cases, cfgs, recent, tok, device, oracle_max_ctx, log=print,
+               apply_fn=None) -> list:
     """Every case under every configuration: prefill once, rewind between."""
     import torch
 
@@ -257,7 +267,7 @@ def eval_cases(ls, cases, cfgs, recent, tok, device, oracle_max_ctx, log=print) 
                     rows.append({**row, "correct": None, "output": None})
                     continue
                 ls.cache.rewind(n)
-                _apply(ls, c, recent)
+                (apply_fn or _apply)(ls, c, recent)
                 logits = None
                 for t in case.question:
                     logits = _step(ls, t, device)
@@ -626,7 +636,7 @@ def main() -> int:
     ls._gpu_mode = True
     wiki = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
     stream = _ids(tok, "\n\n".join(t for t in wiki["text"] if t.strip()))
-    filler = Filler(stream[100_000:] + stream[:100_000])
+    filler = Filler(stream[100_000:] + stream[:100_000], offset=args.seed * 50_021)
     cfgs = [("dense", 1.0)] if args.dense_only else cfg_list(args.ratios, oracle=not args.no_oracle)
 
     if args.task in CASE_TASKS:
@@ -660,13 +670,13 @@ def main() -> int:
         # measuring position extrapolation. The window shrinks to fit.
         limit = ref.shape.max_position_embeddings - cont - 16
         plan = [(8192, 1 if args.quick else 4), (min(32768, limit), 1 if args.quick else 2)]
-        offset = 0
+        offset = args.seed * 100_003          # seed 0: the published windows
         for ctx, windows in plan:
             if ctx > max(args.lengths) + 1024:
                 continue
             ws = []
             for _ in range(windows):
-                ws.append(stream[offset:offset + ctx + cont])
+                ws.append(circular(stream, offset, ctx + cont))
                 offset += ctx + cont
             text_cfgs = [c for c in cfgs if c[0] != "oracle"]   # ceiling already in Phase 14
             res = eval_text(ls, ws, text_cfgs, ctx, args.recent, device, log=log)

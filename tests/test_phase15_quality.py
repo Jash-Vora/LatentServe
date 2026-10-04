@@ -216,3 +216,63 @@ def test_gen_control_runs_dense_on_the_triton_kernel():
     finally:
         pd.set_decode_backend(before)
     assert {r["policy"] for r in rows} == {"dense", "triton"}
+
+
+# ------------------------------------------------------------- bake-off ---
+
+from benchmarks.runners import phase15_bakeoff as bo  # noqa: E402
+
+
+def _row(name, kl, cost):
+    return {"variant": name, "kl": kl, "cost": cost}
+
+
+def test_rule_picks_the_cheapest_within_ten_percent_of_the_best():
+    rows = [_row("rerank", 0.0060, 3), _row("mass", 0.0065, 1), _row("bounds", 0.0090, 0),
+            _row("oracle", 0.0010, None)]
+    assert bo.choose(rows)["variant"] == "mass"          # 0.0065 <= 1.1 x 0.0060, cheaper
+
+
+def test_rule_takes_the_best_when_nothing_cheap_is_close():
+    rows = [_row("rerank", 0.0060, 3), _row("mass", 0.0080, 1)]
+    assert bo.choose(rows)["variant"] == "rerank"
+
+
+def test_rule_never_selects_the_oracle():
+    assert bo.choose([_row("oracle", 0.0001, None), _row("bounds", 0.01, 0)])["variant"] == "bounds"
+
+
+def test_seeds_change_the_contexts_and_seed_zero_keeps_the_published_ones():
+    stream = list(range(1000))
+    assert pq.Filler(stream).take(5) == [0, 1, 2, 3, 4]
+    assert pq.Filler(stream, offset=1 * 50_021).take(5) != pq.Filler(stream).take(5)
+    assert pq.circular(stream, 998, 4) == [998, 999, 0, 1]
+
+
+def test_each_variant_installs_what_it_names():
+    from model.attention import sparse as sp
+
+    ls = _tiny_model()
+    for name, v in bo.VARIANTS.items():
+        study = bo.apply_variant(ls, (name, 0.25), 2)
+        assert (study.policy, study.recent, study.dense_layers) == \
+               (v["policy"], v["recent"], v["dense_layers"])
+        assert ls.layers[0].attn.sparse_study is study
+    sp.install(ls, None)
+
+
+def test_bakeoff_loop_runs_on_a_tiny_model():
+    from benchmarks.runners.phase14_oracle import eval_text
+
+    ls = _tiny_model()
+    cfgs = [("dense", 1.0)] + [(v, 0.25) for v in ("bounds", "mass", "mean", "rerank+dense2+window8")]
+    g = torch.Generator().manual_seed(0)
+    windows = [torch.randint(0, 128, (300,), generator=g).tolist()]
+    out = eval_text(ls, windows, cfgs, 280, 2, "cpu", log=lambda m: None,
+                    apply_fn=bo.apply_variant)
+    assert all(len(out[c]["kl"]) == 19 for c in cfgs)
+    assert statistics_mean(out[("dense", 1.0)]["captured"]) == pytest.approx(1.0, abs=1e-6)
+
+
+def statistics_mean(xs):
+    return sum(xs) / len(xs)
