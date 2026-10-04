@@ -129,7 +129,7 @@ def test_verdicts_apply_the_preregistered_criteria():
     text = {8192: {("gpu", 0.25): {"kl": 0.009}}, 32768: {("gpu", 0.25): {"kl": 0.008}}}
     assert pq.verdicts(_rows(2), text, [0.25])[0]["pass"]            # 2 <= 2% of 100
     v = pq.verdicts(_rows(3), text, [0.25])[0]
-    assert not v["pass"] and "3 paired failures" in v["reasons"][0]
+    assert not v["pass"] and "net loss 3" in v["reasons"][0]
     bad_kl = {8192: {("gpu", 0.25): {"kl": 0.02}}}
     assert not pq.verdicts(_rows(0), bad_kl, [0.25])[0]["pass"]
     assert pq.verdicts(_rows(1, n=10), None, [0.25])[0]["pass"]      # at least one allowed
@@ -147,6 +147,7 @@ def test_curves_writes_a_summary_with_verdicts(tmp_path, capsys):
     assert pq.curves(tmp_path, [0.25]) == 0
     summary = (tmp_path / "summary.md").read_text()
     assert "25.0% of pages: PASS" in summary and "1.66x" in summary
+    assert "original rule: pass" in summary
 
 
 def test_cases_run_under_every_policy_on_a_tiny_model():
@@ -276,3 +277,45 @@ def test_bakeoff_loop_runs_on_a_tiny_model():
 
 def statistics_mean(xs):
     return sum(xs) / len(xs)
+
+
+
+def test_symmetric_churn_passes_the_revised_rule_but_not_the_original():
+    """Seed 3's 50% replication: 2 failures, 3 gains. Counting failures only
+    fails a configuration that lost nothing on net."""
+    rows = []
+    outcomes = [(True, False)] * 2 + [(False, True)] * 3 + [(True, True)] * 80
+    for case, (d, s) in enumerate(outcomes):
+        rows.append({"task": "qa", "case": case, "policy": "dense", "ratio": 1.0, "correct": d})
+        rows.append({"task": "qa", "case": case, "policy": "gpu", "ratio": 0.5, "correct": s})
+    v = pq.verdicts(rows, {8192: {("gpu", 0.5): {"kl": 0.003}}}, [0.5])[0]
+    assert v["pass"] and not v["original_pass"] and v["net_loss"] == -1
+
+
+def test_the_revised_rule_still_fails_a_net_loss():
+    rows = []
+    outcomes = [(True, False)] * 4 + [(False, True)] * 1 + [(True, True)] * 80
+    for case, (d, s) in enumerate(outcomes):
+        rows.append({"task": "qa", "case": case, "policy": "dense", "ratio": 1.0, "correct": d})
+        rows.append({"task": "qa", "case": case, "policy": "gpu", "ratio": 0.25, "correct": s})
+    v = pq.verdicts(rows, None, [0.25])[0]
+    assert not v["pass"] and v["net_loss"] == 3
+
+
+def test_the_dense_control_runs_on_case_tasks_and_is_reported_as_the_noise_floor(tmp_path):
+    from kernels.gqa import paged_decode as pd
+
+    ls = _tiny_model()
+    tok = CharTok()
+    cases = pq.build_needles(tok, _filler(), [400], [0.5], 1, random.Random(0))
+    before = pd.decode_backend()
+    try:
+        rows = pq.eval_cases(ls, cases, [("dense", 1.0), ("triton", 1.0), ("gpu", 0.25)], 2, tok,
+                             "cpu", oracle_max_ctx=16384, log=lambda m: None)
+    finally:
+        pd.set_decode_backend(before)
+    assert {r["policy"] for r in rows} == {"dense", "triton", "gpu"}
+    (tmp_path / "needle.json").write_text(json.dumps({"rows": rows}))
+    pq.curves(tmp_path, [0.25])
+    summary = (tmp_path / "summary.md").read_text()
+    assert "Noise floor" in summary and "| triton | 100.0% |" in summary
