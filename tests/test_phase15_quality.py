@@ -178,3 +178,41 @@ def test_every_builder_keeps_the_answer_inside_the_length():
              + pq.build_vartrack(tok, _filler(), [3000], 2, rng))
     for c in cases:
         assert len(c.context) + len(c.question) + c.answer_tokens <= c.length, c.task
+
+
+def test_two_hop_vartrack_is_the_default_shape():
+    tok = CharTok()
+    c = pq.build_vartrack(tok, _filler(), [2000], 1, random.Random(0), hops=2)[0]
+    text = tok.decode(c.context)
+    a, b = c.meta["chain"]
+    assert f"VAR {a} = {c.answers[0]}" in text and f"VAR {b} = VAR {a}" in text
+
+
+def test_curves_reports_failures_by_length_and_the_gen_control(tmp_path):
+    rows = []
+    for case, length in enumerate([4096] * 5 + [32768] * 5):
+        rows.append({"task": "needle", "case": case, "length": length, "policy": "dense",
+                     "ratio": 1.0, "correct": True})
+        rows.append({"task": "needle", "case": case, "length": length, "policy": "gpu",
+                     "ratio": 0.25, "correct": not (length == 32768 and case % 2)})
+    (tmp_path / "needle.json").write_text(json.dumps({"rows": rows}))
+    (tmp_path / "gen.json").write_text(json.dumps({"rows": [
+        {"policy": "triton", "ratio": 1.0, "prompt": 0, "first_diff": 30, "identical": False},
+        {"policy": "gpu", "ratio": 0.25, "prompt": 0, "first_diff": 12, "identical": False}]}))
+    pq.curves(tmp_path, [0.25])
+    summary = (tmp_path / "summary.md").read_text()
+    assert "| 25.0% | 0/5 | 3/5 |" in summary          # cases 5, 7 and 9 fail at 32K
+    assert "dense, Triton kernel (control) | 0/1 | 30" in summary
+
+
+def test_gen_control_runs_dense_on_the_triton_kernel():
+    from kernels.gqa import paged_decode as pd
+
+    ls = _tiny_model()
+    before = pd.decode_backend()
+    try:
+        rows = pq.eval_gen(ls, [list(range(1, 60))], [("dense", 1.0), ("triton", 1.0)], 2, 4,
+                           "cpu", log=lambda m: None)
+    finally:
+        pd.set_decode_backend(before)
+    assert {r["policy"] for r in rows} == {"dense", "triton"}

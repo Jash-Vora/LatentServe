@@ -274,6 +274,25 @@ def eval_cases(ls, cases, cfgs, recent, tok, device, oracle_max_ctx, log=print) 
     return rows
 
 
+def _apply_gen(ls, cfg, recent):
+    """As phase14_oracle._apply, plus ("triton", 1.0): dense through the
+    Triton kernel instead of the CUDA one. Two correct dense
+    implementations — the control that says how fast greedy outputs drift
+    apart from numerical noise alone on these prompts."""
+    from benchmarks.runners.phase14_oracle import _apply
+    from kernels.gqa.paged_decode import set_decode_backend
+    from model.attention import sparse as sp
+
+    if cfg[0] == "triton":
+        sp.install(ls, None)
+        if getattr(ls, "sparse_ratio", None) is not None:
+            ls.set_sparse(None)
+        set_decode_backend("triton")
+        return None
+    set_decode_backend("cuda")
+    return _apply(ls, cfg, recent)
+
+
 def eval_gen(ls, prompts, cfgs, recent, new_tokens, device, log=print) -> list:
     """Greedy generation under each budget against dense's own output."""
     import torch
@@ -293,7 +312,7 @@ def eval_gen(ls, prompts, cfgs, recent, new_tokens, device, log=print) -> list:
             first = ls.prefill(torch.tensor([prompt], device=device))[0, -1]
             for c in cfgs:
                 ls.cache.rewind(n)
-                _apply(ls, c, recent)
+                _apply_gen(ls, c, recent)
                 logits, gen = first, []
                 for _ in range(new_tokens):
                     nxt = int(logits.argmax())
@@ -412,6 +431,18 @@ def curves(results_dir: Path, ratios) -> int:
         tail = f"{pr['failures']} / {pr['gains']}" if pr else "-"
         emit(f"| {policy} | {ratio:.1%} | " + " | ".join(cells) + f" | {tail} |")
 
+    lengths = sorted({r["length"] for r in case_rows if "length" in r})
+    if lengths:
+        emit("\n## Paired failures by context length (GPU path; dense right, budget wrong)\n")
+        emit("| pages | " + " | ".join(f"{L // 1024}K" for L in lengths) + " |")
+        emit("| ---: | " + " | ".join("---:" for _ in lengths) + " |")
+        for ratio in ratios:
+            cells = []
+            for L in lengths:
+                pr = paired([r for r in case_rows if r.get("length") == L], "gpu", ratio)
+                cells.append(f"{pr['failures']}/{pr['dense_correct']}")
+            emit(f"| {ratio:.1%} | " + " | ".join(cells) + " |")
+
     if text:
         emit("\n## Language modelling (KL from dense / top-1 agreement)\n")
         ctxs = sorted(text)
@@ -426,6 +457,10 @@ def curves(results_dir: Path, ratios) -> int:
         emit("\n## Ordinary generation (128 greedy tokens vs dense; reported, not judged)\n")
         emit("| pages | identical | median first difference |")
         emit("| ---: | ---: | ---: |")
+        ctl = [r for r in gen if r["policy"] == "triton"]
+        if ctl:
+            emit(f"| dense, Triton kernel (control) | {sum(r['identical'] for r in ctl)}/{len(ctl)} | "
+                 f"{statistics.median(r['first_diff'] for r in ctl):.0f} |")
         for ratio in ratios:
             rs = [r for r in gen if r["policy"] == "gpu" and abs(r["ratio"] - ratio) < 1e-9]
             if rs:
@@ -524,6 +559,12 @@ def main() -> int:
     p.add_argument("--oracle-max-ctx", type=int, default=16384,
                    help="the oracle's fp32 reference is slow; skip it above this context")
     p.add_argument("--no-oracle", action="store_true")
+    p.add_argument("--hops", type=int, default=2,
+                   help="vartrack chain length. 4 hops left dense at 1/12 in the quick "
+                   "pass: a test dense cannot do measures nothing about sparsity")
+    p.add_argument("--distractors", type=int, default=2, help="vartrack distractor assignments")
+    p.add_argument("--dense-only", action="store_true",
+                   help="calibrate a task's difficulty on dense alone, before any sparse run")
     p.add_argument("--config", default="configs/phase6_vllm.yaml")
     p.add_argument("--results-dir", default="results/raw/phase15")
     p.add_argument("--seed", type=int, default=0)
@@ -586,7 +627,7 @@ def main() -> int:
     wiki = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
     stream = _ids(tok, "\n\n".join(t for t in wiki["text"] if t.strip()))
     filler = Filler(stream[100_000:] + stream[:100_000])
-    cfgs = cfg_list(args.ratios, oracle=not args.no_oracle)
+    cfgs = [("dense", 1.0)] if args.dense_only else cfg_list(args.ratios, oracle=not args.no_oracle)
 
     if args.task in CASE_TASKS:
         depths = [0.1, 0.5, 0.9] if args.quick else [0.1, 0.25, 0.5, 0.75, 0.9]
@@ -596,7 +637,8 @@ def main() -> int:
         elif args.task == "multikey":
             cases = build_multikey(tok, filler, args.lengths, depths[::2] or depths, trials, rng)
         elif args.task == "vartrack":
-            cases = build_vartrack(tok, filler, args.lengths, trials * 3, rng)
+            cases = build_vartrack(tok, filler, args.lengths, trials * 3, rng,
+                                   hops=args.hops, distractors=args.distractors)
         else:
             squad = load_dataset("rajpurkar/squad", split="validation")
             cases = build_qa(tok, squad, args.lengths, depths[::2] or depths, trials + 1, rng)
@@ -633,7 +675,7 @@ def main() -> int:
     elif args.task == "gen":
         n = 4 if args.quick else 16
         prompts = [filler.take(2048) for _ in range(n)]
-        gen_cfgs = [c for c in cfgs if c[0] != "oracle"]
+        gen_cfgs = [c for c in cfgs if c[0] != "oracle"] + [("triton", 1.0)]
         rows = eval_gen(ls, prompts, gen_cfgs, args.recent, 128, device, log)
         (out_dir / "gen.json").write_text(json.dumps({"rows": rows, "args": vars(args)}))
     log(f"{args.task} done in {(time.perf_counter() - t0) / 60:.1f} min -> {out_dir}")
