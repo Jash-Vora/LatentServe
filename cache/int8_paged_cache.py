@@ -689,6 +689,22 @@ class Int8PagedKVCache:
         v_tok = v.permute(0, 2, 1, 3)
         graph_path = self._graph_write and n == 1
 
+        if graph_path and k.is_cuda:
+            # Phase 16: the whole decode-step write — V's quantize and
+            # scatter, K into the residual — as one kernel per layer instead
+            # of ~a dozen ops (~280 launches per step), byte-identical.
+            from kernels.cuda import int8_write as iw
+
+            if iw.eligible(k, v):
+                iw.decode_write(
+                    k, v, slots[:b, 0], self._k_res_idx_buf[:b], self._flat_v[layer_idx],
+                    self._flat_v_scale[layer_idx],
+                    self._flat_v_zero[layer_idx] if self.asymmetric else None,
+                    self._k_res_flat[layer_idx], asym=self.asymmetric, eps=_EPS,
+                    qmax=float(self.v_qmax), levels=float(self.v_levels),
+                    offset=float(self.v_offset))
+                return
+
         # --- V: per-token scale, no look-ahead, quantize+scatter now. ---
         # The fit is FP32 for the same reason K's is (see
         # _finalize_blocks): an FP16 `_EPS` floor is no floor at all.

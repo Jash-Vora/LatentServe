@@ -109,3 +109,41 @@ Overall each adaptive tier is within 5% of its fixed counterpart's
 throughput, or ahead, at lower expected loss. If quiet traffic is a small
 share of tokens the difference will be small — adaptivity pays exactly as
 much as traffic spends at low load.
+
+## Result: varying traffic — both adaptive tiers outperform, by the fixed definition
+
+Recalibrated after the kernel fix: at batch 1, 37.5% runs at 0.96-1.03x of
+dense (0.92-1.00x before); 50% still dips to 0.93x at batch 1 / 4K — where the
+policy runs dense. Large shapes unchanged (37.5%: 1.55x at b8 / 32K, 1.50x at
+b16 / 16K, 1.49x at b32 / 8K).
+
+48 requests, 386K prompt tokens, quiet / burst / medium / quiet; two rounds:
+
+| strategy | decode tok/s | vs dense | dense / 50% / 37.5% tokens | expected loss |
+| --- | ---: | ---: | --- | ---: |
+| dense | 95.6 | 1.00x | 100 / 0 / 0 | 0.00% |
+| fixed-50 | 103.7 | 1.08x | 0 / 100 / 0 | 0.40% |
+| fixed-37.5 | 107.2 | 1.12x | 0 / 0 / 100 | 1.20% |
+| adaptive-balanced | 103.0 | 1.08x | 54 / 46 / 0 | 0.18% |
+| adaptive-relaxed | 105.4 | 1.10x | 46 / 0 / 54 | 0.65% |
+
+37% of tokens were generated at batch <= 2 (identical traffic for every
+strategy). Adaptive-balanced is 0.7% slower than fixed-50 at 0.18% expected
+loss against 0.40%; adaptive-relaxed 1.7% slower than fixed-37.5 at 0.65%
+against 1.20%. **Both within 5% at lower expected loss: both outperform.**
+
+**Answer to Q14: yes — not by being faster, by being nearly as fast at about
+half the quality cost.** The prediction was half right: lower cost, yes; but
+adaptive is 1-2% *slower* than fixed, not faster. The 5% threshold forgoes
+small real gains (37.5% is 3-5% faster at batch 4) to save quality; it is the
+price of quality, and `min_gain` is the knob.
+
+Also shown: on realistic mixed traffic sparsity buys 1.08-1.12x, against up to
+1.5x at peak shapes — 37% of tokens ran where it buys nothing; and prefill
+(~142 s, dense under every strategy) dominates decode (~67 s): for this
+traffic, prefill is where further speed would come from.
+
+**Caveat:** expected loss is Phase 15's per-budget rates weighted by tokens,
+not quality measured on this traffic (random-token prompts, chosen for
+timing). The quality advantage is inferred, and as precise as those rates —
+which is not very.
