@@ -3,11 +3,16 @@ Phase 17: can an adaptive policy outperform a fixed backend? (methodology Q14)
 
     python -m benchmarks.runners.phase17_workload       # ~25 min on a T4
 
-One fixed, seeded mix of requests — mostly short prompts, some long ones,
-varied output lengths — served through the real engine under CUDA graphs.
-As requests arrive and finish, the running batch and its context drift:
-the conditions a policy has to handle. Five strategies serve the identical
-mix:
+Traffic whose load varies: requests *arrive over time*, in four phases —
+quiet (one short request at a time), a burst of long ones overlapping, a
+medium stretch, quiet again. Arrivals are scheduled in decode steps, not wall
+time, so every strategy sees identical traffic relative to its own progress
+(with wall-clock arrivals a faster strategy would also see less queueing).
+
+The first version submitted every request at once: the batch stayed large
+and contexts long throughout, the policy correctly chose sparse on every
+step, and adaptive matched fixed exactly — a test that never entered the
+regime where they differ. Five strategies serve the identical traffic:
 
   dense               no sparsity
   fixed-50, fixed-37.5   one budget on every step
@@ -41,6 +46,29 @@ STRATEGIES = {
 # Prompt-length mix: mostly chat-sized, a tail of long documents.
 MIX = ((2048, 0.40), (4096, 0.25), (8192, 0.15), (16384, 0.12), (30000, 0.08))
 OUTPUTS = (64, 128, 256)
+
+
+# Traffic phases: (requests, steps between arrivals, prompt lengths, outputs).
+PHASES = (
+    ("quiet", 12, 140, (1024, 2048, 4096), (128,)),
+    ("burst", 16, 0, (8192, 16384, 30000), (128, 256)),
+    ("medium", 12, 20, (2048, 4096, 8192, 16384), (128,)),
+    ("quiet", 8, 140, (1024, 2048, 4096), (128,)),
+)
+
+
+def traffic(seed: int, gap_after_burst: int = 400) -> list:
+    """Requests with an `arrival` decode step, phase by phase."""
+    rng = random.Random(seed)
+    reqs, step, i = [], 0, 0
+    for name, n, every, lengths, outs in PHASES:
+        for _ in range(n):
+            reqs.append({"id": i, "phase": name, "arrival": step, "prompt_len": rng.choice(lengths),
+                         "max_new": rng.choice(outs), "seed": rng.randrange(1 << 30)})
+            i += 1
+            step += every
+        step += gap_after_burst if name == "burst" else every
+    return reqs
 
 
 def workload(n: int, seed: int) -> list:
@@ -79,26 +107,42 @@ def serve(model, reqs, strategy: dict, policy_table, num_blocks: int, max_runnin
                            max_seq_len=max(r["prompt_len"] + r["max_new"] for r in reqs) + 64,
                            block_size=16, num_blocks=num_blocks, use_cuda_graphs=True,
                            policy=policy)
-    for r in reqs:
+    def make(r):
         g = torch.Generator().manual_seed(r["seed"])
         ids = torch.randint(1000, 100000, (r["prompt_len"],), generator=g).tolist()
-        engine.add_request(ServedRequest(request_id=r["id"], prompt_ids=ids,
-                                         max_new_tokens=r["max_new"]))
+        return ServedRequest(request_id=r["id"], prompt_ids=ids, max_new_tokens=r["max_new"])
+
+    pending = sorted(reqs, key=lambda r: (r.get("arrival", 0), r["id"]))
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    done = engine.run()
+    step = 0
+    while pending or engine.has_work:
+        while pending and pending[0].get("arrival", 0) <= step:
+            engine.add_request(make(pending.pop(0)))
+        if engine.has_work:
+            engine.step()
+            step += 1
+        else:
+            step = pending[0]["arrival"]        # idle: skip ahead to the next arrival
+    done = engine.finished
     torch.cuda.synchronize()
     wall = time.perf_counter() - t0
     tokens = sum(len(r.output_ids) for r in done)
     by_ratio = dict(engine.decoder.ratio_tokens) if engine.decoder else dict(engine.ratio_tokens)
     model.set_sparse(None)
     capture_s = engine.decoder.capture_s if engine.decoder else 0.0
-    decode_s = wall - engine.prefill_s - capture_s     # graph capture is a one-off
+    decode_s = engine.decode_s - capture_s              # graph capture is a one-off
+    low = sum(v for (b, _), v in engine.decoder.batch_tokens.items() if b <= 2) \
+        if engine.decoder else 0
     out = {"wall_s": wall, "prefill_s": engine.prefill_s, "decode_s": decode_s,
            "capture_s": capture_s, "graphs": len(engine.decoder.graphs) if engine.decoder else 0,
            "tokens": tokens, "decode_tok_s": tokens / decode_s if decode_s > 0 else float("nan"),
            "tokens_by_ratio": {("dense" if k is None else k): v for k, v in by_ratio.items()},
-           "expected_loss": expected_answer_loss(by_ratio)}
+           "expected_loss": expected_answer_loss(by_ratio),
+           "low_load_tokens": low,
+           "batch_tokens": {f"{b}|{'dense' if r is None else r}": v
+                            for (b, r), v in (engine.decoder.batch_tokens.items()
+                                              if engine.decoder else [])}}
     del engine
     model.cache = None
     torch.cuda.empty_cache()
@@ -109,7 +153,9 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("--table", default="results/raw/phase17/step_table.json",
                    help="from phase17_calibrate")
-    p.add_argument("--requests", type=int, default=40)
+    p.add_argument("--requests", type=int, default=40, help="(--all-at-once only)")
+    p.add_argument("--all-at-once", action="store_true",
+                   help="the first version: every request submitted at t=0")
     p.add_argument("--max-running", type=int, default=16)
     p.add_argument("--rounds", type=int, default=2)
     p.add_argument("--seed", type=int, default=0)
@@ -136,7 +182,7 @@ def main() -> int:
     cfg = load_config(args.config)
     ref = QwenReference(model_name=cfg.model.name, dtype="fp16", device="cuda:0").load()
     set_decode_backend("cuda")
-    reqs = workload(args.requests, args.seed)
+    reqs = workload(args.requests, args.seed) if args.all_at_once else traffic(args.seed)
     longest = max(r["prompt_len"] + r["max_new"] for r in reqs) + 512
     model = LatentServeQwen.from_reference(ref, max_seq_len_hint=longest,
                                            attn_impl="triton_paged", fuse_projections=True)
@@ -158,7 +204,7 @@ def main() -> int:
     base = statistics.median(x["decode_tok_s"] for x in results.get("dense", [])) \
         if results.get("dense") else None
     print(f"\n{'strategy':<20}{'decode tok/s':>13}{'vs dense':>10}{'dense':>8}{'50%':>7}"
-          f"{'37.5%':>7}{'expected loss':>15}")
+          f"{'37.5%':>7}{'expected loss':>15}{'low-load tokens':>17}")
     summary = {}
     for name, rs in results.items():
         tps = statistics.median(x["decode_tok_s"] for x in rs)
@@ -171,9 +217,11 @@ def main() -> int:
         print(f"{name:<20}{tps:>13.1f}{rel:>10}"
               + "".join(f"{share.get(k, 0) / total:>7.0%}" if k != "dense" else
                         f"{share.get(k, 0) / total:>8.0%}" for k in ("dense", 0.5, 0.375))
-              + f"{loss:>14.2%}")
+              + f"{loss:>14.2%}"
+              + f"{rs[0]['low_load_tokens'] / total:>16.0%}")
     print("\n'expected loss': Phase 15's net answer-loss rates per budget, weighted by the\n"
-          "tokens each budget generated — an estimate, since those rates are imprecise.")
+          "tokens each budget generated — an estimate, since those rates are imprecise.\n"
+          "'low-load tokens': generated at batch <= 2, where sparse is slower than dense.")
     out = Path(args.results_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "workload.json").write_text(json.dumps(

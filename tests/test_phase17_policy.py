@@ -193,3 +193,16 @@ def test_the_workload_mix_is_deterministic_and_mixed():
     assert a == b
     lengths = {r["prompt_len"] for r in a}
     assert {2048, 30000} <= lengths and len(lengths) >= 4
+
+
+def test_traffic_has_quiet_bursty_and_medium_load():
+    from benchmarks.runners.phase17_workload import traffic
+
+    reqs = traffic(0)
+    assert reqs == traffic(0) and len(reqs) == 48
+    burst = [r for r in reqs if r["phase"] == "burst"]
+    assert len({r["arrival"] for r in burst}) == 1                 # all at once
+    quiet = [r for r in reqs if r["phase"] == "quiet"][:12]
+    gaps = {b["arrival"] - a["arrival"] for a, b in zip(quiet, quiet[1:])}
+    assert gaps == {140} and max(r["prompt_len"] for r in quiet) <= 4096
+    assert [r["arrival"] for r in reqs] == sorted(r["arrival"] for r in reqs)

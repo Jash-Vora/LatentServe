@@ -169,20 +169,23 @@ def select(scores: torch.Tensor, k: int, sorted: bool = False) -> torch.Tensor:
 
 
 def budgets(seq_lens: torch.Tensor, ratio: float, recent: int = 2, page: int = 16) -> torch.Tensor:
-    """Per-sequence page budget for its current length, on the GPU: the
-    eager rule Phase 15 measured, max(recent + 1, ceil(ratio x pages)),
-    capped at the pages it has. -> int32 [B]."""
+    """Per-sequence page budget for its current length — the rule the sparse
+    kernel applies inline: max(recent + 1, ceil(ratio x pages)), capped at
+    the pages it has. Multiplied in float32, as the kernel does (`ceilf`),
+    so the two agree even where float64 would round differently. For tests
+    and reference; the kernel does not use it. -> int32 [B]."""
     pages = (seq_lens.to(torch.int64) + page - 1) // page
     if ratio >= 1.0:
         return pages.to(torch.int32)
-    n = torch.ceil(ratio * pages.to(torch.float64)).to(torch.int64).clamp(min=recent + 1)
+    prod = torch.tensor(ratio, dtype=torch.float32, device=pages.device) * pages.to(torch.float32)
+    n = torch.ceil(prod).to(torch.int64).clamp(min=recent + 1)
     return torch.minimum(n, pages).to(torch.int32)
 
 
 def sparse_decode(q, k_pool, v_pool, block_tables, seq_lens, sel,
                   num_splits: Optional[int] = None,
                   softmax_scale: Optional[float] = None,
-                  sel_count: Optional[torch.Tensor] = None) -> torch.Tensor:
+                  ratio: Optional[float] = None, recent: int = 2) -> torch.Tensor:
     """Attention over the pages in `sel` [B, H, K] only."""
     import numpy as np
 
@@ -202,7 +205,7 @@ def sparse_decode(q, k_pool, v_pool, block_tables, seq_lens, sel,
     i64 = np.int64
     fn((b, splits, h), (32, 1, 1),
        (ptr(q), ptr(k_pool), ptr(v_pool), ptr(block_tables), ptr(seq_lens), ptr(sel),
-        np.uint64(0 if sel_count is None else sel_count.data_ptr()),
+        np.float32(0.0 if ratio is None else ratio), np.int32(recent),
         ptr(acc), ptr(m), ptr(l),
         np.int32(block_tables.shape[1]), np.int32(num_sel), np.int32(splits),
         i64(q.stride(0)), i64(q.stride(1)), i64(q.stride(2)),
@@ -245,7 +248,7 @@ def sparse_attention(q, k_pool, v_pool, block_tables, seq_lens, kmin, kmax,
     # below `max_seq_len` it is.
     sel = select(scores, k, sorted=True)
     return sparse_decode(q, k_pool, v_pool, block_tables, seq_lens, sel, num_splits,
-                         softmax_scale, sel_count=budgets(seq_lens, ratio, recent, page))
+                         softmax_scale, ratio=ratio, recent=recent)
 
 
 def kernel_resources(device: Optional[torch.device] = None) -> dict:

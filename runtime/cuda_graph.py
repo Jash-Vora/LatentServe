@@ -241,6 +241,7 @@ class GraphedDecoder:
         self.policy = policy
         self.ratio_steps: Counter = Counter()
         self.ratio_tokens: Counter = Counter()
+        self.batch_tokens: Counter = Counter()    # (batch size, ratio) -> tokens
         # Seconds spent capturing. A strategy that uses more budgets captures
         # more graphs; timed in with its decode, that one-off cost would count
         # against exactly the strategy being compared.
@@ -349,6 +350,7 @@ class GraphedDecoder:
             ratio = getattr(self.model, "sparse_ratio", None)
         self.ratio_steps[ratio] += 1
         self.ratio_tokens[ratio] += batch
+        self.batch_tokens[(batch, ratio)] += batch
 
         if not self.enabled or bucket is None or bucket > rope_limit:
             self.eager_steps += 1
