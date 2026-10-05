@@ -206,6 +206,7 @@ extern "C" __global__ void __launch_bounds__(32)
 paged_sparse_fp16(const __half* __restrict__ q, const __half* __restrict__ k_pool,
                   const __half* __restrict__ v_pool, const int* __restrict__ block_tables,
                   const int* __restrict__ seq_lens, const int* __restrict__ sel,
+                  const int* __restrict__ sel_count,
                   float* __restrict__ part_acc, float* __restrict__ part_m,
                   float* __restrict__ part_l,
                   int max_pages, int num_sel, int num_splits,
@@ -229,9 +230,15 @@ paged_sparse_fp16(const __half* __restrict__ q, const __half* __restrict__ k_poo
 
     const int L = seq_lens[b];
     const int num_pages = (L + PAGE - 1) / PAGE;
-    const int per = (num_sel + num_splits - 1) / num_splits;
+    // How many of this sequence's (score-sorted) selections to attend: its
+    // own budget for its *current* length, computed on the GPU each step.
+    // A captured graph's selection is sized for the top of its context
+    // bucket; without this count, a budget fixed at capture would decay to
+    // half its nominal ratio as a sequence grew through a doubling bucket.
+    const int n = sel_count ? min(sel_count[b], num_sel) : num_sel;
+    const int per = (n + num_splits - 1) / num_splits;
     const int lo = split * per;
-    const int hi = min(lo + per, num_sel);
+    const int hi = min(lo + per, n);
     const int* my_sel = sel + b * sl_b + h * sl_h;
 
     float m[NREP], l[NREP], acc[NREP][DPL];

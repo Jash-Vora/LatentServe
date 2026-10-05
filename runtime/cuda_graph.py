@@ -229,8 +229,22 @@ class GraphedDecoder:
         num_splits: Optional[dict] = None,
         enabled: bool = True,
         greedy: bool = False,
+        policy=None,
     ):
+        from collections import Counter
+
         self.model = model
+        # Phase 17: a sparsity policy chooses each step's page budget. Graphs
+        # are keyed by (batch, bucket, ratio) — keyed without the ratio, a
+        # set_sparse between steps would replay a graph captured under a
+        # different budget — and tokens are counted per budget.
+        self.policy = policy
+        self.ratio_steps: Counter = Counter()
+        self.ratio_tokens: Counter = Counter()
+        # Seconds spent capturing. A strategy that uses more budgets captures
+        # more graphs; timed in with its decode, that one-off cost would count
+        # against exactly the strategy being compared.
+        self.capture_s = 0.0
         self.num_splits_override = num_splits or {}
         # Whether the *model* is on a GPU, not whether the machine has one.
         # Checking only `torch.cuda.is_available()` let a CPU model on a GPU
@@ -323,6 +337,18 @@ class GraphedDecoder:
         batch = len(slots)
         bucket = self.bucket_for(cache.max_len)
         rope_limit = self.model.rope.max_seq_len
+        if self.policy is not None:
+            # Mean, not max: step cost follows the tokens attended, and the
+            # calibration table was measured at uniform contexts.
+            mean_ctx = sum(cache.tables[s].length for s in slots) / max(1, batch)
+            ratio = self.policy.choose(batch, mean_ctx)
+            if ratio != getattr(self.model, "sparse_ratio", None):
+                self.model.set_sparse(ratio, recent=getattr(self.model.layers[0].attn,
+                                                            "sparse_recent", 2))
+        else:
+            ratio = getattr(self.model, "sparse_ratio", None)
+        self.ratio_steps[ratio] += 1
+        self.ratio_tokens[ratio] += batch
 
         if not self.enabled or bucket is None or bucket > rope_limit:
             self.eager_steps += 1
@@ -332,13 +358,21 @@ class GraphedDecoder:
             self.last_host_ms = (_time.perf_counter() - t0) * 1000
             return out
 
-        key = (batch, bucket)
+        key = (batch, bucket, ratio)
         graph = self.graphs.get(key)
         if graph is None:
             graph = CapturedDecode(self.model, batch, bucket, self._splits_for(batch, bucket),
                                    greedy=self.greedy)
             graph.load(token_ids, positions)
-            graph.capture(pool=self._pool)
+            # Size the sparse selection for the top of the bucket; each
+            # sequence's own budget is counted on the GPU at every replay.
+            cache.sparse_context_hint = bucket
+            t_cap = _time.perf_counter()
+            try:
+                graph.capture(pool=self._pool)
+            finally:
+                cache.sparse_context_hint = None
+                self.capture_s += _time.perf_counter() - t_cap
             if self._pool is None:
                 self._pool = graph.graph.pool()
             self.graphs[key] = graph
@@ -353,6 +387,7 @@ class GraphedDecoder:
 
     def stats(self) -> dict:
         return {
+            "ratio_tokens": {("dense" if k is None else k): v for k, v in self.ratio_tokens.items()},
             "graphs": len(self.graphs),
             "captures": self.captures,
             "graph_steps": self.graph_steps,

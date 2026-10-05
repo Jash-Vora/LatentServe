@@ -74,8 +74,15 @@ class ServingEngine:
         sample_in_graph: bool = True,
         profile_loop: bool = False,
         kv_dtype: str = "fp16",
+        policy=None,
     ):
+        from collections import Counter
+
         self.model = model
+        # Phase 17: the sparsity policy (runtime/policy.py), and tokens
+        # generated per budget on the eager path.
+        self.policy = policy
+        self.ratio_tokens: Counter = Counter()
         self.max_running = max_running
         self.prefill_chunk_size = prefill_chunk_size
         self.eos_token_id = eos_token_id
@@ -98,6 +105,13 @@ class ServingEngine:
         from cache.int8_paged_cache import Int8PagedKVCache
 
         assert isinstance(cache, (PagedKVCache, Int8PagedKVCache))
+        if policy is not None and policy.may_sparsify:
+            # Bounds kept from the first write, dense steps included: the
+            # policy can switch a running batch to sparse at any step, and
+            # bounds missing for earlier tokens would scramble its selection.
+            if not hasattr(cache, "enable_page_bounds"):
+                raise ValueError("a sparsity policy needs the fp16 paged cache")
+            cache.enable_page_bounds()
         self.cache: PagedKVCache = cache
 
         # Phase 13: decode through captured CUDA graphs. Prefill stays
@@ -139,7 +153,7 @@ class ServingEngine:
                 # engine only ever samples greedily (argmax), so moving it
                 # into the graph changes no output — it removes a launch
                 # and a host round trip per step.
-                self.decoder = GraphedDecoder(model, greedy=sample_in_graph)
+                self.decoder = GraphedDecoder(model, greedy=sample_in_graph, policy=policy)
             except GraphUnsupported as e:
                 warnings.warn(f"CUDA graphs disabled, decoding eagerly: {e}", stacklevel=2)
                 self.decoder = None
@@ -187,6 +201,24 @@ class ServingEngine:
         if self.on_retire is not None:
             self.on_retire(request, self)
 
+    def _blocks_promised(self) -> int:
+        """Blocks running requests have yet to claim for the tokens they may
+        still generate."""
+        alloc = self.cache.allocator
+        return sum(max(0, alloc.blocks_for_tokens(r.prompt_len + r.max_new_tokens)
+                       - len(self.cache.tables[r.slot].blocks)) for r in self.running)
+
+    def _fits(self, request: ServedRequest) -> bool:
+        """Admit only if the pool can hold this request's prompt *and* every
+        token it may generate, after what running requests are still owed.
+
+        Checking the prompt alone over-admits: two requests whose prompts fit
+        exhausted a 12-block pool during decode (OutOfBlocks mid-run). Without
+        preemption, reserving the worst case is the rule that cannot crash.
+        """
+        need = self.cache.allocator.blocks_for_tokens(request.prompt_len + request.max_new_tokens)
+        return need <= self.cache.allocator.num_free - self._blocks_promised()
+
     def _admit_and_prefill(self) -> None:
         admitted = self.scheduler.select(
             self.waiting,
@@ -197,8 +229,9 @@ class ServingEngine:
             if not self._free_slots:
                 break
             # Re-check: earlier admissions in this same iteration consumed
-            # blocks the scheduler's snapshot did not know about.
-            if not self.cache.can_admit(request.prompt_len):
+            # blocks the scheduler's snapshot did not know about — and the
+            # request must fit with its outputs, not just its prompt.
+            if not self.cache.can_admit(request.prompt_len) or not self._fits(request):
                 break
             slot = self._free_slots.pop(0)
             request.slot = slot
@@ -289,6 +322,12 @@ class ServingEngine:
                 # that safe.
                 logits = self.decoder.step(tokens, positions, slots)
             else:
+                if self.policy is not None:
+                    lens = [self.cache.tables[s].length for s in slots]
+                    ratio = self.policy.choose(len(slots), sum(lens) / max(1, len(lens)))
+                    if ratio != getattr(self.model, "sparse_ratio", None):
+                        self.model.set_sparse(ratio)
+                    self.ratio_tokens[ratio] += len(slots)
                 logits = self.model.decode_step_ragged(tokens, positions, slots)
             t_launch = clock()
             if device.type == "cuda":

@@ -228,3 +228,7 @@ dense got right (gaining 1) and its KL at 8K is 0.0146, failing both
 criteria. Only 50% passes. Up to 16K the oracle loses nothing at 25%, so
 the loss is the bound-based indexer's, not sparsity's. See
 docs/phase15_quality.md.
+
+Final status after Phase 15's confirmatory run: no budget is validated;
+50% costs ~0.4% of answers and 37.5% ~1.2% (all on QA; retrieval intact),
+25% ~5.5% with KL failing. See docs/phase15_quality.md.

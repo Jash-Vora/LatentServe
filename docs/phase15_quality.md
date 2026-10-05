@@ -190,3 +190,159 @@ Not the bake-off's selection, so tested on its own terms:
 GPU path: `page_index_heads` writes each query head's bound; summed mass is
 computed from them in torch, inside the CUDA graph
 (`set_sparse(..., scoring="mass")`, `phase15_quality --scoring mass`).
+
+## Follow-up result: summed mass at 25% — FAIL
+
+Seed 2, Phase 15's full sample sizes, with bounds on the same cases as the
+control:
+
+| scoring | paired failures / gains (of 87; 1 allowed) | KL 8K | KL ~31K | verdict |
+| --- | ---: | ---: | ---: | --- |
+| bounds (control) | 5 / 0 | 0.0101 | 0.0043 | FAIL |
+| summed mass | 4 / 1 | 0.0077 | 0.0034 | FAIL |
+
+Mass is genuinely better on identical cases — KL ~23% lower at both lengths,
+enough to pass the KL criterion that bounds narrowly fails — but retrieval
+improves by one case where the limit is one. Failures sit at 4K-16K (none at
+32K); a better *estimate* still misses the pages that matter, which only
+exact reranking avoided in the bake-off. Seed 2 is easier than seed 0
+(bounds' KL at 8K 0.0101 against 0.0146), which is why the control was run.
+
+**Mass scoring also costs speed:** converting per-head bounds to estimated
+mass adds about a dozen small operations per layer, ~2-3 ms per step. At
+25%: 1.56x at batch 8 / 32K (bounds 1.71x), and 0.90x at batch 1 / 8K —
+slower than dense. Even a pass would have bought 1.56x, not the 1.7x the
+follow-up was framed around; that cost was not considered when proposing it.
+
+Outcome accepted as fixed beforehand: no further seeds.
+
+## Second follow-up — fixed before it is run: 37.5% with bounds, and a 50% replication
+
+* **Hypothesis:** 37.5% of pages with plain bounds scoring passes the Phase 15
+  criteria, unchanged. Motivation: interpolating measured steps at batch 8 /
+  32K (37.9 ms at 50%, 29.4 at 25%) puts it near 33-34 ms, ~1.5x — about
+  what fused reranking was estimated to buy, with no new kernel.
+* **Replication:** 50% on the same cases. It is the only passing result, on
+  one seed; if it fails here, it is not validated.
+* **Fresh data:** seed 3 (seeds 0, 1, 2 have all been seen). Phase 15's full
+  sample sizes. Both outcomes accepted; no further seeds.
+* **Prediction:** KL passes (~0.007 at 8K by interpolation); retrieval is a
+  coin flip (0 failures at 50%, 4-5 at 25%; the limit is 1); no gain at
+  batch 1.
+
+Choosing 37.5% after seeing 25% fail and 50% pass is a new hypothesis, which
+is legitimate only because it is judged on unseen data and every attempt —
+this one included — is reported.
+
+## Second follow-up result (seed 3), and a revised retrieval rule
+
+| budget | paired failures / gains (of 85) | KL 8K | KL ~31K | original rule | step, b8 / 32K |
+| ---: | ---: | ---: | ---: | --- | ---: |
+| 50% | 2 / 3 | 0.0028 | 0.0010 | FAIL | 38.13 ms (1.32x) |
+| 37.5% | 2 / 3 | 0.0062 | 0.0020 | FAIL | 33.63 ms (1.50x) |
+| 25% | — | — | — | — | 29.51 ms (1.71x) |
+
+By the criteria fixed in advance, both fail — **including the 50%
+replication.** Needle and multikey were perfect at both budgets; every flip
+was in QA, where dense itself is right only 61% of the time, and the flips
+went both ways: 2 lost, 3 gained, net +1 for sparse. KL predicted ~0.007 at
+37.5%, measured 0.0062; 1.5x as predicted.
+
+**Why the original rule was unreliable.** "At most 2% of dense-correct" with
+85 cases rounded down to 1 allowed — in practice stricter than 2% — and
+counted failures only. The chance of failing a configuration purely by luck,
+with 1 allowed of 85, by its true failure rate:
+
+| true failure rate | chance of 2+ failures (FAIL) |
+| ---: | ---: |
+| 0.5% | 7% |
+| 1% | 21% |
+| 2% (the stated tolerance) | 51% |
+
+A configuration within the stated tolerance fails half the time: the rule
+cannot separate noise flips from damage at this sample size, which is how
+50% passed on seed 0 and failed on seed 3. Raising the limit to 2 — the
+count 37.5% happened to get — would fit the rule to the result; it is not
+done.
+
+**Revised retrieval rule** (KL criterion unchanged): *net* paired loss —
+failures minus gains — at most 2% of dense-correct, minimum 1. Noise flips
+answers both ways and cancels; damage goes one way. The justification is
+independent of 37.5%: the original rule failed its own replication, a
+configuration at KL 0.0028.
+
+Re-scored with the revised rule — **exploratory**, because these runs
+informed the revision:
+
+| run | budget | failures / gains | net loss | revised |
+| --- | ---: | ---: | ---: | --- |
+| seed 0 | 50% | 0 / 0 | 0 | pass |
+| seed 0 | 25% | 4 / 1 | 3 | fail (KL fails too) |
+| seed 0 | 12.5% | 11 / 3 | 8 | fail |
+| seed 2, bounds | 25% | 5 / 0 | 5 | fail |
+| seed 2, mass | 25% | 4 / 1 | 3 | fail |
+| seed 3 | 50% | 2 / 3 | -1 | pass |
+| seed 3 | 37.5% | 2 / 3 | -1 | pass |
+
+## Confirmatory run — fixed before it is run
+
+* **Seed 4**, unseen; Phase 15's full sample sizes; bounds scoring.
+* **Budgets:** 50%, 37.5%, and 25% as a negative control — if the revised
+  rule passes 25% too, it is too lenient to mean anything.
+* **Noise floor in the same run:** dense on the Triton kernel
+  (`--dense-control`), numerically different but not sparser, on retrieval,
+  QA and text. Its paired flips and KL are what noise alone produces.
+* **Rule:** the revised one; the original printed beside it. Accepted
+  either way.
+* **Prediction:** 50% and 37.5% pass, 25% fails; the Triton control shows
+  some flips both ways with net loss near 0, and KL near 1e-5.
+
+## Confirmatory result (seed 4) — every budget fails
+
+| configuration | failures / gains (of 84) | net loss | KL 8K | KL ~31K | revised rule |
+| --- | ---: | ---: | ---: | ---: | --- |
+| dense on Triton (noise floor) | 0 / 0 | 0 | 0.0001 | 0.0001 | — |
+| 50% | 2 / 0 | 2 | 0.0020 | 0.0007 | FAIL |
+| 37.5% | 3 / 0 | 3 | 0.0048 | 0.0015 | FAIL |
+| 25% | 6 / 0 | 6 | 0.0108 | 0.0036 | FAIL (KL too) |
+
+The prediction (50% and 37.5% pass, 25% fails) was wrong. **The noise floor
+is zero:** dense through a numerically different kernel flips no answers.
+The flips at 50% and 37.5% are therefore real effects of sparsity, not
+numerical noise. Seed 3's "2 lost, 3 gained" was read as symmetric churn
+that cancels; seed 4 (all losses) and the control refute that reading — it
+was a story fitted to one seed.
+
+A second error: the revised rule kept the round-down that makes "2% of
+dense-correct" allow only 1 of 84 — the very defect shown, with numbers,
+when the rule was revised. It is not corrected and re-scored here: that
+would be a third rule written after seeing data.
+
+## Phase 15 conclusion
+
+**No sparse budget passed a confirmatory test.** Pooled over every seed run
+(descriptive — several were exploratory):
+
+| budget | net answers lost (of dense-correct) | KL 8K across seeds | step, b8 / 32K |
+| ---: | ---: | --- | ---: |
+| 50% | 1 of 252 (0.4%) | 0.0020-0.0032 | 1.32x |
+| 37.5% | 2 of 169 (1.2%) | 0.0048-0.0062 | 1.50x |
+| 25% | 14 of 254 (5.5%) | 0.0101-0.0146: fails on every seed | 1.71x |
+| 12.5% | 8 of 83 (9.6%) | 0.0453 | 1.97x |
+
+Every answer lost at 50% and 37.5% was a QA question: needle and multikey
+retrieval were perfect at both budgets on every seed. Exact facts survive
+sparsity; borderline comprehension answers move.
+
+Sparse decode carries a small, real quality cost at every budget tested,
+traded for speed — the sparsity / quality / latency curve the plan asks for,
+not a single safe point. A pass/fail test at ~84 cases per seed cannot
+resolve differences this small: distinguishing 0.4% from 0% reliably needs
+well over a thousand cases. No further seeds are run to chase a pass. The
+curve is the input to Phase 17's adaptive runtime: dense where every answer
+matters, 37.5-50% where ~1% of borderline answers is a fair price for
+1.3-1.5x.
+
+Limitations: one model (Qwen2.5-1.5B), one GPU (T4), training-free
+page-level indexers only; multi-hop retrieval untested (the model cannot do
+it densely).

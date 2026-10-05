@@ -161,15 +161,28 @@ def page_scores_mass(q, kmin, kmax, block_tables, seq_lens, recent: int = 2,
                        torch.full_like(score, float("-inf")), score)
 
 
-def select(scores: torch.Tensor, k: int) -> torch.Tensor:
-    """Top-k pages per (sequence, head), unsorted: online softmax does not
-    care about order. -> int32 [B, H, k]."""
-    return torch.topk(scores, k, dim=-1, sorted=False).indices.to(torch.int32)
+def select(scores: torch.Tensor, k: int, sorted: bool = False) -> torch.Tensor:
+    """Top-k pages per (sequence, head) -> int32 [B, H, k]. Online softmax
+    does not care about order; `sorted` is for a per-sequence count that
+    keeps only the first n — forced pages (+inf) first, then by score."""
+    return torch.topk(scores, k, dim=-1, sorted=sorted).indices.to(torch.int32)
+
+
+def budgets(seq_lens: torch.Tensor, ratio: float, recent: int = 2, page: int = 16) -> torch.Tensor:
+    """Per-sequence page budget for its current length, on the GPU: the
+    eager rule Phase 15 measured, max(recent + 1, ceil(ratio x pages)),
+    capped at the pages it has. -> int32 [B]."""
+    pages = (seq_lens.to(torch.int64) + page - 1) // page
+    if ratio >= 1.0:
+        return pages.to(torch.int32)
+    n = torch.ceil(ratio * pages.to(torch.float64)).to(torch.int64).clamp(min=recent + 1)
+    return torch.minimum(n, pages).to(torch.int32)
 
 
 def sparse_decode(q, k_pool, v_pool, block_tables, seq_lens, sel,
                   num_splits: Optional[int] = None,
-                  softmax_scale: Optional[float] = None) -> torch.Tensor:
+                  softmax_scale: Optional[float] = None,
+                  sel_count: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Attention over the pages in `sel` [B, H, K] only."""
     import numpy as np
 
@@ -189,6 +202,7 @@ def sparse_decode(q, k_pool, v_pool, block_tables, seq_lens, sel,
     i64 = np.int64
     fn((b, splits, h), (32, 1, 1),
        (ptr(q), ptr(k_pool), ptr(v_pool), ptr(block_tables), ptr(seq_lens), ptr(sel),
+        np.uint64(0 if sel_count is None else sel_count.data_ptr()),
         ptr(acc), ptr(m), ptr(l),
         np.int32(block_tables.shape[1]), np.int32(num_sel), np.int32(splits),
         i64(q.stride(0)), i64(q.stride(1)), i64(q.stride(2)),
@@ -215,8 +229,9 @@ def sparse_attention(q, k_pool, v_pool, block_tables, seq_lens, kmin, kmax,
     32K-capacity cache serving a 4K context is more pages than exist, and
     the step runs dense while paying for the indexer.
     """
+    page = k_pool.shape[1]
     pages = block_tables.shape[1] if max_seq_len is None else min(
-        block_tables.shape[1], -(-max_seq_len // k_pool.shape[1]))
+        block_tables.shape[1], -(-max_seq_len // page))
     k = budget(ratio, pages, recent)
     if scoring == "mass":
         scores = page_scores_mass(q, kmin, kmax, block_tables, seq_lens, recent, softmax_scale,
@@ -225,9 +240,12 @@ def sparse_attention(q, k_pool, v_pool, block_tables, seq_lens, kmin, kmax,
         scores = page_scores(q, kmin, kmax, block_tables, seq_lens, recent)
     else:
         raise ValueError(f"unknown scoring {scoring!r}")
-    sel = select(scores, k)
+    # Sorted, with a per-sequence count: each sequence attends to the best
+    # pages its own current length is owed — exactly the ratio, however far
+    # below `max_seq_len` it is.
+    sel = select(scores, k, sorted=True)
     return sparse_decode(q, k_pool, v_pool, block_tables, seq_lens, sel, num_splits,
-                         softmax_scale)
+                         softmax_scale, sel_count=budgets(seq_lens, ratio, recent, page))
 
 
 def kernel_resources(device: Optional[torch.device] = None) -> dict:

@@ -183,3 +183,18 @@ def test_scoring_persists_when_only_the_ratio_changes():
     assert ls.layers[0].attn.sparse_scoring == "mass"
     with pytest.raises(ValueError, match="unknown sparse scoring"):
         ls.set_sparse(0.25, scoring="max")
+
+
+def test_admission_reserves_room_for_generated_tokens():
+    """Prompts that fit but whose outputs do not used to exhaust the pool
+    mid-decode (OutOfBlocks). Now the second request waits, and both finish."""
+    from runtime.engine import ServingEngine
+    from runtime.request import ServedRequest
+
+    ls = _model(attn="sdpa")
+    engine = ServingEngine(ls, max_running=2, max_seq_len=200, block_size=16, num_blocks=12)
+    for i in range(2):
+        engine.add_request(ServedRequest(request_id=i, prompt_ids=list(range(1, 81)),
+                                         max_new_tokens=64))
+    done = engine.run()
+    assert sorted((r.request_id, len(r.output_ids)) for r in done) == [(0, 64), (1, 64)]
