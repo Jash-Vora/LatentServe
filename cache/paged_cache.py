@@ -194,7 +194,32 @@ class PagedKVCache:
         """Whether the pool can seat a prompt of this length right now.
         The scheduler's admission test — a paged cache that dies on
         exhaustion has thrown away the reason to page."""
-        return self.allocator.blocks_for_tokens(num_tokens) <= self.allocator.num_free
+        return self.allocator.blocks_for_tokens(num_tokens) <= self.allocator.num_available
+
+    def attach_prefix(self, index: int, blocks: Sequence[int], num_tokens: int) -> None:
+        """Start sequence `index` on already-written blocks (Phase 13).
+
+        The blocks hold `num_tokens` tokens of K/V — a whole number of full
+        blocks, from another request with the same prefix. The sequence
+        takes a reference to each; prefill then continues from num_tokens.
+        Only full blocks are ever shared, and the cache is append-only, so a
+        shared block is never written again: no copy-on-write is needed.
+        """
+        table = self.tables[index]
+        if table.length or table.blocks:
+            raise ValueError(f"slot {index} is not empty")
+        if num_tokens != len(blocks) * self.block_size:
+            raise ValueError("a cached prefix is a whole number of full blocks")
+        self.allocator.incref(blocks)
+        table.blocks = list(blocks)
+        table.length = num_tokens
+        table.version += 1
+        self._read_slots_dirty = True
+
+    def shareable_blocks(self, index: int) -> int:
+        """Full blocks of sequence `index` whose K/V is final in the pool —
+        safe for the prefix cache to share. All of them, for fp16."""
+        return self.tables[index].length // self.block_size
 
     def free_sequence(self, index: int) -> None:
         """Return one sequence's blocks to the pool. The operation a

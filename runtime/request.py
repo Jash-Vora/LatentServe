@@ -51,6 +51,7 @@ class ServedRequest:
 
     state: RequestState = RequestState.ARRIVED
     slot: Optional[int] = None  # cache slot while resident
+    prefix_hit_tokens: int = 0  # prompt tokens reused from the prefix cache (Phase 13)
     output_ids: list = field(default_factory=list)
 
     # --- timing, all perf_counter seconds ---

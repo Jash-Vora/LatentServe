@@ -53,6 +53,13 @@ def kernels_per_step(model, batch: int, ctx: int, block_size: int) -> int:
     """
     model.allocate_cache(batch, ctx + 64, paged=True, block_size=block_size,
                          kv_dtype=MODE["kv_dtype"])
+    # The path the timed runs take: GraphedDecoder puts an INT8 cache in
+    # deferred mode, which is where its graph-path (and since Phase 16,
+    # fused) write lives. Without this the counter measured INT8's old eager
+    # write — a path the timings never use — and reported 709 kernels after
+    # the fused write had cut the timed path's count.
+    if hasattr(model.cache, "enable_deferred_finalize"):
+        model.cache.enable_deferred_finalize()
     model.cache.reset()
     model.cache.advance(ctx, batch_size=batch)
     slots = list(range(batch))

@@ -380,7 +380,37 @@ class Int8PagedKVCache:
             r.zero_()
 
     def can_admit(self, num_tokens: int) -> bool:
-        return self.allocator.blocks_for_tokens(num_tokens) <= self.allocator.num_free
+        return self.allocator.blocks_for_tokens(num_tokens) <= self.allocator.num_available
+
+    def shareable_blocks(self, index: int) -> int:
+        """Full blocks whose K is *quantized into the pool*. Under deferred
+        finalization a block completed during decode is quantized at the next
+        advance(); until then its K exists only in this sequence's fp16
+        residual and the pool holds stale bytes. Sharing it would hand a later
+        request K that was never written, so only finalized blocks count."""
+        full = self.tables[index].length // self.block_size
+        if not self.deferred_finalize:
+            # Eager mode quantizes a block the moment it fills, and does not
+            # track finalization at all: every full block is final.
+            return full
+        return min(full, self._finalized[index])
+
+    def attach_prefix(self, index: int, blocks: Sequence[int], num_tokens: int) -> None:
+        """Start sequence `index` on already-written, finalized blocks (Phase
+        13). The prefix is whole blocks, so this sequence's residual — its
+        partial last page — starts empty, and every attached block is final."""
+        table = self.tables[index]
+        if table.length or table.blocks:
+            raise ValueError(f"slot {index} is not empty")
+        if num_tokens != len(blocks) * self.block_size:
+            raise ValueError("a cached prefix is a whole number of full blocks")
+        self.allocator.incref(blocks)
+        table.blocks = list(blocks)
+        table.length = num_tokens
+        table.version += 1
+        self._read_slots = None
+        self._write_plan = None
+        self._set_finalized(index, len(blocks))
 
     def free_sequence(self, index: int) -> None:
         self.tables[index].free()

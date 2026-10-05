@@ -35,3 +35,94 @@ option: for requests fp16 cannot hold at all.
 **Prediction:** the fused write brings INT8 within ~5% of fp16 at large
 shapes (its attention kernel measured 2-7% slower than fp16's); small
 batches stay slower.
+
+## The first fused write was not byte-identical
+
+The end-to-end check failed: symmetric — layer 0's INT8 values identical,
+layer 1's different; asymmetric — layer 0's already different. Identical
+values with a downstream difference pointed at the *scales*: one bit off
+barely changes a rounded value but changes the V that layer attends to, which
+changes the next layer's input.
+
+Cause: PyTorch does not divide by a Python number on the GPU. `t / 127` is
+computed as `t * (1/127)`, the reciprocal rounded once in fp32 on the host;
+its source says this "may lose one bit of precision". The kernel divided
+properly. Measured in fp32: the two disagree by one ulp in 4.7% of cases at
+/127 (symmetric) and 74.3% at /255 (asymmetric) — rare enough that values
+survive and scales do not, and common enough that asymmetric values flip.
+Fixed by computing scales as the torch path does: times the fp32 reciprocal.
+
+Test design, also corrected: the end-to-end state comparison is a strong
+check but a poor diagnostic — one wrong bit spreads through every later
+layer and step. Added a unit test (kernel against the torch formula on
+identical inputs, 256 tokens over five decades of magnitude) and a
+determinism control (the torch path end to end must reproduce itself, or a
+mismatch against the fused path proves nothing).
+
+## Gate result — FAIL; Phase 16 stops
+
+Whole decode steps, INT8 against fp16, both on the CUDA kernel, fused write:
+
+| batch | ctx | fp16 | INT8 | INT8 vs fp16 | gate (within 8% at b >= 8, ctx >= 8K) |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 2048 | 16.71 ms | 16.98 | -1.5% | |
+| 1 | 16384 | 19.27 | 20.14 | -4.5% | |
+| 4 | 8192 | 21.94 | 22.21 | -1.2% | |
+| 8 | 8192 | 26.39 | 27.46 | -4.0% | pass |
+| 8 | 16384 | 35.94 | 38.76 | -7.4% | pass |
+| 16 | 2048 | 24.47 | 24.36 | +0.5% | |
+| 16 | 8192 | 38.24 | 39.29 | -2.7% | pass (spread 1.71 ms) |
+| 16 | 16384 | 53.80 | 58.89 | **-9.3%** | **fail** |
+
+By the rule fixed beforehand, Phase 16 stops: INT8 is a **capacity-only**
+option, for requests fp16 cannot hold at all. The prediction (within ~5% at
+large shapes) was wrong at the shape that matters. INT8's penalty grows with
+batch x context — where attention dominates the step and INT8's attention
+kernel is slower than fp16's (the Phase 12 latency finding) — so its tax is
+heaviest exactly where its capacity would be used.
+
+**The fused write is a clear win on its own:** INT8 end to end went from
+6.5-19.4% slower than fp16 to 1.2-9.3%, and at batch 16 / 2K from -12.5% to
+even. As a capacity-only mode it is much cheaper than it was.
+
+**Untested hypothesis, not a result:** the gate measured dense INT8, because
+the INT8 sparse kernel was stage 2. Under sparsity attention is a smaller
+share of each step, so INT8's attention tax would be smaller too — the gate
+may have been conservative. That argument was made after the gate failed, so
+it does not override it.
+
+**Instrument fix:** the A/B runner's kernel counter ran its eager step
+without the deferred mode GraphedDecoder enables for INT8 caches, so it
+measured INT8's old write path — one the timed runs never take — and still
+reported 709 kernels after the fused write. It now enables the same mode.
+
+## Kernel census (`phase16_kernel_census`) — the 709, measured
+
+| one decode step, batch 1 / 2K | kernels | int8_decode_write |
+| --- | ---: | ---: |
+| fp16 | 429 | 0 |
+| INT8, eager (the old counter) | 709 | 0 |
+| INT8, deferred, fused off (timed path before Phase 16) | 709 | 0 |
+| INT8, deferred, fused on (timed path now) | 401 | 28 |
+| captured graph, replayed: fp16 | 433 | 0 |
+| captured graph, replayed: INT8 | 407 | 28 |
+
+The explanation is confirmed: the old counter and the pre-fusion timed path
+both had 709 kernels, which is why the count never looked wrong until the
+fusion changed only one of them; the replay shows the timed path running the
+fused kernel once per layer. With fusion off, INT8's extra kernels were 280
+elementwise, reduce and index ops (+308) less fp16's attention kernel (-28).
+With fusion on, INT8 issues **28 fewer kernels than fp16** (one fused write
+per layer against fp16's two scatters). The predicted 400-430 held; the
+earlier "~457" had assumed the fused kernel was *added* per layer rather than
+replacing a dozen.
+
+**Consequence for the gate:** INT8's remaining penalty (up to 9.3% at batch
+16 / 16K) cannot be launch overhead — it now launches fewer kernels than
+fp16. It is INT8's attention kernel, latency-bound as Phase 12 found, which is
+why the penalty grows with batch x context. That makes the gate's verdict
+firmer, not weaker.
+
+(The census's first version listed differing kernels only over the INT8
+run's own names, so fp16's attention kernel — absent from INT8 runs — never
+showed its -28; fixed to use the union.)

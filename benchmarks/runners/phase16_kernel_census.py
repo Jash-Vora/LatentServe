@@ -130,8 +130,11 @@ def main() -> int:
     base = collections.Counter(_short(k) for k in runs["fp16"])
     for name in ("int8, deferred, fused off", "int8, deferred, fused on"):
         c = collections.Counter(_short(k) for k in runs[name])
-        extra = sorted(((k, c[k] - base.get(k, 0)) for k in c if c[k] != base.get(k, 0)),
-                       key=lambda kv: -abs(kv[1]))
+        # Over the union of names: iterating only this run's kernels missed
+        # those it does not run at all — fp16's own attention kernel among them.
+        keys = set(c) | set(base)
+        extra = sorted(((k, c.get(k, 0) - base.get(k, 0)) for k in keys
+                        if c.get(k, 0) != base.get(k, 0)), key=lambda kv: -abs(kv[1]))
         print(f"\n  {name} vs fp16 — kernels whose count differs:")
         for k, d in extra[:14]:
             print(f"    {d:+5d}  {k}")

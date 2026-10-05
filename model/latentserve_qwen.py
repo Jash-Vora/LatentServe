@@ -491,17 +491,20 @@ class LatentServeQwen:
         return self._to_logits(hidden)
 
     @torch.no_grad()
-    def prefill_slot(self, input_ids: torch.Tensor, slot: int, chunk_size: Optional[int] = None):
+    def prefill_slot(self, input_ids: torch.Tensor, slot: int, chunk_size: Optional[int] = None,
+                     start: int = 0):
         """Prefill one request into one cache slot, leaving every other
         slot untouched. The operation continuous batching is built from:
         an arriving request must be able to run its prompt without
         disturbing sequences already decoding."""
+        # `start`: tokens already in the slot's cache — a reused prefix
+        # (Phase 13). `input_ids` is then only the rest of the prompt.
         seq_len = input_ids.shape[1]
         step = chunk_size or seq_len
         hidden = None
-        for start in range(0, seq_len, step):
-            block = input_ids[:, start : start + step]
-            hidden = self._forward_block(block, start_pos=start, slots=[slot])
+        for offset in range(0, seq_len, step):
+            block = input_ids[:, offset : offset + step]
+            hidden = self._forward_block(block, start_pos=start + offset, slots=[slot])
         return self._to_logits(hidden[:, -1:, :])
 
     @torch.no_grad()

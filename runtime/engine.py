@@ -75,6 +75,7 @@ class ServingEngine:
         profile_loop: bool = False,
         kv_dtype: str = "fp16",
         policy=None,
+        prefix_caching: bool = False,
     ):
         from collections import Counter
 
@@ -112,6 +113,16 @@ class ServingEngine:
             if not hasattr(cache, "enable_page_bounds"):
                 raise ValueError("a sparsity policy needs the fp16 paged cache")
             cache.enable_page_bounds()
+        # Phase 13: shared prompt prefixes are prefilled once (cache/prefix_cache.py).
+        self.prefix = None
+        self.prefix_hit_tokens = 0
+        self.prompt_tokens_seen = 0
+        if prefix_caching:
+            if not hasattr(cache, "attach_prefix"):
+                raise ValueError("prefix caching needs a cache that can attach a cached prefix")
+            from cache.prefix_cache import PrefixCache
+
+            self.prefix = PrefixCache(cache.allocator, block_size)
         self.cache: PagedKVCache = cache
 
         # Phase 13: decode through captured CUDA graphs. Prefill stays
@@ -194,6 +205,15 @@ class ServingEngine:
     def _retire(self, request: ServedRequest) -> None:
         request.finish_time = time.perf_counter()
         request.state = RequestState.FINISHED
+        if self.prefix is not None:
+            # Every full block this sequence wrote, generated tokens included:
+            # a multi-turn conversation's next prompt contains this reply. The
+            # cache holds the prompt and every output token but the last,
+            # which was returned and never fed back.
+            table = self.cache.tables[request.slot]
+            n = self.cache.shareable_blocks(request.slot)
+            written = (list(request.prompt_ids) + list(request.output_ids))[: n * self.cache.block_size]
+            self.prefix.register(written, table.blocks[:n])
         self.cache.free_sequence(request.slot)
         self._free_slots.append(request.slot)
         request.slot = None
@@ -208,7 +228,7 @@ class ServingEngine:
         return sum(max(0, alloc.blocks_for_tokens(r.prompt_len + r.max_new_tokens)
                        - len(self.cache.tables[r.slot].blocks)) for r in self.running)
 
-    def _fits(self, request: ServedRequest) -> bool:
+    def _fits(self, request: ServedRequest, matched=()) -> bool:
         """Admit only if the pool can hold this request's prompt *and* every
         token it may generate, after what running requests are still owed.
 
@@ -216,8 +236,12 @@ class ServingEngine:
         exhausted a 12-block pool during decode (OutOfBlocks mid-run). Without
         preemption, reserving the worst case is the rule that cannot crash.
         """
-        need = self.cache.allocator.blocks_for_tokens(request.prompt_len + request.max_new_tokens)
-        return need <= self.cache.allocator.num_free - self._blocks_promised()
+        alloc = self.cache.allocator
+        need = alloc.blocks_for_tokens(request.prompt_len + request.max_new_tokens) - len(matched)
+        # Reused blocks need no allocation — but any of them that is now only
+        # evictable stops counting as available the moment it is attached.
+        taken = sum(1 for b in matched if alloc.ref_count(b) == 1)
+        return need <= alloc.num_available - taken - self._blocks_promised()
 
     def _admit_and_prefill(self) -> None:
         admitted = self.scheduler.select(
@@ -231,7 +255,8 @@ class ServingEngine:
             # Re-check: earlier admissions in this same iteration consumed
             # blocks the scheduler's snapshot did not know about — and the
             # request must fit with its outputs, not just its prompt.
-            if not self.cache.can_admit(request.prompt_len) or not self._fits(request):
+            matched = self.prefix.match(request.prompt_ids) if self.prefix else []
+            if not self.cache.can_admit(request.prompt_len) or not self._fits(request, matched):
                 break
             slot = self._free_slots.pop(0)
             request.slot = slot
@@ -239,15 +264,28 @@ class ServingEngine:
             request.scheduled_time = time.perf_counter()
             self.waiting.remove(request)
 
+            reused = len(matched) * self.cache.block_size
+            if reused:
+                self.cache.attach_prefix(slot, matched, reused)
             ids = torch.tensor(
-                [request.prompt_ids], dtype=torch.long, device=self.model.device
+                [request.prompt_ids[reused:]], dtype=torch.long, device=self.model.device
             )
             t0 = time.perf_counter()
-            logits = self.model.prefill_slot(ids, slot, chunk_size=self.prefill_chunk_size)
+            logits = self.model.prefill_slot(ids, slot, chunk_size=self.prefill_chunk_size,
+                                             start=reused)
             if self.model.device.type == "cuda":
                 torch.cuda.synchronize()
             self.prefill_s += time.perf_counter() - t0
-            self.prefill_tokens += request.prompt_len
+            self.prefill_tokens += request.prompt_len - reused
+            self.prefix_hit_tokens += reused
+            self.prompt_tokens_seen += request.prompt_len
+            request.prefix_hit_tokens = reused
+            if self.prefix is not None:
+                # Record the prompt's full blocks now, so requests arriving
+                # while this one decodes can share them.
+                n = self.cache.shareable_blocks(slot)
+                self.prefix.register(request.prompt_ids[: n * self.cache.block_size],
+                                     self.cache.tables[slot].blocks[:n])
 
             next_id = int(logits[0, -1].argmax().item())
             request.first_token_time = time.perf_counter()

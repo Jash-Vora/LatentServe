@@ -24,7 +24,7 @@ pressure; carrying an always-1 counter now costs nothing.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 
 class OutOfBlocks(RuntimeError):
@@ -56,6 +56,15 @@ class BlockAllocator:
     alloc_calls: int = field(default=0, init=False)
     free_calls: int = field(default=0, init=False)
     peak_used: int = field(default=0, init=False)
+    # Phase 13: a prefix cache keeps blocks no sequence references, until
+    # memory is needed. `reclaimable()` counts them; `reclaimer(n)` evicts up
+    # to n back into the pool. Both None without prefix caching.
+    reclaimer: Optional[Callable[[int], None]] = field(default=None, init=False, repr=False)
+    reclaimable: Optional[Callable[[], int]] = field(default=None, init=False, repr=False)
+    # Called as on_ref_change(block, old, new) — lets the prefix cache keep
+    # its reclaimable count in O(1) instead of scanning every cached block.
+    on_ref_change: Optional[Callable[[int, int, int], None]] = field(default=None, init=False,
+                                                                       repr=False)
 
     def __post_init__(self) -> None:
         if self.num_blocks <= 0 or self.block_size <= 0:
@@ -82,7 +91,15 @@ class BlockAllocator:
 
     # ------------------------------------------------------------------
 
+    @property
+    def num_available(self) -> int:
+        """Free blocks plus cached blocks nobody references: what an
+        allocation can actually get."""
+        return self.num_free + (self.reclaimable() if self.reclaimable else 0)
+
     def allocate(self, num_blocks: int) -> list[int]:
+        if num_blocks > self.num_free and self.reclaimer is not None:
+            self.reclaimer(num_blocks - self.num_free)
         if num_blocks > self.num_free:
             raise OutOfBlocks(
                 f"requested {num_blocks} blocks, {self.num_free} free "
@@ -111,6 +128,8 @@ class BlockAllocator:
             else:
                 del self._ref_count[b]
                 self._free.append(b)
+            if self.on_ref_change is not None:
+                self.on_ref_change(b, count, count - 1)
 
     def incref(self, blocks: Iterable[int]) -> None:
         """Mark blocks as shared by one more sequence. Unused until
@@ -119,6 +138,8 @@ class BlockAllocator:
             if b not in self._ref_count:
                 raise ValueError(f"increfing block {b} that is not allocated")
             self._ref_count[b] += 1
+            if self.on_ref_change is not None:
+                self.on_ref_change(b, self._ref_count[b] - 1, self._ref_count[b])
 
     def ref_count(self, block: int) -> int:
         return self._ref_count.get(block, 0)
