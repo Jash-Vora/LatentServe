@@ -74,5 +74,8 @@ def decode_write(k, v, slots, res_idx, flat_v, flat_v_scale, flat_v_zero, k_res,
         ptr(flat_v_zero), ptr(k_res),
         i64(k.stride(0)), i64(k.stride(1)), i64(v.stride(0)), i64(v.stride(1)),
         np.int32(h), np.int32(int(asym)), np.float32(eps), np.float32(qmax),
-        np.float32(levels), np.float32(offset)),
+        # The reciprocal exactly as PyTorch forms it for `t / python_number`:
+        # one fp32 division on the host.
+        np.float32(1.0) / np.float32(qmax), np.float32(levels),
+        np.float32(1.0) / np.float32(levels), np.float32(offset)),
        stream=pdc._stream(k.device))

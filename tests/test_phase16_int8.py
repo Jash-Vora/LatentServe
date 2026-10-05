@@ -93,3 +93,60 @@ def test_the_fused_path_is_actually_taken():
     finally:
         iw.decode_write = original
     assert len(calls) == 3 * 2                                    # steps x layers
+
+
+
+def _torch_reference(k, v, asym, eps=1e-8, v_bits=8):
+    """The torch path's arithmetic, verbatim from Int8PagedKVCache.write()."""
+    qmax, levels, offset = 2 ** (v_bits - 1) - 1, 2 ** v_bits - 1, 2 ** (v_bits - 1)
+    v_f = v.permute(0, 2, 1, 3).to(torch.float32)              # [B, 1, H, D]
+    if asym:
+        v_lo = v_f.amin(dim=-1, keepdim=True)
+        v_hi = v_f.amax(dim=-1, keepdim=True)
+        v_step = ((v_hi - v_lo) / levels).clamp_min(eps)
+        v_u = torch.clamp(torch.round((v_f - v_lo) / v_step), 0, levels)
+        v_q = (v_u - offset).to(torch.int8)
+        zero = (v_lo + offset * v_step).squeeze(-1)
+    else:
+        v_step = v_f.abs().amax(dim=-1, keepdim=True).clamp_min(eps) / qmax
+        v_q = torch.clamp(torch.round(v_f / v_step), -qmax, qmax).to(torch.int8)
+        zero = None
+    return v_q[:, 0], v_step.squeeze(-1)[:, 0], None if zero is None else zero[:, 0]
+
+
+@requires_gpu
+@pytest.mark.parametrize("asym", [False, True])
+def test_kernel_matches_the_torch_formula_on_identical_inputs(asym):
+    """Isolates the kernel: same inputs, compared byte for byte, over many
+    tokens and magnitudes — no model, nothing to propagate."""
+    g = torch.Generator(device="cuda").manual_seed(5)
+    b, h, d = 256, 2, 128
+    scale = torch.logspace(-3, 2, b, device="cuda")[:, None, None, None]
+    v = (torch.randn(b, h, 1, d, device="cuda", generator=g) * scale).half()
+    k = torch.randn(b, h, 1, d, device="cuda", generator=g).half()
+    slots = torch.randperm(4 * b, device="cuda", generator=g)[:b]
+    res_idx = torch.arange(b, device="cuda")
+    flat_v = torch.zeros(4 * b, h, d, dtype=torch.int8, device="cuda")
+    flat_s = torch.zeros(4 * b, h, device="cuda")
+    flat_z = torch.zeros(4 * b, h, device="cuda") if asym else None
+    k_res = torch.zeros(b, h, d, dtype=torch.float16, device="cuda")
+    iw.decode_write(k, v, slots, res_idx, flat_v, flat_s, flat_z, k_res, asym=asym, eps=1e-8,
+                    qmax=127.0, levels=255.0, offset=128.0)
+    torch.cuda.synchronize()
+    want_q, want_s, want_z = _torch_reference(k, v, asym)
+    assert torch.equal(flat_v[slots], want_q)
+    assert torch.equal(flat_s[slots], want_s), "scales differ: check the reciprocal"
+    if asym:
+        assert torch.equal(flat_z[slots], want_z)
+    assert torch.equal(k_res, k[:, :, 0])
+
+
+@requires_gpu
+def test_the_torch_path_is_deterministic_end_to_end():
+    """Control for the end-to-end comparison: if the torch path does not
+    reproduce itself, a mismatch against the fused path proves nothing."""
+    a = _decode_state(False, fused=False)
+    b = _decode_state(False, fused=False)
+    for name in a:
+        for x, y in zip(a[name], b[name]):
+            assert torch.equal(x, y), name

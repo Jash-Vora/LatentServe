@@ -12,6 +12,14 @@
 // torch.round), and every multiply/add/divide that the torch path rounds
 // separately is rounded separately here too (__fmul_rn etc.) — otherwise
 // the compiler may contract a multiply-add into one FMA that rounds once.
+//
+// One trap: PyTorch does not *divide* by a Python number on the GPU. For
+// `t / 127` it multiplies by a reciprocal computed once in fp32 on the host
+// (its source: "this may lose one bit of precision"). The first version of
+// this kernel divided properly, and so disagreed by one bit in 4.7% of
+// scales at /127 and 74% at /255 — enough to fail byte-identity. Scales are
+// computed here as the torch path computes them: times inv_qmax / inv_levels.
+// Tensor-by-tensor divisions (x / step) are true divisions in torch, and here.
 
 #include <cuda_fp16.h>
 
@@ -40,7 +48,8 @@ int8_decode_write(const __half* __restrict__ k, const __half* __restrict__ v,
                   signed char* __restrict__ flat_v, float* __restrict__ flat_v_scale,
                   float* __restrict__ flat_v_zero, __half* __restrict__ k_res,
                   long long sk_b, long long sk_h, long long sv_b, long long sv_h,
-                  int heads, int asym, float eps, float qmax, float levels, float offset) {
+                  int heads, int asym, float eps, float qmax, float inv_qmax, float levels,
+                  float inv_levels, float offset) {
     __shared__ float buf[WARPS];
     const int b = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
     const float x = __half2float(v[b * sv_b + h * sv_h + d]);
@@ -49,14 +58,14 @@ int8_decode_write(const __half* __restrict__ k, const __half* __restrict__ v,
 
     if (!asym) {
         const float amax = block_max(fabsf(x), buf);
-        const float step = __fdiv_rn(fmaxf(amax, eps), qmax);
+        const float step = __fmul_rn(fmaxf(amax, eps), inv_qmax);
         const float q = fminf(fmaxf(rintf(__fdiv_rn(x, step)), -qmax), qmax);
         flat_v[row * HEAD_DIM + d] = (signed char)(int)q;
         if (d == 0) flat_v_scale[row] = step;
     } else {
         const float hi = block_max(x, buf);
         const float lo = -block_max(-x, buf);
-        const float step = fmaxf(__fdiv_rn(__fsub_rn(hi, lo), levels), eps);
+        const float step = fmaxf(__fmul_rn(__fsub_rn(hi, lo), inv_levels), eps);
         const float u = fminf(fmaxf(rintf(__fdiv_rn(__fsub_rn(x, lo), step)), 0.f), levels);
         flat_v[row * HEAD_DIM + d] = (signed char)(int)__fsub_rn(u, offset);
         if (d == 0) {
