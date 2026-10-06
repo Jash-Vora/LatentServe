@@ -142,3 +142,41 @@ def test_the_vllm_adapter_reports_first_tokens_and_completions():
     assert done == [req] and req.output_ids == [1, 2, 3]
     assert req.finish_time >= t_first and req.prefix_hit_tokens == 32
     assert not eng.has_work
+
+
+def test_aggregate_takes_medians_and_reports_the_spread():
+    from benchmarks.runners.phase18_replicas import aggregate
+
+    def run(tps, ttft):
+        return {"out_tok_s_ex_capture": tps, "out_tok_s": tps, "hit_rate": 0.5,
+                "ttft_ms": {"p50": ttft, "p95": ttft, "p99": ttft},
+                "tpot_ms": {"p50": 1.0, "p95": 1.0, "p99": 1.0},
+                "e2e_ms": {"p50": 2.0, "p95": 2.0, "p99": 2.0}, "busy_frac": [0.9, 0.8]}
+
+    agg = aggregate([run(100.0, 10.0), run(110.0, 30.0), run(90.0, 20.0)])
+    assert agg["out_tok_s_ex_capture"] == 100.0 and agg["ttft_ms"]["p50"] == 20.0
+    assert agg["tok_s_spread"] == pytest.approx(0.2)
+
+
+def test_a_worker_failure_surfaces_with_its_traceback():
+    """A worker that fails must fail the run quickly and say why — the first
+    vLLM run's workers died silently and the parent waited 15 minutes."""
+    import queue as q
+
+    from benchmarks.runners import phase18_replicas as pr
+
+    import os
+
+    # worker_main sets CUDA_VISIBLE_DEVICES for its process — here, the test
+    # process: restore it, or later tests could lose the second GPU.
+    saved = os.environ.get("CUDA_VISIBLE_DEVICES")
+    out = q.Queue()
+    try:
+        pr.worker_main(0, "no-such-backend", q.Queue(), out, {})
+    finally:
+        if saved is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = saved
+    kind, gpu, msg = out.get_nowait()
+    assert kind == "error" and gpu == 0 and "no-such-backend" in msg

@@ -89,8 +89,8 @@ def main() -> int:
     print(f"peer-to-peer access between the two GPUs: {p2p}\n")
     print(f"{'all-reduce':<22}{'bytes':>10}{'latency':>12}{'x56 per decode step':>22}")
     for label, (rows, ms) in lat.items():
-        print(f"{label:<22}{rows * HIDDEN * 2:>10}{ms * 1000:>10.1f}us"
-              f"{(ms * 2 * LAYERS if label.startswith('decode') else float('nan')):>20.2f}ms")
+        per_step = f"{ms * 2 * LAYERS:.2f}ms" if label.startswith("decode") else "-"
+        print(f"{label:<22}{rows * HIDDEN * 2:>10}{ms * 1000:>10.1f}us{per_step:>22}")
 
     step = {}
     if Path(args.step_table).exists():
@@ -98,17 +98,19 @@ def main() -> int:
             if r["ratio"] is None and r["ctx"] == 2048:
                 step[r["batch"]] = r["ms"]
     if step:
-        print(f"\nOptimistic TP-2 estimate at 2K context (half the single-GPU step + "
-              f"{2 * LAYERS} all-reduces):\n")
-        print(f"{'batch':>6}{'1 GPU':>10}{'TP-2 bound':>13}{'speedup bound':>16}")
+        print(f"\nTP-2 estimate at 2K context (half the single-GPU step + "
+              f"{2 * LAYERS} NCCL all-reduces):\n")
+        print(f"{'batch':>6}{'1 GPU':>10}{'TP-2 est.':>12}{'speedup est.':>15}")
         for b in sorted(step):
             key = f"decode b{b}"
             if key not in lat:
                 continue
             tp = step[b] / 2 + lat[key][1] * 2 * LAYERS
-            print(f"{b:>6}{step[b]:>8.2f}ms{tp:>11.2f}ms{step[b] / tp:>15.2f}x")
-        print("\nAn upper bound on TP's benefit: perfect splitting assumed, embedding and\n"
-              "output layers ignored. Below 1.0x, TP cannot pay here; above, it might.")
+            print(f"{b:>6}{step[b]:>8.2f}ms{tp:>10.2f}ms{step[b] / tp:>14.2f}x")
+        print("\nNot an upper bound. It assumes a perfect split of the compute (optimistic)\n"
+              "but NCCL's all-reduce latency (pessimistic): engines with their own\n"
+              "peer-to-peer all-reduce do better — vLLM's TP-2 measured 1.73x at batch 1\n"
+              "against this 1.45x. See phase18_vllm_tp for the measured number.")
     else:
         print(f"\n(no step table at {args.step_table}: run phase17_calibrate for the estimate)")
     d = Path(args.results_dir)
