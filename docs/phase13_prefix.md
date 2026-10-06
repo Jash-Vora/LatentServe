@@ -65,3 +65,39 @@ rounds, alternating order; production setup.
 first request), prefill per request and TTFT down ~80-85%; chat — hit rate
 rising turn by turn, ~70-85% overall; none — hit rate ~0 and overhead under
 1% on every metric; decode throughput unchanged within ~2% everywhere.
+
+## Result (T4; two rounds, alternating order; median of rounds)
+
+| workload | kv | hit rate | TTFT p50 off -> on | prefill / request | decode off -> on |
+| --- | --- | ---: | --- | --- | --- |
+| shared | fp16 | 86.1% | 318.8 -> 51.1 ms (-84%) | 344.4 -> 58.5 ms | 337.0 -> 353.9 tok/s |
+| chat | fp16 | 86.7% | 182.5 -> 41.6 ms (-77%) | 183.2 -> 42.1 ms | 351.2 -> 351.9 |
+| none | fp16 | 0% | 374.9 -> 378.5 ms (+1.0%) | 373.5 -> 376.4 ms | 322.6 -> 321.4 |
+| shared | int8 | 86.1% | 345.7 -> 60.2 ms (-83%) | 370.7 -> 67.8 ms | 315.0 -> 327.6 |
+| chat | int8 | 86.7% | 192.3 -> 58.7 ms (-70%) | 193.5 -> 59.1 ms | 308.0 -> 316.5 |
+| none | int8 | 0% | 383.8 -> 381.7 ms (-0.6%) | 382.6 -> 380.3 ms | 307.0 -> 307.1 |
+
+Live KV blocks at peak (fp16): shared 1172 -> 738 (-37%), chat 856 -> 665
+(-22%).
+
+**Against the predictions:** shared hit rate 86% predicted, 86.1% measured;
+TTFT -80-85% predicted, -84%. Chat 70-85% predicted, 86.7% — just above.
+No-sharing overhead "under 1%": +1.0% (fp16) and -0.6% (int8), against ~3%
+round-to-round noise — indistinguishable from zero. **Wrong:** "decode
+unchanged within 2%" — *shared* decodes 4-5% faster with prefix caching,
+consistently in both rounds and in INT8. Hypothesis, not measured: every
+sequence in a batch reads the same physical pages for the 2048-token prefix
+(~2 MB per layer, within the T4's 4 MB L2), so later sequences hit L2. Chat
+shares less per batch and shows no gain, which is consistent.
+
+**It stacks with INT8:** identical hit rates, TTFT -83% (shared) and -70%
+(chat), no overhead without sharing. Chat gains less than fp16 because the
+uncached part of each prompt still attends over the reused prefix, and
+prefill reads INT8 pages more slowly. (Correctness: the CPU stacking test and
+the GPU test that INT8 never shares an unfinalized block.)
+
+**Instrument correction:** the first run reported 4706 peak blocks for
+*none* with caching on (1172 off). That is not pressure — `peak_used`
+counted blocks the cache keeps after requests finish, which a 16K-block pool
+never needed to evict. The benchmark now reports peak *live* blocks
+(held by running requests), from the prefix cache's own accounting.

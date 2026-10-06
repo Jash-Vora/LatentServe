@@ -117,7 +117,12 @@ def serve(model, wl: dict, prefix_caching: bool, num_blocks: int, kv_dtype: str,
         "prefill_ms_per_request": 1000 * engine.prefill_s / max(1, len(done)),
         "ttft_mean_ms": statistics.fmean(ttft), "ttft_p50_ms": statistics.median(ttft),
         "decode_tok_s": gen / max(1e-9, engine.decode_s - capture), "wall_s": wall,
+        # `peak_used` counts blocks the prefix cache keeps after requests
+        # finish (evictable on demand); `peak_live` counts only blocks live
+        # requests hold — the memory pressure that matters.
         "peak_blocks": engine.cache.allocator.peak_used,
+        "peak_live_blocks": (engine.prefix.peak_live if engine.prefix
+                             else engine.cache.allocator.peak_used),
         "prefix": engine.prefix.stats() if engine.prefix else None,
     }
     del engine
@@ -174,7 +179,7 @@ def main() -> int:
         results[name] = runs
 
     print(f"\n{'workload':<9}{'prefix':<8}{'hit rate':>9}{'TTFT p50':>11}{'TTFT mean':>11}"
-          f"{'prefill/req':>13}{'decode tok/s':>14}{'peak blocks':>13}")
+          f"{'prefill/req':>13}{'decode tok/s':>14}{'peak live blocks':>18}")
     for name, runs in results.items():
         for on in (False, True):
             rs = runs[on]
@@ -182,7 +187,7 @@ def main() -> int:
             print(f"{name:<9}{'on' if on else 'off':<8}{med('hit_rate'):>9.1%}"
                   f"{med('ttft_p50_ms'):>9.1f}ms{med('ttft_mean_ms'):>9.1f}ms"
                   f"{med('prefill_ms_per_request'):>11.1f}ms{med('decode_tok_s'):>14.1f}"
-                  f"{int(med('peak_blocks')):>13}")
+                  f"{int(med('peak_live_blocks')):>18}")
         off = statistics.median(x["ttft_p50_ms"] for x in runs[False])
         on_ = statistics.median(x["ttft_p50_ms"] for x in runs[True])
         print(f"{'':<9}TTFT p50 {(1 - on_ / off):+.1%} with prefix caching\n")

@@ -252,3 +252,14 @@ def test_benchmark_workloads_have_the_intended_shape():
     assert len({tuple(r["prompt"][:16]) for r in none}) == 32          # nothing shared
     chat = workload("chat", 0)
     assert chat["chat"] and chat["turns"] == 5 and len(chat["requests"]) == 8
+
+
+def test_peak_live_blocks_exclude_what_the_cache_merely_keeps():
+    g = torch.Generator().manual_seed(6)
+    prompts = [torch.randint(0, 128, (60,), generator=g).tolist() for _ in range(6)]
+    ls = _model()
+    eng, _ = _serve(ls, prompts, True, max_running=2, arrive="sequential")
+    alloc = eng.cache.allocator
+    assert len(eng.prefix.entry) > 0
+    assert eng.prefix.peak_live <= alloc.peak_used
+    assert eng.prefix.peak_live < alloc.peak_used          # cached-only blocks inflate peak_used

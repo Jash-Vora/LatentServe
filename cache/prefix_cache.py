@@ -46,6 +46,7 @@ class PrefixCache:
     lookups: int = 0
     evictions: int = 0
     _reclaimable: int = 0
+    peak_live: int = 0        # blocks held by live sequences, cache-only blocks excluded
 
     def __post_init__(self):
         self.allocator.reclaimer = self.reclaim
@@ -57,6 +58,9 @@ class PrefixCache:
         Admission asks for it several times per step; scanning ~16K cached
         blocks each time would have shown up as prefix-caching overhead that
         was really just a lazy count."""
+        live = self.allocator.num_used - self._reclaimable
+        if live > self.peak_live:
+            self.peak_live = live
         if block not in self.entry:
             return
         if old == 2 and new == 1:
@@ -132,4 +136,5 @@ class PrefixCache:
 
     def stats(self) -> dict:
         return {"cached_blocks": len(self.entry), "reclaimable": self.num_reclaimable(),
+                "peak_live": self.peak_live,
                 "lookups": self.lookups, "hits": self.hits, "evictions": self.evictions}
