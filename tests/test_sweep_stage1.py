@@ -58,7 +58,7 @@ def _args(tmp_path, **kw):
 def small(monkeypatch):
     """A small matrix, and workloads whose arrival times are compressed."""
     monkeypatch.setattr(sw, "A_BATCHES", (1, 32))   # 32: the batch the first version could never run
-    monkeypatch.setattr(sw, "A_CONTEXTS", (2048, 32000))
+    monkeypatch.setattr(sw, "A_CONTEXTS", (2048, 32768))
     monkeypatch.setattr(sw, "B_LENGTHS", (1024, 4096))
     monkeypatch.setattr(sw, "FRACTIONS", (0.5, 1.0))
     real_open, real_vary = sw.openloop, sw.varying
@@ -87,7 +87,7 @@ def test_the_full_flow_saves_every_cell_and_a_rerun_measures_nothing(tmp_path, s
     names = {p.name for p in tmp_path.glob("*.json")}
     # A: 2 batches x 2 contexts x 2 rounds x (4 LS configs + vLLM)
     assert sum(n.startswith("A__") for n in names) == 2 * 2 * 2 * 5
-    assert "A__b32-c32000__ls-dense__r0.json" in names            # saved even when it did not fit
+    assert "A__b32-c32768__ls-dense__r0.json" in names            # saved even when it did not fit
     assert "A__b32-c2048__ls-dense__r0.json" in names
     # B: 2 lengths x (dense, int8, vLLM); one round
     assert sum(n.startswith("B__") for n in names) == 2 * 3
@@ -217,12 +217,17 @@ def test_a_batch_over_the_limit_is_reported_as_concurrency_not_memory():
 
 
 def test_every_cell_stays_within_the_models_position_limit():
-    """Qwen2.5-1.5B has 32,768 positions. vLLM refuses anything longer; LatentServe
-    would run past the trained range. Every cell must fit, on both engines."""
+    """Qwen2.5-1.5B has 32,768 positions for prompt and generated tokens
+    together. vLLM refuses anything longer; LatentServe would run past the
+    trained range. Every cell must fit, on both engines."""
     assert sw.MAX_SEQ == 32768
-    for ctx in sw.A_CONTEXTS:                                    # context + every decoded token
-        assert ctx + 48 + sw.A_STEPS_HEADROOM <= sw.MAX_SEQ
-    assert all(L + 1 <= sw.MAX_SEQ for L in sw.B_LENGTHS)
+    for steps in (48, 16, 100):
+        for ctx in sw.A_CONTEXTS:                          # prompt + every decoded token
+            assert sw.a_prompt(ctx, steps) + sw.A_WARMUP + steps + sw.A_HEADROOM <= sw.MAX_SEQ
+    assert sw.a_prompt(32768, 48) == 32696                 # ends exactly at the limit
+    assert sw.a_prompt(8192, 48) == 8192                   # shorter contexts untouched
+    assert sw.b_prompt(32768) == 32767 and sw.b_prompt(4096) == 4096
+    assert all(sw.b_prompt(L) + 1 <= sw.MAX_SEQ for L in sw.B_LENGTHS)
     from benchmarks.runners import phase18_replicas as pr
 
     for wl in (sw.varying(0), sw.probe(0), sw.openloop(0, 1.0, 40), pr.burst(0), pr.chat(0)):

@@ -61,18 +61,32 @@ A_BATCHES = (1, 4, 8, 16, 32)
 # serving workloads keep 16. (The first version applied 16 everywhere, so
 # batch 32 could never run and was misreported as not fitting.)
 A_MAX_RUNNING = max(A_BATCHES)
-# The largest context is 32,000, not 32,768: Qwen2.5-1.5B's limit is 32,768
-# positions (max_position_embeddings), and the decode steps measured on top of
-# a context must fit inside it. The first version used 32,768 contexts and a
-# 33,280 limit: LatentServe ran past the model's trained range, and vLLM —
-# which checks — refused to start.
-A_CONTEXTS = (2048, 8192, 16384, 32000)
-B_LENGTHS = (1024, 2048, 4096, 8192, 16384, 32000)   # prompt + 1 token within the limit
+# Qwen2.5-1.5B's limit is 32,768 positions (max_position_embeddings) for the
+# prompt *and* every generated token together. A "32,768" cell therefore fills
+# the cache up to the limit: its prompt leaves room for the tokens decoded on
+# top (a_prompt). The first version started the prompt at 32,768 and decoded
+# past the end — LatentServe, which never checked, ran past the trained range;
+# vLLM, which does, refused to start.
+A_CONTEXTS = (2048, 8192, 16384, 32768)
+B_LENGTHS = (1024, 2048, 4096, 8192, 16384, 32768)   # 32,768: a 32,767-token prompt + 1 token
 B_LS = ["ls-dense", "ls-int8"]
 C_LS = ["ls-dense", "ls-sparse37.5", "ls-adaptive", "ls-int8"]
 FRACTIONS = (0.1, 0.25, 0.4, 0.55, 0.7, 0.8, 0.9, 1.0, 1.1)
 MAX_SEQ = 32768            # the model's own limit (max_position_embeddings), both engines
-A_STEPS_HEADROOM = 8 + 16  # section A's warm-up steps and token headroom beyond the timed steps
+A_WARMUP, A_HEADROOM = 8, 16   # decoded beyond the timed steps (see _measure_steps)
+
+
+def a_prompt(ctx: int, steps: int) -> int:
+    """Section A's prompt for a context label: the label itself, unless the
+    tokens decoded on top would pass the limit — then the prompt that ends
+    exactly at it (32,768 -> 32,696 with 48 timed steps)."""
+    return min(ctx, MAX_SEQ - (A_WARMUP + steps + A_HEADROOM))
+
+
+def b_prompt(length: int) -> int:
+    """Section B's prompt: the length itself, or 32,767 for 32,768 — the one
+    output token needs a position too."""
+    return min(length, MAX_SEQ - 1)
 
 
 def cell_id(section: str, what: str, config: str, rnd: int) -> str:
@@ -221,14 +235,16 @@ def run_group(run: Runner, cluster, configs: dict, sections, base: dict, chat_on
                         if run.done(cid):
                             continue
                         cluster.reset(opts_for(name, max_running=A_MAX_RUNNING))
-                        m = cluster.measure_steps(0, batch=b, ctx=ctx, steps=a.steps, warmup=8,
+                        m = cluster.measure_steps(0, batch=b, ctx=a_prompt(ctx, a.steps),
+                                                  steps=a.steps, warmup=A_WARMUP,
                                                   seed=zlib.crc32(cid.encode()) & 0xFFFF)
                         cluster.reset(opts_for(name))
                         if m.get("fits") and m.get("step_ms"):
                             m["pct"] = percentiles(m["step_ms"], (50, 90, 95, 99))
                             m["tok_s"] = b * 1000 / statistics.median(m["step_ms"])
                         run.save(cid, {"result": m, "config": name, "backend": backend,
-                                       "batch": b, "ctx": ctx})
+                                       "batch": b, "ctx": ctx,
+                                       "prompt_tokens": a_prompt(ctx, a.steps)})
                         note = (f"p50 {m['pct']['p50']:.2f} ms  p99 {m['pct']['p99']:.2f} ms"
                                 if m.get("pct") else f"skipped: {m.get('reason', 'did not fit')}")
                         print(f"  {cid:<44} {note}", flush=True)
@@ -239,7 +255,8 @@ def run_group(run: Runner, cluster, configs: dict, sections, base: dict, chat_on
                 # The A/B limit on both engines: vLLM's A/B engine is built
                 # with it, so LatentServe's B cells use it too.
                 workload_cell(cell_id("B", f"L{length}", name, 0), name,
-                              sequential(length, a.b_repeats, a.seed), max_running=A_MAX_RUNNING)
+                              sequential(b_prompt(length), a.b_repeats, a.seed),
+                              max_running=A_MAX_RUNNING)
 
     if "C" in sections:
         cs = [n for n in names if n in C_LS or n == "vllm"]
@@ -413,7 +430,9 @@ def report(results: Path) -> str:
                         row.append("did not fit" if rs else "-")
                 if any(x != "-" for x in row):
                     lines.append(f"| {b} | {ctx} | " + " | ".join(row) + " |")
-        lines.append("")
+        lines += ["", f"The 32768 rows fill the cache to the model's limit: a "
+                  f"{a_prompt(32768, 48)}-token prompt plus the tokens decoded on top "
+                  "(with 48 timed steps).", ""]
 
     bcells = [c for c in cells if c["sec"] == "B"]
     if bcells:
@@ -427,7 +446,8 @@ def report(results: Path) -> str:
                 row.append(f"{r['ttft_ms']['p50']:.0f} / {r['ttft_ms']['p95']:.0f} / "
                            f"{r['ttft_ms']['p99']:.0f} (n={r['requests']})" if r else "-")
             lines.append(f"| {L} | " + " | ".join(row) + " |")
-        lines.append("")
+        lines += ["", "The 32768 row is a 32,767-token prompt: its one output token "
+                  "needs the last position.", ""]
 
     c_cells = [c for c in cells if c["sec"] == "C" and c["what"] in ("burst", "varying", "chat")]
     if c_cells:
