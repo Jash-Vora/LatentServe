@@ -57,6 +57,10 @@ LS = {  # LatentServe configurations: worker options on top of the base
 }
 A_LS = ["ls-dense", "ls-sparse50", "ls-sparse37.5", "ls-int8"]
 A_BATCHES = (1, 4, 8, 16, 32)
+# Section A's concurrency limit, for both engines: its largest batch. The
+# serving workloads keep 16. (The first version applied 16 everywhere, so
+# batch 32 could never run and was misreported as not fitting.)
+A_MAX_RUNNING = max(A_BATCHES)
 A_CONTEXTS = (2048, 8192, 16384, 32768)
 B_LENGTHS = (1024, 2048, 4096, 8192, 16384, 32768)
 B_LS = ["ls-dense", "ls-int8"]
@@ -210,7 +214,7 @@ def run_group(run: Runner, cluster, configs: dict, sections, base: dict, chat_on
                         cid = cell_id("A", f"b{b}-c{ctx}", name, rnd)
                         if run.done(cid):
                             continue
-                        cluster.reset(opts_for(name))
+                        cluster.reset(opts_for(name, max_running=A_MAX_RUNNING))
                         m = cluster.measure_steps(0, batch=b, ctx=ctx, steps=a.steps, warmup=8,
                                                   seed=zlib.crc32(cid.encode()) & 0xFFFF)
                         cluster.reset(opts_for(name))
@@ -226,8 +230,10 @@ def run_group(run: Runner, cluster, configs: dict, sections, base: dict, chat_on
     if "B" in sections and not chat_only:
         for length in B_LENGTHS:
             for name in [n for n in names if n in B_LS or n == "vllm"]:
+                # The A/B limit on both engines: vLLM's A/B engine is built
+                # with it, so LatentServe's B cells use it too.
                 workload_cell(cell_id("B", f"L{length}", name, 0), name,
-                              sequential(length, a.b_repeats, a.seed))
+                              sequential(length, a.b_repeats, a.seed), max_running=A_MAX_RUNNING)
 
     if "C" in sections:
         cs = [n for n in names if n in C_LS or n == "vllm"]
@@ -323,17 +329,22 @@ def main() -> int:
         finally:
             cluster.stop()
     if "vllm" in args.backends:
-        for prefix_on in (True, False):
-            if not prefix_on and "C" not in args.sections:
-                continue
-            group_base = dict(base, vllm_prefix=prefix_on)
-            print(f"vLLM group (prefix caching {'on' if prefix_on else 'off'}): starting...",
-                  flush=True)
+        # vLLM fixes max_num_seqs at startup, so sections A/B (limit 32) and the
+        # serving cells (limit 16, prefix caching on, then off) need separate
+        # engines.
+        groups = []
+        ab = [s for s in args.sections if s in ("A", "B")]
+        if ab:
+            groups.append(("sections A/B", ab, dict(base, max_running=A_MAX_RUNNING), False))
+        if "C" in args.sections:
+            groups.append(("serving, prefix caching on", ["C"], dict(base, vllm_prefix=True), False))
+            groups.append(("serving, prefix caching off", ["C"], dict(base, vllm_prefix=False), True))
+        for label, secs, group_base, chat_only in groups:
+            print(f"vLLM group ({label}): starting...", flush=True)
             cluster = pr.Cluster(1, "vllm", group_base)
             try:
                 cluster.warmup(group_base)
-                run_group(run, cluster, {"vllm": {}}, args.sections, group_base,
-                          not prefix_on, "vllm")
+                run_group(run, cluster, {"vllm": {}}, secs, group_base, chat_only, "vllm")
             finally:
                 cluster.stop()
     if run.ran and "vllm" in args.backends and "latentserve" in args.backends \

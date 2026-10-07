@@ -98,8 +98,9 @@ class _VLLMEngine:
     vLLM's incremental engine (`llm.llm_engine`). Built once per worker; a
     reset clears vLLM's prefix cache rather than reloading the model."""
 
-    def __init__(self, llm):
+    def __init__(self, llm, max_running=None):
         self.llm = llm
+        self.max_running = max_running          # vLLM's max_num_seqs, fixed at startup
         self.eng = llm.llm_engine
         self.reqs: dict = {}
         self.on_retire = None
@@ -169,10 +170,11 @@ def _vllm_engine(opts: dict, state: dict):
         # per configuration): on unless opts say otherwise. A reset clears it,
         # so a burst run starts cold and gains nothing from it.
         state["prefix"] = opts.get("vllm_prefix", True)
+        state["max_running"] = opts["max_running"]
         state["llm"], _ = construct_engine(LLM, kwargs, state["prefix"], None)
     elif hasattr(state["llm"], "reset_prefix_cache"):
         state["llm"].reset_prefix_cache()
-    return _VLLMEngine(state["llm"])
+    return _VLLMEngine(state["llm"], state.get("max_running"))
 
 
 BACKENDS = {"latentserve": _latentserve_engine, "vllm": _vllm_engine}
@@ -251,6 +253,10 @@ def _measure_steps(engine, ServedRequest, batch: int, ctx: int, steps: int, warm
     cannot all run at once is reported as not fitting, never timed short."""
     import random as _r
 
+    limit = getattr(engine, "max_running", None)
+    if limit is not None and batch > limit:
+        return {"fits": False, "reason": f"batch {batch} exceeds the engine's concurrency limit "
+                                         f"of {limit} — a configuration error, not memory"}
     if hasattr(engine, "cache"):                           # LatentServe: check the pool first
         alloc = engine.cache.allocator
         need = batch * alloc.blocks_for_tokens(ctx + warmup + steps + 16)   # the same headroom
@@ -287,7 +293,7 @@ def _timed_batch(engine, ServedRequest, batch, ctx, steps, warmup, seed, vocab) 
     if done or any(r.first_token_time is None for r in reqs):
         while engine.has_work:
             engine.step()
-        return {"fits": False, "reason": "the batch could not all decode at once"}
+        return {"fits": False, "reason": "the batch could not all decode at once (memory)"}
     for _ in range(warmup):
         engine.step()
     times = []

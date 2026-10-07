@@ -20,15 +20,22 @@ class FakeCluster:
 
     def reset(self, opts):
         self.resets += 1
+        self.opts = opts
         return [1.0], [0.0]
 
     def measure_steps(self, gpu, batch, ctx, steps, warmup, seed):
         self.measured += 1
+        # Section A must run at its own concurrency limit, or batch 32 cannot run.
+        assert self.opts["max_running"] >= batch, "section A ran under the serving limit"
         if batch * ctx > 16 * 16384:                     # pretend the largest do not fit
             return {"fits": False, "reason": "needs more blocks"}
         return {"fits": True, "step_ms": [10.0 + 0.01 * i for i in range(steps)]}
 
     def submit(self, gpu, rid, prompt, max_new):
+        # Section B (one-token requests) at the A/B limit on both engines;
+        # serving cells at 16.
+        want = sw.A_MAX_RUNNING if max_new == 1 else 16
+        assert self.opts["max_running"] == want, f"limit {self.opts['max_running']}, want {want}"
         now = time.perf_counter()
         self.inbox.append(("done", {"rid": rid, "gpu": gpu, "n_out": max_new,
                                     "output_ids": [7] * max_new, "t_first": now + 0.001,
@@ -50,7 +57,7 @@ def _args(tmp_path, **kw):
 @pytest.fixture
 def small(monkeypatch):
     """A small matrix, and workloads whose arrival times are compressed."""
-    monkeypatch.setattr(sw, "A_BATCHES", (1, 16))
+    monkeypatch.setattr(sw, "A_BATCHES", (1, 32))   # 32: the batch the first version could never run
     monkeypatch.setattr(sw, "A_CONTEXTS", (2048, 32768))
     monkeypatch.setattr(sw, "B_LENGTHS", (1024, 4096))
     monkeypatch.setattr(sw, "FRACTIONS", (0.5, 1.0))
@@ -80,7 +87,8 @@ def test_the_full_flow_saves_every_cell_and_a_rerun_measures_nothing(tmp_path, s
     names = {p.name for p in tmp_path.glob("*.json")}
     # A: 2 batches x 2 contexts x 2 rounds x (4 LS configs + vLLM)
     assert sum(n.startswith("A__") for n in names) == 2 * 2 * 2 * 5
-    assert "A__b16-c32768__ls-dense__r0.json" in names            # saved even when it did not fit
+    assert "A__b32-c32768__ls-dense__r0.json" in names            # saved even when it did not fit
+    assert "A__b32-c2048__ls-dense__r0.json" in names
     # B: 2 lengths x (dense, int8, vLLM); one round
     assert sum(n.startswith("B__") for n in names) == 2 * 3
     # C: chat has prefix on and off for both engines
@@ -150,3 +158,58 @@ def test_section_a_seeds_are_stable_across_processes():
 
     assert zlib.crc32(b"A|b8-c2048|ls-dense|r0") == zlib.crc32(b"A|b8-c2048|ls-dense|r0")
     assert "hash(cid)" not in open(sw.__file__).read()
+
+
+
+def test_main_gives_vllm_separate_engines_for_sections_a_b_and_for_serving(tmp_path, small,
+                                                                           monkeypatch):
+    """vLLM fixes max_num_seqs at startup: A/B need 32, serving 16 (prefix on,
+    then off)."""
+    import sys
+
+    from benchmarks.runners import phase18_replicas as pr
+
+    built = []
+
+    class Fake(FakeCluster):
+        def __init__(self, gpus, backend, opts):
+            super().__init__()
+            built.append((backend, opts.get("max_running"), opts.get("vllm_prefix")))
+
+        def warmup(self, opts):
+            pass
+
+        def stop(self):
+            pass
+
+    table = tmp_path / "table.json"
+    table.write_text('{"rows": []}')
+    monkeypatch.setattr(pr, "Cluster", Fake)
+    monkeypatch.setattr(sys, "argv", ["sweep", "--results-dir", str(tmp_path / "r"),
+                                      "--policy-table", str(table)])
+    assert sw.main() == 0
+    vllm = [b for b in built if b[0] == "vllm"]
+    assert vllm == [("vllm", 32, None), ("vllm", 16, True), ("vllm", 16, False)]
+    assert (tmp_path / "r" / "A__b32-c2048__vllm__r0.json").exists()
+
+
+def test_a_batch_over_the_limit_is_reported_as_concurrency_not_memory():
+    import torch
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
+    from benchmarks.runners import phase18_replicas as pr
+    from model.latentserve_qwen import LatentServeQwen
+    from model.qwen import ModelShape
+    from runtime.engine import ServingEngine
+    from runtime.request import ServedRequest
+
+    torch.manual_seed(0)
+    cfg = Qwen2Config(vocab_size=128, hidden_size=128, intermediate_size=256, num_hidden_layers=2,
+                      num_attention_heads=8, num_key_value_heads=2, max_position_embeddings=1024)
+    ls = LatentServeQwen(hf_model=Qwen2ForCausalLM(cfg).eval(), tokenizer=None,
+                         shape=ModelShape(2, 8, 2, 16, 128, 128, 1024, "torch.float32"),
+                         device="cpu", attn_impl="sdpa", max_seq_len_hint=512)
+    engine = ServingEngine(ls, max_running=2, max_seq_len=256, block_size=16)
+    res = pr._measure_steps(engine, ServedRequest, batch=3, ctx=40, steps=4, warmup=1,
+                            vocab=(0, 128))
+    assert not res["fits"] and "concurrency limit" in res["reason"]
