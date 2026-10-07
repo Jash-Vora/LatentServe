@@ -130,6 +130,42 @@ class _VLLMEngine:
     def has_work(self) -> bool:
         return bool(self.reqs) or self.eng.has_unfinished_requests()
 
+    def abort(self, reqs) -> None:
+        ids = [str(r.request_id) for r in reqs if str(r.request_id) in self.reqs]
+        if ids:
+            self.eng.abort_request(ids)
+            for i in ids:
+                del self.reqs[i]
+
+    @property
+    def kv_blocks(self):
+        """(KV blocks, block size), if this vLLM version exposes them in the
+        main process — from its config, or from its cache_config_info metric.
+        None otherwise; the measurement then relies on aborting instead."""
+        if getattr(self, "_kv", 0) != 0:
+            return self._kv
+        self._kv = None
+        for path in ("vllm_config.cache_config", "cache_config"):
+            obj = self.eng
+            try:
+                for part in path.split("."):
+                    obj = getattr(obj, part)
+            except AttributeError:
+                continue
+            n, bs = getattr(obj, "num_gpu_blocks", None), getattr(obj, "block_size", None)
+            if n and bs:
+                self._kv = (int(n), int(bs))
+                return self._kv
+        try:
+            for m in self.llm.get_metrics():
+                labels = getattr(m, "labels", None) or {}
+                if "num_gpu_blocks" in labels and labels.get("block_size"):
+                    self._kv = (int(float(labels["num_gpu_blocks"])), int(float(labels["block_size"])))
+                    break
+        except Exception:  # noqa: BLE001 - metrics are optional
+            pass
+        return self._kv
+
     def step(self) -> None:
         t0 = time.perf_counter()
         outs = self.eng.step()
@@ -257,6 +293,12 @@ def _measure_steps(engine, ServedRequest, batch: int, ctx: int, steps: int, warm
     if limit is not None and batch > limit:
         return {"fits": False, "reason": f"batch {batch} exceeds the engine's concurrency limit "
                                          f"of {limit} — a configuration error, not memory"}
+    kv = getattr(engine, "kv_blocks", None)                # vLLM: (blocks, block size) if known
+    if kv:
+        blocks, bs = kv
+        need = batch * -(-(ctx + warmup + steps + 16) // bs)
+        if need > blocks:
+            return {"fits": False, "reason": f"needs {need} KV blocks, the engine has {blocks}"}
     if hasattr(engine, "cache"):                           # LatentServe: check the pool first
         alloc = engine.cache.allocator
         need = batch * alloc.blocks_for_tokens(ctx + warmup + steps + 16)   # the same headroom
@@ -291,6 +333,11 @@ def _timed_batch(engine, ServedRequest, batch, ctx, steps, warmup, seed, vocab) 
             break
         engine.step()
     if done or any(r.first_token_time is None for r in reqs):
+        # Abort what is left: draining it prefilled every remaining request for
+        # nothing — ~25 minutes per non-fitting 32K cell on vLLM.
+        rest = [r for r in reqs if r not in done]
+        if hasattr(engine, "abort"):
+            engine.abort(rest)
         while engine.has_work:
             engine.step()
         return {"fits": False, "reason": "the batch could not all decode at once (memory)"}

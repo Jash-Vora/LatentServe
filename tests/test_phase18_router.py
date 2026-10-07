@@ -282,3 +282,60 @@ def test_a_sequential_workload_sends_one_request_at_a_time():
     reqs = [{"rid": i, "prompt": [1] * 32, "max_new": 1} for i in range(5)]
     res = pr.run_workload(Seq(), Router(1), {"kind": "sequential", "requests": reqs}, 1)
     assert res["requests"] == 5 and Seq.peak == 1
+
+
+class _FakeVLLMLike:
+    """An engine with vLLM's shape: KV capacity known or not, abort available.
+    Admits at most `fits` requests at once; each finishes after `n` steps."""
+
+    def __init__(self, fits, n=3, kv=None):
+        self.fits, self.n, self.kv_blocks = fits, n, kv
+        self.queue, self.active, self.steps, self.aborted, self.on_retire = [], [], 0, 0, None
+        self.prefilled = 0
+
+    def add_request(self, r):
+        self.queue.append(r)
+
+    @property
+    def has_work(self):
+        return bool(self.queue or self.active)
+
+    def abort(self, reqs):
+        before = len(self.queue) + len(self.active)
+        self.queue = [r for r in self.queue if r not in reqs]
+        self.active = [r for r in self.active if r not in reqs]
+        self.aborted += before - len(self.queue) - len(self.active)
+
+    def step(self):
+        import time as _t
+
+        self.steps += 1
+        while self.queue and len(self.active) < self.fits:
+            r = self.queue.pop(0)
+            r.first_token_time, r._left = _t.perf_counter(), self.n
+            self.prefilled += 1
+            self.active.append(r)
+        for r in list(self.active):
+            r._left -= 1
+            if r._left <= 0:
+                self.active.remove(r)
+                self.on_retire(r, self)
+
+
+def test_a_known_kv_capacity_skips_a_non_fitting_batch_without_running_it():
+    from benchmarks.runners import phase18_replicas as pr
+    from runtime.request import ServedRequest
+
+    eng = _FakeVLLMLike(fits=2, kv=(100, 16))              # 100 blocks of 16 tokens
+    res = pr._measure_steps(eng, ServedRequest, batch=4, ctx=800, steps=5, warmup=1, vocab=(0, 9))
+    assert not res["fits"] and "KV blocks" in res["reason"] and eng.steps == 0
+
+
+def test_a_batch_found_not_to_fit_is_aborted_not_drained():
+    from benchmarks.runners import phase18_replicas as pr
+    from runtime.request import ServedRequest
+
+    eng = _FakeVLLMLike(fits=2, n=3)                       # capacity unknown
+    res = pr._measure_steps(eng, ServedRequest, batch=10, ctx=50, steps=5, warmup=1, vocab=(0, 9))
+    assert not res["fits"] and "memory" in res["reason"]
+    assert eng.aborted >= 7 and eng.prefilled <= 3          # the rest never prefilled
