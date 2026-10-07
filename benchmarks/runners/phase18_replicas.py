@@ -75,6 +75,11 @@ def _latentserve_engine(opts: dict, state: dict):
                                                attn_impl="triton_paged", fuse_projections=True)
         model.set_elementwise(True)
         state["model"] = model
+        # The free memory every pool is sized from: measured once, with only the
+        # model loaded, so a pool never depends on what a previous engine holds.
+        del ref
+        _release_gpu()
+        state["free0"] = torch.cuda.mem_get_info()[0]
     model = state["model"]
     model.cache = None
     torch.cuda.empty_cache()
@@ -88,7 +93,8 @@ def _latentserve_engine(opts: dict, state: dict):
         policy = SparsePolicy.from_json(opts["policy_table"], tier=opts["tier"])
     return ServingEngine(model, max_running=opts["max_running"], max_seq_len=opts["max_seq_len"],
                          block_size=16,
-                         num_blocks=pool_blocks(model, opts["headroom_gb"], kv_dtype=opts["kv_dtype"]),
+                         num_blocks=pool_blocks(model, opts["headroom_gb"], kv_dtype=opts["kv_dtype"],
+                                                free=state["free0"]),
                          use_cuda_graphs=True, kv_dtype=opts["kv_dtype"],
                          prefix_caching=opts["prefix_caching"], policy=policy)
 
@@ -228,6 +234,21 @@ def worker_main(gpu: int, backend: str, inbox, outbox, opts: dict) -> None:
         outbox.put(("error", gpu, traceback.format_exc()))
 
 
+def _release_gpu() -> None:
+    """Collect garbage and return cached GPU memory, if there is a GPU."""
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    except ImportError:  # pragma: no cover
+        pass
+
+
 def _worker_loop(gpu: int, backend: str, inbox, outbox, opts: dict) -> None:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)        # before torch is imported
     from runtime.request import ServedRequest
@@ -239,6 +260,11 @@ def _worker_loop(gpu: int, backend: str, inbox, outbox, opts: dict) -> None:
 
     def build(o):
         nonlocal engine, busy0
+        # Drop the old engine before building the new one: `engine = factory(...)`
+        # keeps the old one alive while the factory runs, so a new pool was sized
+        # with the old pool, and its CUDA-graph memory, still allocated.
+        engine = None
+        _release_gpu()
         engine = BACKENDS[backend](o, state)
         busy0 = 0.0
 
@@ -282,8 +308,18 @@ def _worker_loop(gpu: int, backend: str, inbox, outbox, opts: dict) -> None:
             engine.step()
 
 
-def _measure_steps(engine, ServedRequest, batch: int, ctx: int, steps: int, warmup: int,
-                   seed: int = 0, vocab: tuple = (1000, 100000), headroom: int = 16) -> dict:
+def _measure_steps(engine, *args, **kw) -> dict:
+    """Per-step decode time, plus the KV pool's size: a cell skipped for lack of
+    blocks can then be checked against the pool it actually had."""
+    res = _measure_steps_inner(engine, *args, **kw)
+    cache = getattr(engine, "cache", None)
+    if cache is not None and hasattr(cache, "allocator"):
+        res["pool_blocks"] = cache.allocator.num_blocks
+    return res
+
+
+def _measure_steps_inner(engine, ServedRequest, batch: int, ctx: int, steps: int, warmup: int,
+                         seed: int = 0, vocab: tuple = (1000, 100000), headroom: int = 16) -> dict:
     """Per-step decode time at (batch, ctx), at the engine level: `batch`
     requests of `ctx` prompt tokens, each generating warmup + steps tokens;
     once *every* request is decoding, each engine step is timed. A batch that

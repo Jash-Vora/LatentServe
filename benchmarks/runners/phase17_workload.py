@@ -103,12 +103,23 @@ def bytes_per_block(model, kv_dtype: str = "fp16", block_size: int = 16,
     return layers * per_layer
 
 
-def pool_blocks(model, headroom_gb: float, block_size: int = 16, kv_dtype: str = "fp16") -> int:
+def pool_blocks(model, headroom_gb: float, block_size: int = 16, kv_dtype: str = "fp16",
+                free=None) -> int:
+    """KV blocks that fit. `free` is the GPU's free bytes: pass a baseline measured
+    once (after the model loads) so the size cannot depend on whatever a previous
+    engine still holds — measuring it per build made the pool vary from 64 to
+    15,000 blocks in the final sweep. A pool this small is an error, not a size."""
     import torch
 
-    free, _ = torch.cuda.mem_get_info()
+    if free is None:
+        free, _ = torch.cuda.mem_get_info()
     per_block = bytes_per_block(model, kv_dtype, block_size)
-    return max(64, int((free - headroom_gb * 1024**3) // per_block))
+    blocks = int((free - headroom_gb * 1024**3) // per_block)
+    if blocks < 256:
+        raise RuntimeError(
+            f"only {blocks} KV blocks would fit ({free / 1024**3:.2f} GB free, "
+            f"{headroom_gb} GB headroom): something is still holding GPU memory")
+    return blocks
 
 
 def serve(model, reqs, strategy: dict, policy_table, num_blocks: int, max_running: int) -> dict:

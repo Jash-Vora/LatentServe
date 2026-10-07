@@ -384,3 +384,61 @@ def test_staggered_admission_needs_headroom_and_short_timing_is_not_did_not_fit(
     new = pr._measure_steps(_StaggeredEngine(fits=99), ServedRequest, batch=batch, ctx=ctx,
                             steps=48, warmup=8, vocab=(0, 9), headroom=sw.a_headroom(batch, ctx))
     assert new["fits"] and not new["timed_short"] and len(new["step_ms"]) == 48
+
+
+
+def test_pool_size_comes_from_the_baseline_and_a_tiny_pool_is_an_error(monkeypatch):
+    from types import SimpleNamespace
+
+    from benchmarks.runners.phase17_workload import bytes_per_block, pool_blocks
+
+    qwen = SimpleNamespace(layers=[None] * 28, shape=SimpleNamespace(num_key_value_heads=2, head_dim=128))
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (_ for _ in ()).throw(AssertionError(
+        "must not re-measure when a baseline is given")), raising=False)
+    free = int(11.5 * 1024**3)
+    n = pool_blocks(qwen, 2.5, free=free)
+    assert n == int((free - 2.5 * 1024**3) // bytes_per_block(qwen, "fp16"))
+    assert pool_blocks(qwen, 2.5, free=free) == n                       # the same every time
+    assert pool_blocks(qwen, 2.5, kv_dtype="int8", free=free) > 1.8 * n
+    with pytest.raises(RuntimeError, match="still holding GPU memory"):
+        pool_blocks(qwen, 2.5, free=int(2.6 * 1024**3))
+
+
+def test_the_old_engine_is_gone_before_the_new_one_is_built():
+    """`engine = factory(...)` kept the old engine alive during construction, so a
+    new pool was sized with the old one still allocated."""
+    import os
+    import queue as q
+    import weakref
+
+    from benchmarks.runners import phase18_replicas as pr
+
+    class Eng:
+        prefill_s = decode_s = 0.0
+        has_work, decoder, on_retire = False, None, None
+
+    refs, old_alive = [], []
+
+    def factory(opts, state):
+        old_alive.append(bool(refs) and refs[-1]() is not None)
+        e = Eng()
+        refs.append(weakref.ref(e))
+        return e
+
+    pr.BACKENDS["fake"] = factory
+    saved = os.environ.get("CUDA_VISIBLE_DEVICES")
+    inbox, outbox = q.Queue(), q.Queue()
+    inbox.put(("reset", {}))
+    inbox.put(("reset", {}))
+    inbox.put(("stop",))
+    try:
+        pr.worker_main(0, "fake", inbox, outbox, {})
+    finally:
+        pr.BACKENDS.pop("fake", None)
+        if saved is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = saved
+    assert len(old_alive) == 3 and old_alive == [False, False, False]
