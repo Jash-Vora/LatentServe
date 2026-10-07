@@ -61,12 +61,18 @@ A_BATCHES = (1, 4, 8, 16, 32)
 # serving workloads keep 16. (The first version applied 16 everywhere, so
 # batch 32 could never run and was misreported as not fitting.)
 A_MAX_RUNNING = max(A_BATCHES)
-A_CONTEXTS = (2048, 8192, 16384, 32768)
-B_LENGTHS = (1024, 2048, 4096, 8192, 16384, 32768)
+# The largest context is 32,000, not 32,768: Qwen2.5-1.5B's limit is 32,768
+# positions (max_position_embeddings), and the decode steps measured on top of
+# a context must fit inside it. The first version used 32,768 contexts and a
+# 33,280 limit: LatentServe ran past the model's trained range, and vLLM —
+# which checks — refused to start.
+A_CONTEXTS = (2048, 8192, 16384, 32000)
+B_LENGTHS = (1024, 2048, 4096, 8192, 16384, 32000)   # prompt + 1 token within the limit
 B_LS = ["ls-dense", "ls-int8"]
 C_LS = ["ls-dense", "ls-sparse37.5", "ls-adaptive", "ls-int8"]
 FRACTIONS = (0.1, 0.25, 0.4, 0.55, 0.7, 0.8, 0.9, 1.0, 1.1)
-MAX_SEQ = 33280            # 32K contexts plus headroom, for both engines
+MAX_SEQ = 32768            # the model's own limit (max_position_embeddings), both engines
+A_STEPS_HEADROOM = 8 + 16  # section A's warm-up steps and token headroom beyond the timed steps
 
 
 def cell_id(section: str, what: str, config: str, rnd: int) -> str:
