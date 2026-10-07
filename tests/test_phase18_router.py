@@ -339,3 +339,48 @@ def test_a_batch_found_not_to_fit_is_aborted_not_drained():
     res = pr._measure_steps(eng, ServedRequest, batch=10, ctx=50, steps=5, warmup=1, vocab=(0, 9))
     assert not res["fits"] and "memory" in res["reason"]
     assert eng.aborted >= 7 and eng.prefilled <= 3          # the rest never prefilled
+
+
+
+class _StaggeredEngine(_FakeVLLMLike):
+    """vLLM's admission pattern: a per-step token budget (8,192) shared by
+    prompt tokens and the one token each running request decodes — so a big
+    batch is admitted over many steps while the early requests decode."""
+
+    budget = 8192
+
+    def step(self):
+        import time as _t
+
+        self.steps += 1
+        room = self.budget - len(self.active)
+        while self.queue and room > 0:
+            r = self.queue[0]
+            left = getattr(r, "_prompt_left", len(r.prompt_ids))
+            take = min(left, room)
+            r._prompt_left, room = left - take, room - take
+            if r._prompt_left == 0:
+                self.queue.pop(0)
+                r.first_token_time, r._left = _t.perf_counter(), r.max_new_tokens
+                self.active.append(r)
+            else:
+                break
+        for r in list(self.active):
+            r._left -= 1
+            if r._left <= 0:
+                self.active.remove(r)
+                self.on_retire(r, self)
+
+
+def test_staggered_admission_needs_headroom_and_short_timing_is_not_did_not_fit():
+    from benchmarks.runners import phase18_replicas as pr
+    from benchmarks.runners import sweep_stage1 as sw
+    from runtime.request import ServedRequest
+
+    batch, ctx = 16, 8192
+    old = pr._measure_steps(_StaggeredEngine(fits=99), ServedRequest, batch=batch, ctx=ctx,
+                            steps=48, warmup=8, vocab=(0, 9), headroom=16)
+    assert old["fits"] and old["timed_short"]               # the batch ran: not "did not fit"
+    new = pr._measure_steps(_StaggeredEngine(fits=99), ServedRequest, batch=batch, ctx=ctx,
+                            steps=48, warmup=8, vocab=(0, 9), headroom=sw.a_headroom(batch, ctx))
+    assert new["fits"] and not new["timed_short"] and len(new["step_ms"]) == 48

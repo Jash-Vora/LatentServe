@@ -76,11 +76,19 @@ MAX_SEQ = 32768            # the model's own limit (max_position_embeddings), bo
 A_WARMUP, A_HEADROOM = 8, 16   # decoded beyond the timed steps (see _measure_steps)
 
 
-def a_prompt(ctx: int, steps: int) -> int:
+def a_headroom(batch: int, ctx: int) -> int:
+    """Tokens beyond warm-up and timed steps: enough for the slowest admission.
+    vLLM admits a big batch over ~batch x ceil(ctx / 8192) steps while
+    decoding the early requests; a fixed 16 let four vLLM cells run out of
+    tokens mid-timing."""
+    return A_HEADROOM + batch * -(-ctx // 8192)
+
+
+def a_prompt(ctx: int, steps: int, batch: int = 1) -> int:
     """Section A's prompt for a context label: the label itself, unless the
     tokens decoded on top would pass the limit — then the prompt that ends
-    exactly at it (32,768 -> 32,696 with 48 timed steps)."""
-    return min(ctx, MAX_SEQ - (A_WARMUP + steps + A_HEADROOM))
+    exactly at it."""
+    return min(ctx, MAX_SEQ - (A_WARMUP + steps + a_headroom(batch, ctx)))
 
 
 def b_prompt(length: int) -> int:
@@ -235,8 +243,9 @@ def run_group(run: Runner, cluster, configs: dict, sections, base: dict, chat_on
                         if run.done(cid):
                             continue
                         cluster.reset(opts_for(name, max_running=A_MAX_RUNNING))
-                        m = cluster.measure_steps(0, batch=b, ctx=a_prompt(ctx, a.steps),
+                        m = cluster.measure_steps(0, batch=b, ctx=a_prompt(ctx, a.steps, b),
                                                   steps=a.steps, warmup=A_WARMUP,
+                                                  headroom=a_headroom(b, ctx),
                                                   seed=zlib.crc32(cid.encode()) & 0xFFFF)
                         cluster.reset(opts_for(name))
                         if m.get("fits") and m.get("step_ms"):
@@ -244,9 +253,11 @@ def run_group(run: Runner, cluster, configs: dict, sections, base: dict, chat_on
                             m["tok_s"] = b * 1000 / statistics.median(m["step_ms"])
                         run.save(cid, {"result": m, "config": name, "backend": backend,
                                        "batch": b, "ctx": ctx,
-                                       "prompt_tokens": a_prompt(ctx, a.steps)})
+                                       "prompt_tokens": a_prompt(ctx, a.steps, b)})
                         note = (f"p50 {m['pct']['p50']:.2f} ms  p99 {m['pct']['p99']:.2f} ms"
                                 if m.get("pct") else f"skipped: {m.get('reason', 'did not fit')}")
+                        if m.get("timed_short"):
+                            note += f"  TIMED SHORT ({len(m['step_ms'])} of {a.steps} steps)"
                         print(f"  {cid:<44} {note}", flush=True)
 
     if "B" in sections and not chat_only:
@@ -423,16 +434,17 @@ def report(results: Path) -> str:
                 for k in cfgs:
                     rs = [c["result"] for c in a if c["cfg"] == k and c["what"] == f"b{b}-c{ctx}"]
                     ok = [r for r in rs if r.get("pct")]
-                    if ok:
+                    if any(r.get("timed_short") for r in ok):
+                        row.append("timed short")
+                    elif ok:
                         row.append(f"{_med(r['pct']['p50'] for r in ok):.2f} / "
                                    f"{_med(r['pct']['p99'] for r in ok):.2f}")
                     else:
                         row.append("did not fit" if rs else "-")
                 if any(x != "-" for x in row):
                     lines.append(f"| {b} | {ctx} | " + " | ".join(row) + " |")
-        lines += ["", f"The 32768 rows fill the cache to the model's limit: a "
-                  f"{a_prompt(32768, 48)}-token prompt plus the tokens decoded on top "
-                  "(with 48 timed steps).", ""]
+        lines += ["", "The 32768 rows fill the cache to the model's limit: the prompt is "
+                  "32,768 minus the tokens decoded on top (each cell records it).", ""]
 
     bcells = [c for c in cells if c["sec"] == "B"]
     if bcells:

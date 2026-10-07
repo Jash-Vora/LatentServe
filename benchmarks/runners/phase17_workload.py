@@ -82,14 +82,32 @@ def workload(n: int, seed: int) -> list:
     return reqs
 
 
-def pool_blocks(model, headroom_gb: float, block_size: int = 16) -> int:
+def bytes_per_block(model, kv_dtype: str = "fp16", block_size: int = 16,
+                    asymmetric: bool = False) -> int:
+    """Bytes one KV block costs across all layers, by cache type.
+
+    fp16: K and V, plus page bounds (counted always: a sparsity policy may
+    enable them). INT8: K and V at one byte, K's per-channel scales per block
+    and V's per-token scales (and zero points if asymmetric), all fp32. The
+    sweep's first version sized every pool as fp16, so INT8 got the same number
+    of blocks as fp16 in half the memory — its capacity advantage unused."""
+    layers = len(model.layers)
+    h, d = model.shape.num_key_value_heads, model.shape.head_dim
+    if kv_dtype == "int8":
+        per_layer = 2 * block_size * h * d                                  # K, V: int8
+        per_layer += h * d * 4                                              # K scales, per channel
+        per_layer += block_size * h * 4 * (2 if asymmetric else 1)          # V scales (+ zeros)
+    else:
+        per_layer = 2 * block_size * h * d * 2                              # K, V: fp16
+        per_layer += 2 * h * d * 2                                          # page bounds
+    return layers * per_layer
+
+
+def pool_blocks(model, headroom_gb: float, block_size: int = 16, kv_dtype: str = "fp16") -> int:
     import torch
 
     free, _ = torch.cuda.mem_get_info()
-    spec_layers = len(model.layers)
-    kv_heads, head_dim = model.shape.num_key_value_heads, model.shape.head_dim
-    per_block = spec_layers * block_size * kv_heads * head_dim * 2 * 2      # K and V, fp16
-    per_block += spec_layers * 2 * kv_heads * head_dim * 2                  # page bounds
+    per_block = bytes_per_block(model, kv_dtype, block_size)
     return max(64, int((free - headroom_gb * 1024**3) // per_block))
 
 

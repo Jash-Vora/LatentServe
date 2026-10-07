@@ -23,7 +23,7 @@ class FakeCluster:
         self.opts = opts
         return [1.0], [0.0]
 
-    def measure_steps(self, gpu, batch, ctx, steps, warmup, seed):
+    def measure_steps(self, gpu, batch, ctx, steps, warmup, seed, headroom=16):
         self.measured += 1
         # Section A must run at its own concurrency limit, or batch 32 cannot run.
         assert self.opts["max_running"] >= batch, "section A ran under the serving limit"
@@ -223,9 +223,12 @@ def test_every_cell_stays_within_the_models_position_limit():
     assert sw.MAX_SEQ == 32768
     for steps in (48, 16, 100):
         for ctx in sw.A_CONTEXTS:                          # prompt + every decoded token
-            assert sw.a_prompt(ctx, steps) + sw.A_WARMUP + steps + sw.A_HEADROOM <= sw.MAX_SEQ
-    assert sw.a_prompt(32768, 48) == 32696                 # ends exactly at the limit
-    assert sw.a_prompt(8192, 48) == 8192                   # shorter contexts untouched
+            for b in sw.A_BATCHES:
+                total = sw.a_prompt(ctx, steps, b) + sw.A_WARMUP + steps + sw.a_headroom(b, ctx)
+                assert total <= sw.MAX_SEQ
+    for b in sw.A_BATCHES:                                 # the 32768 row ends exactly at the limit
+        assert sw.a_prompt(32768, 48, b) + sw.A_WARMUP + 48 + sw.a_headroom(b, 32768) == sw.MAX_SEQ
+    assert sw.a_prompt(8192, 48, 16) == 8192               # shorter contexts untouched
     assert sw.b_prompt(32768) == 32767 and sw.b_prompt(4096) == 4096
     assert all(sw.b_prompt(L) + 1 <= sw.MAX_SEQ for L in sw.B_LENGTHS)
     from benchmarks.runners import phase18_replicas as pr
@@ -233,3 +236,42 @@ def test_every_cell_stays_within_the_models_position_limit():
     for wl in (sw.varying(0), sw.probe(0), sw.openloop(0, 1.0, 40), pr.burst(0), pr.chat(0)):
         for r in wl["requests"]:
             assert len(r["prompt"]) + r["max_new"] <= sw.MAX_SEQ
+
+
+
+def test_int8_pools_are_sized_from_the_caches_real_tensors():
+    """The pool sizing must match what the caches actually allocate per block —
+    the first version sized INT8 as fp16, wasting half its capacity."""
+    import torch
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
+    from benchmarks.runners.phase17_workload import bytes_per_block
+    from model.latentserve_qwen import LatentServeQwen
+    from model.qwen import ModelShape
+
+    cfg = Qwen2Config(vocab_size=128, hidden_size=128, intermediate_size=256, num_hidden_layers=2,
+                      num_attention_heads=8, num_key_value_heads=2, max_position_embeddings=1024)
+    ls = LatentServeQwen(hf_model=Qwen2ForCausalLM(cfg).eval(), tokenizer=None,
+                         shape=ModelShape(2, 8, 2, 16, 128, 128, 1024, "torch.float32"),
+                         device="cpu", attn_impl="sdpa", max_seq_len_hint=512)
+    n = 40
+    c = ls.allocate_cache(2, 256, paged=True, block_size=16, kv_dtype="int8", num_blocks=n)
+    real = sum(t.nbytes for name in ("k_pool", "v_pool", "k_scale_pool", "v_scale_pool")
+               for t in getattr(c, name))
+    assert bytes_per_block(ls, "int8") == real // n
+    c = ls.allocate_cache(2, 256, paged=True, block_size=16, kv_dtype="fp16", num_blocks=n)
+    kv = sum(t.nbytes for name in ("k_pool", "v_pool") for t in getattr(c, name))
+    elem = c.k_pool[0].element_size()                      # fp32 here; 2 on the GPU (fp16)
+    bounds = 2 * 2 * ls.shape.num_key_value_heads * ls.shape.head_dim * 2
+    assert bytes_per_block(ls, "fp16") == (kv // n) * 2 // elem + bounds
+
+
+def test_int8_gets_about_1_86x_the_blocks_of_fp16_on_the_real_model():
+    from types import SimpleNamespace
+
+    from benchmarks.runners.phase17_workload import bytes_per_block
+
+    qwen = SimpleNamespace(layers=[None] * 28,
+                           shape=SimpleNamespace(num_key_value_heads=2, head_dim=128))
+    ratio = bytes_per_block(qwen, "fp16") / bytes_per_block(qwen, "int8")
+    assert ratio == pytest.approx(17408 / 9344)

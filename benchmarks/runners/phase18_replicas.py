@@ -87,7 +87,8 @@ def _latentserve_engine(opts: dict, state: dict):
 
         policy = SparsePolicy.from_json(opts["policy_table"], tier=opts["tier"])
     return ServingEngine(model, max_running=opts["max_running"], max_seq_len=opts["max_seq_len"],
-                         block_size=16, num_blocks=pool_blocks(model, opts["headroom_gb"]),
+                         block_size=16,
+                         num_blocks=pool_blocks(model, opts["headroom_gb"], kv_dtype=opts["kv_dtype"]),
                          use_cuda_graphs=True, kv_dtype=opts["kv_dtype"],
                          prefix_caching=opts["prefix_caching"], policy=policy)
 
@@ -282,7 +283,7 @@ def _worker_loop(gpu: int, backend: str, inbox, outbox, opts: dict) -> None:
 
 
 def _measure_steps(engine, ServedRequest, batch: int, ctx: int, steps: int, warmup: int,
-                   seed: int = 0, vocab: tuple = (1000, 100000)) -> dict:
+                   seed: int = 0, vocab: tuple = (1000, 100000), headroom: int = 16) -> dict:
     """Per-step decode time at (batch, ctx), at the engine level: `batch`
     requests of `ctx` prompt tokens, each generating warmup + steps tokens;
     once *every* request is decoding, each engine step is timed. A batch that
@@ -296,34 +297,36 @@ def _measure_steps(engine, ServedRequest, batch: int, ctx: int, steps: int, warm
     kv = getattr(engine, "kv_blocks", None)                # vLLM: (blocks, block size) if known
     if kv:
         blocks, bs = kv
-        need = batch * -(-(ctx + warmup + steps + 16) // bs)
+        need = batch * -(-(ctx + warmup + steps + headroom) // bs)
         if need > blocks:
             return {"fits": False, "reason": f"needs {need} KV blocks, the engine has {blocks}"}
     if hasattr(engine, "cache"):                           # LatentServe: check the pool first
         alloc = engine.cache.allocator
-        need = batch * alloc.blocks_for_tokens(ctx + warmup + steps + 16)   # the same headroom
+        need = batch * alloc.blocks_for_tokens(ctx + warmup + steps + headroom)   # the same headroom
         if need > alloc.num_available:
             return {"fits": False, "reason": f"needs {need} blocks, pool has {alloc.num_available}"}
     # Our own completion hook while measuring — restored afterwards, or the
     # next workload on this engine would never report a completion.
     previous = engine.on_retire
     try:
-        return _timed_batch(engine, ServedRequest, batch, ctx, steps, warmup, seed, vocab)
+        return _timed_batch(engine, ServedRequest, batch, ctx, steps, warmup, seed, vocab, headroom)
     finally:
         engine.on_retire = previous
 
 
-def _timed_batch(engine, ServedRequest, batch, ctx, steps, warmup, seed, vocab) -> dict:
+def _timed_batch(engine, ServedRequest, batch, ctx, steps, warmup, seed, vocab, headroom) -> dict:
     import random as _r
 
     rng = _r.Random(seed)
     reqs = [ServedRequest(request_id=10_000_000 + i,
                           prompt_ids=[rng.randrange(*vocab) for _ in range(ctx)],
                           # Headroom beyond what is timed: engines differ in how many
-                          # tokens a request has by the time all are decoding
-                          # (LatentServe's step prefills newcomers *and* decodes
-                          # them), so exact counting finished requests mid-timing.
-                          max_new_tokens=warmup + steps + 16) for i in range(batch)]
+                          # tokens a request has by the time all are decoding.
+                          # LatentServe prefills an admitted batch at once; vLLM
+                          # admits a big batch over many steps (~8,192 prompt
+                          # tokens each) while already decoding the early ones,
+                          # so the caller sizes this for the slowest admission.
+                          max_new_tokens=warmup + steps + headroom) for i in range(batch)]
     done = []
     engine.on_retire = lambda req, eng: done.append(req)
     for r in reqs:
@@ -352,7 +355,10 @@ def _timed_batch(engine, ServedRequest, batch, ctx, steps, warmup, seed, vocab) 
             break
     while engine.has_work:
         engine.step()
-    return {"fits": len(times) == steps, "step_ms": times}
+    # Timed short — a request ran out of tokens mid-timing — is not "did not
+    # fit": the batch ran. Reporting it as such once turned four vLLM cells
+    # that fit into capacity failures.
+    return {"fits": True, "timed_short": len(times) < steps, "step_ms": times}
 
 
 class Cluster:
