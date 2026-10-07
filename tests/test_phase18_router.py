@@ -180,3 +180,105 @@ def test_a_worker_failure_surfaces_with_its_traceback():
             os.environ["CUDA_VISIBLE_DEVICES"] = saved
     kind, gpu, msg = out.get_nowait()
     assert kind == "error" and gpu == 0 and "no-such-backend" in msg
+
+
+# ------------------------------------------------- sweep harness pieces ---
+
+
+def test_measure_steps_times_a_full_batch_and_restores_the_hook():
+    """On a tiny CPU engine: every request decoding before timing starts, the
+    requested number of steps timed, and the worker's own hook back after."""
+    import torch
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
+    import benchmarks.runners.phase18_replicas as pr
+    from model.latentserve_qwen import LatentServeQwen
+    from model.qwen import ModelShape
+    from runtime.engine import ServingEngine
+    from runtime.request import ServedRequest
+
+    torch.manual_seed(0)
+    cfg = Qwen2Config(vocab_size=128, hidden_size=128, intermediate_size=256, num_hidden_layers=2,
+                      num_attention_heads=8, num_key_value_heads=2, max_position_embeddings=1024)
+    ls = LatentServeQwen(hf_model=Qwen2ForCausalLM(cfg).eval(), tokenizer=None,
+                         shape=ModelShape(2, 8, 2, 16, 128, 128, 1024, "torch.float32"),
+                         device="cpu", attn_impl="sdpa", max_seq_len_hint=512)
+    engine = ServingEngine(ls, max_running=4, max_seq_len=256, block_size=16)
+    mine = lambda r, e: None  # noqa: E731
+    engine.on_retire = mine
+    res = pr._measure_steps(engine, ServedRequest, batch=3, ctx=40, steps=5, warmup=2, seed=1,
+                            vocab=(0, 128))
+    assert res["fits"] and len(res["step_ms"]) == 5
+    assert engine.on_retire is mine
+    assert not engine.has_work
+
+
+def test_measure_steps_refuses_a_batch_that_cannot_fit():
+    import torch
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
+    import benchmarks.runners.phase18_replicas as pr
+    from model.latentserve_qwen import LatentServeQwen
+    from model.qwen import ModelShape
+    from runtime.engine import ServingEngine
+    from runtime.request import ServedRequest
+
+    torch.manual_seed(0)
+    cfg = Qwen2Config(vocab_size=128, hidden_size=128, intermediate_size=256, num_hidden_layers=2,
+                      num_attention_heads=8, num_key_value_heads=2, max_position_embeddings=1024)
+    ls = LatentServeQwen(hf_model=Qwen2ForCausalLM(cfg).eval(), tokenizer=None,
+                         shape=ModelShape(2, 8, 2, 16, 128, 128, 1024, "torch.float32"),
+                         device="cpu", attn_impl="sdpa", max_seq_len_hint=512)
+    engine = ServingEngine(ls, max_running=4, max_seq_len=256, block_size=16, num_blocks=10)
+    res = pr._measure_steps(engine, ServedRequest, batch=3, ctx=100, steps=5, warmup=2)
+    assert not res["fits"] and "blocks" in res["reason"]
+
+
+def test_timed_arrivals_are_released_on_schedule():
+    import time as _t
+
+    from benchmarks.runners import phase18_replicas as pr
+
+    class Clock(FakeCluster):
+        def __init__(self):
+            super().__init__()
+            self.sent_at = []
+
+        def submit(self, gpu, rid, prompt, max_new):
+            self.sent_at.append(_t.perf_counter())
+            super().submit(gpu, rid, prompt, max_new)
+
+        def recv(self, timeout=None):
+            if not self.inbox:
+                import queue
+
+                _t.sleep(timeout or 0)
+                raise queue.Empty
+            return self.inbox.pop(0)
+
+    reqs = [{"rid": i, "prompt": [1] * 32, "max_new": 4, "at": 0.05 * i} for i in range(4)]
+    c = Clock()
+    res = pr.run_workload(c, Router(1), {"kind": "open", "requests": reqs}, 1)
+    gaps = [b - a for a, b in zip(c.sent_at, c.sent_at[1:])]
+    assert res["requests"] == 4 and all(0.035 < g < 0.2 for g in gaps)
+
+
+def test_a_sequential_workload_sends_one_request_at_a_time():
+    from benchmarks.runners import phase18_replicas as pr
+
+    class Seq(FakeCluster):
+        outstanding = 0
+        peak = 0
+
+        def submit(self, gpu, rid, prompt, max_new):
+            Seq.outstanding += 1
+            Seq.peak = max(Seq.peak, Seq.outstanding)
+            super().submit(gpu, rid, prompt, max_new)
+
+        def recv(self, timeout=None):
+            Seq.outstanding -= 1
+            return self.inbox.pop(0)
+
+    reqs = [{"rid": i, "prompt": [1] * 32, "max_new": 1} for i in range(5)]
+    res = pr.run_workload(Seq(), Router(1), {"kind": "sequential", "requests": reqs}, 1)
+    assert res["requests"] == 5 and Seq.peak == 1

@@ -78,10 +78,18 @@ def _latentserve_engine(opts: dict, state: dict):
     model = state["model"]
     model.cache = None
     torch.cuda.empty_cache()
+    # Sweep options: a fixed sparse budget, or the adaptive policy (a tier
+    # and the step table it decides from); neither by default.
+    model.set_sparse(opts.get("sparse"))
+    policy = None
+    if opts.get("tier"):
+        from runtime.policy import SparsePolicy
+
+        policy = SparsePolicy.from_json(opts["policy_table"], tier=opts["tier"])
     return ServingEngine(model, max_running=opts["max_running"], max_seq_len=opts["max_seq_len"],
                          block_size=16, num_blocks=pool_blocks(model, opts["headroom_gb"]),
                          use_cuda_graphs=True, kv_dtype=opts["kv_dtype"],
-                         prefix_caching=opts["prefix_caching"])
+                         prefix_caching=opts["prefix_caching"], policy=policy)
 
 
 class _VLLMEngine:
@@ -107,7 +115,13 @@ class _VLLMEngine:
             prompt = TokensPrompt(prompt_token_ids=list(req.prompt_ids))
         except ImportError:  # pragma: no cover - older vLLM
             prompt = {"prompt_token_ids": list(req.prompt_ids)}
-        params = SamplingParams(max_tokens=req.max_new_tokens, temperature=0.0, ignore_eos=True)
+        # detokenize=False: LatentServe never turns tokens into text, so vLLM
+        # should not be charged for it either.
+        try:
+            params = SamplingParams(max_tokens=req.max_new_tokens, temperature=0.0,
+                                    ignore_eos=True, detokenize=False)
+        except TypeError:  # pragma: no cover - a version without the field
+            params = SamplingParams(max_tokens=req.max_new_tokens, temperature=0.0, ignore_eos=True)
         self.eng.add_request(str(req.request_id), prompt, params)
         self.reqs[str(req.request_id)] = req
 
@@ -147,11 +161,15 @@ def _vllm_engine(opts: dict, state: dict):
         cfg = load_config(opts["config"])
         kwargs = {"model": cfg.model.name, "dtype": "float16", "seed": 0,
                   "gpu_memory_utilization": opts.get("vllm_memory", 0.85),
-                  "max_model_len": opts["max_seq_len"], "tensor_parallel_size": 1}
-        # Prefix caching on for the whole run: vLLM cannot toggle it per
-        # configuration, and the chat runs need it. A reset clears it, so a
-        # burst run starts cold and gains nothing from it (random prompts).
-        state["llm"], _ = construct_engine(LLM, kwargs, True, None)
+                  "max_model_len": opts["max_seq_len"], "tensor_parallel_size": 1,
+                  # The same concurrency limit LatentServe runs with: left at
+                  # vLLM's default (~256) it was not a like-for-like comparison.
+                  "max_num_seqs": opts["max_running"]}
+        # Prefix caching is fixed for the engine's life (vLLM cannot toggle it
+        # per configuration): on unless opts say otherwise. A reset clears it,
+        # so a burst run starts cold and gains nothing from it.
+        state["prefix"] = opts.get("vllm_prefix", True)
+        state["llm"], _ = construct_engine(LLM, kwargs, state["prefix"], None)
     elif hasattr(state["llm"], "reset_prefix_cache"):
         state["llm"].reset_prefix_cache()
     return _VLLMEngine(state["llm"])
@@ -215,12 +233,73 @@ def _worker_loop(gpu: int, backend: str, inbox, outbox, opts: dict) -> None:
                 outbox.put(("stats", gpu, busy, capture))
                 build(m[1])
                 outbox.put(("reset_ok", gpu))
+            elif m[0] == "measure_steps":
+                outbox.put(("steps", gpu, _measure_steps(engine, ServedRequest, **m[1])))
             elif m[0] == "stop":
                 capture = engine.decoder.capture_s if getattr(engine, "decoder", None) else 0.0
                 outbox.put(("stats", gpu, engine.prefill_s + engine.decode_s, capture))
                 return
         if engine.has_work:
             engine.step()
+
+
+def _measure_steps(engine, ServedRequest, batch: int, ctx: int, steps: int, warmup: int,
+                   seed: int = 0, vocab: tuple = (1000, 100000)) -> dict:
+    """Per-step decode time at (batch, ctx), at the engine level: `batch`
+    requests of `ctx` prompt tokens, each generating warmup + steps tokens;
+    once *every* request is decoding, each engine step is timed. A batch that
+    cannot all run at once is reported as not fitting, never timed short."""
+    import random as _r
+
+    if hasattr(engine, "cache"):                           # LatentServe: check the pool first
+        alloc = engine.cache.allocator
+        need = batch * alloc.blocks_for_tokens(ctx + warmup + steps + 16)   # the same headroom
+        if need > alloc.num_available:
+            return {"fits": False, "reason": f"needs {need} blocks, pool has {alloc.num_available}"}
+    # Our own completion hook while measuring — restored afterwards, or the
+    # next workload on this engine would never report a completion.
+    previous = engine.on_retire
+    try:
+        return _timed_batch(engine, ServedRequest, batch, ctx, steps, warmup, seed, vocab)
+    finally:
+        engine.on_retire = previous
+
+
+def _timed_batch(engine, ServedRequest, batch, ctx, steps, warmup, seed, vocab) -> dict:
+    import random as _r
+
+    rng = _r.Random(seed)
+    reqs = [ServedRequest(request_id=10_000_000 + i,
+                          prompt_ids=[rng.randrange(*vocab) for _ in range(ctx)],
+                          # Headroom beyond what is timed: engines differ in how many
+                          # tokens a request has by the time all are decoding
+                          # (LatentServe's step prefills newcomers *and* decodes
+                          # them), so exact counting finished requests mid-timing.
+                          max_new_tokens=warmup + steps + 16) for i in range(batch)]
+    done = []
+    engine.on_retire = lambda req, eng: done.append(req)
+    for r in reqs:
+        engine.add_request(r)
+    while engine.has_work and any(r.first_token_time is None for r in reqs):
+        if done:                                           # one finished before all started
+            break
+        engine.step()
+    if done or any(r.first_token_time is None for r in reqs):
+        while engine.has_work:
+            engine.step()
+        return {"fits": False, "reason": "the batch could not all decode at once"}
+    for _ in range(warmup):
+        engine.step()
+    times = []
+    for _ in range(steps):
+        t0 = time.perf_counter()
+        engine.step()
+        times.append((time.perf_counter() - t0) * 1000)
+        if done:
+            break
+    while engine.has_work:
+        engine.step()
+    return {"fits": len(times) == steps, "step_ms": times}
 
 
 class Cluster:
@@ -253,8 +332,10 @@ class Cluster:
         traceback, if a worker reports an error or dies."""
         deadline = time.perf_counter() + timeout
         while True:
+            # Never wait longer than what remains: polling in fixed 5 s slices
+            # let a short timeout overshoot by up to 5 s.
             try:
-                m = self.outbox.get(timeout=5)
+                m = self.outbox.get(timeout=max(0.001, min(5.0, deadline - time.perf_counter())))
             except queue.Empty:
                 dead = [g for g, p in enumerate(self.procs) if not p.is_alive()]
                 if dead:
@@ -266,6 +347,13 @@ class Cluster:
             if m[0] == "error":
                 raise RuntimeError(f"worker {m[1]} failed:\n{m[2]}")
             return m
+
+    def measure_steps(self, gpu: int, **spec) -> dict:
+        self.inboxes[gpu].put(("measure_steps", spec))
+        while True:
+            m = self.recv()
+            if m[0] == "steps":
+                return m[2]
 
     def warmup(self, opts, lengths=(1024, 2048, 4096), per_gpu: int = 6) -> None:
         """Run a short workload on every worker, then reset. The first timed
@@ -341,11 +429,37 @@ def run_workload(cluster, router, wl: dict, gpus_used: int) -> dict:
         submit_t[r["rid"]] = time.perf_counter()
         cluster.submit(g, r["rid"], r["prompt"], r["max_new"])
 
-    for r in wl["requests"]:
-        send(r)
-    pending = len(wl["requests"])
-    while pending:
-        m = cluster.recv()
+    # Requests may carry `at` — seconds after the start — for open-loop
+    # traffic; without it they are sent at once. A "sequential" workload sends
+    # each request when the previous one finishes.
+    queue_ = sorted(wl["requests"], key=lambda r: r.get("at", 0.0))
+    sequential = wl["kind"] == "sequential"
+    t_start = time.perf_counter()
+    pending = 0
+
+    def release():
+        nonlocal pending
+        while queue_ and (sequential and pending == 0 or not sequential
+                          and queue_[0].get("at", 0.0) <= time.perf_counter() - t_start):
+            send(queue_.pop(0))
+            pending += 1
+            if sequential:
+                break
+
+    release()
+    while pending or queue_:
+        wait = 3600.0
+        if queue_ and not sequential:
+            wait = max(0.0, t_start + queue_[0].get("at", 0.0) - time.perf_counter())
+        if not pending:
+            time.sleep(wait)
+            release()
+            continue
+        try:
+            m = cluster.recv(timeout=max(wait, 0.001))
+        except queue.Empty:
+            release()
+            continue
         if m[0] != "done":
             continue
         d = m[1]
@@ -354,6 +468,7 @@ def run_workload(cluster, router, wl: dict, gpus_used: int) -> dict:
         d["t_submit"] = submit_t[d["rid"]]
         results.append(d)
         r = meta[d["rid"]]
+        release()
         if wl["kind"] == "chat" and r["turn"] + 1 < wl["turns"]:
             t = r["turn"] + 1
             nxt = {"rid": d["rid"] + 1, "prompt": r["prompt"] + d["output_ids"] + wl["msgs"][(r["conv"], t)],
