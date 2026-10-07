@@ -292,9 +292,14 @@ class ServingEngine:
             request.last_token_time = request.first_token_time
             request.output_ids.append(next_id)
             request.state = RequestState.DECODING
-            self.running.append(request)
+            # Finished already — one token asked for, or end-of-sequence first —
+            # retire it; otherwise it joins the decode batch. Never both: it
+            # used to be appended *and* retired, leaving a request with no
+            # slot in the batch, which crashed the next decode step.
             if self._should_stop(request):
                 self._retire(request)
+            else:
+                self.running.append(request)
 
     def _should_stop(self, request: ServedRequest) -> bool:
         if request.generated >= request.max_new_tokens:
