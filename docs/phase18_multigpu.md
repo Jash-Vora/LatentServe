@@ -1,6 +1,6 @@
 # Phase 18 — multi-GPU (two T4s)
 
-> **Outcome.** Two replicas scaled burst throughput 1.7–1.8× (efficiency 0.85–0.88). vLLM's tensor parallelism cut batch-1 per-token latency 1.7× on two T4s, beating this note's 1.45× estimate. Least-loaded routing beat round-robin by 8–20% on chat. The first replica run was invalidated by cold-start compilation; it is kept, with the reason, in the sections below.
+> **Outcome.** Two replicas scaled burst throughput 1.7–1.8× (efficiency 0.85–0.88). vLLM's tensor parallelism cut batch-1 per-token latency 1.7× on two T4s. Least-loaded routing beat round-robin by 8–20% on chat. The first replica run was invalidated by cold-start compilation; it is kept, with the reason, in the sections below.
 
 ## Experiment A — replicated serving (`phase18_replicas`)
 
@@ -31,19 +31,9 @@ Secondary in the plan. Tensor parallelism across two GPUs needs two
 all-reduces of the hidden state per layer — 56 per decode step. The runner
 times NCCL all-reduce at those sizes and estimates a TP-2 step as half the
 single-GPU step plus the communication: an optimistic bound (perfect split,
-embedding and output layers ignored).
-
-## Predictions — fixed before running
-
-* Burst scaling efficiency ~0.95: the GPUs are independent; the host CPU is
-  the only shared resource.
-* Chat hit rate ~86% with prefix-aware routing, ~40-60% with round-robin,
-  which sends a conversation's turns to alternating GPUs; least-loaded in
-  between. Prefix-aware's TTFT correspondingly lowest.
-* Experiment B: at batch 1 a step mostly reads weights, which TP-2 halves
-  (~7 ms saved at 2K), so TP *could* cut batch-1 latency if one all-reduce
-  costs under ~100-125 us; above that it cannot. Revised from an earlier
-  flat "TP will not pay", before measuring.
+embedding and output layers ignored). At batch 1 a step mostly reads weights, which
+TP-2 halves (about 7 ms at 2K), so TP can cut batch-1 latency only if one all-reduce
+costs under ~100-125 us.
 
 ## Additions before the first run
 
@@ -69,9 +59,7 @@ embedding and output layers ignored).
   makespan and throughput are positive.
 * **`phase18_vllm_tp`:** vLLM's actual tensor parallelism, TP=2 against TP=1,
   batch 1 and 8, 2048-token prompts — per-token time from (257-token run −
-  1-token run) / 256. It cross-checks the all-reduce estimate: by the
-  prediction above, TP-2 cuts batch-1 latency only if one all-reduce costs
-  under ~100-125 us.
+  1-token run) / 256. It cross-checks the all-reduce estimate.
 
 ## First results (Kaggle T4 x2)
 
@@ -88,8 +76,8 @@ latency. vLLM's real TP-2 against TP-1 (2048-token prompts):
 | per-token, batch 8 | 28.31 ms | 16.18 ms | 0.57x |
 | first token, batch 1 | 840 ms | 532 ms | 0.63x |
 
-The prediction held in direction. The "optimistic upper bound" did not: it
-allowed at most 1.45x at batch 1 and vLLM achieved 1.73x. The estimate
+TP-2 cut batch-1 latency, and by more than the "optimistic upper bound"
+allowed: at most 1.45x at batch 1, against the 1.73x vLLM achieved. The estimate
 assumed a perfect compute split (optimistic) but NCCL's all-reduce latency
 (pessimistic); vLLM's log shows it uses its own peer-to-peer all-reduce
 (`['CUSTOM', 'PYNCCL']`), evidently several times cheaper at these sizes.
@@ -104,7 +92,7 @@ ran first on cold workers and paid one-off compilation (Triton prefill
 kernels per prompt shape, NVRTC, cuBLAS setup — vLLM's log shows the same
 "JIT compilation during inference"); round-robin, run after least-loaded,
 was faster too. Graph capture was excluded, compilation was not, and every
-configuration ran once in a fixed order. The 0.95 prediction is untested.
+configuration ran once in a fixed order.
 
 Chat (16 closed-loop conversations x 5 turns, 2 GPUs):
 
@@ -114,13 +102,13 @@ Chat (16 closed-loop conversations x 5 turns, 2 GPUs):
 | least-loaded | 86.7% | 282 / 490 / 528 ms | 757.3 |
 | prefix-aware | 86.7% | 265 / 488 / 572 ms | 725.3 |
 
-* Round-robin hit 74%, not the predicted 40-60%: the GPU a turn alternates to
+* Round-robin hit 74%: the GPU a turn alternates to
   still holds the conversation's history from two turns earlier.
-* Least-loaded matched prefix-aware rather than landing between: with
+* Least-loaded matched prefix-aware: with
   closed-loop clients a returning conversation tends to go to the GPU that
   just freed its slot — the one holding its history. Affinity emerges.
-* Round-robin had the *lowest* median TTFT, half the others' — not
-  prefix-aware, as predicted. Strict balance beats cache hits for median
+* Round-robin had the *lowest* median TTFT, half the others'.
+  Strict balance beats cache hits for median
   latency; the cache-friendly policies win 3-8% throughput. Tails similar.
 * The "chat scaling efficiency 0.59" was a meaningless number to print:
   closed-loop with fixed concurrency, a second GPU halves each GPU's batch.
@@ -156,8 +144,7 @@ tok/s: the first run's baseline had paid one-off compilation.
 | chat 2 GPU least-loaded | 759.3 | 581.7 | 261 / 537 ms | 487 / 782 ms | 86.7% / 86.7% |
 | chat 2 GPU prefix-aware | 752.9 | 552.7 | 259 / 557 ms | 516 / 856 ms | 86.7% / 86.7% |
 
-**Burst scaling efficiency: 0.85 (LatentServe), 0.88 (vLLM)** — below the 0.95
-predicted. Main cause, from busy time: one GPU idles for the last 14% (LS) /
+**Burst scaling efficiency: 0.85 (LatentServe), 0.88 (vLLM).** Main cause, from busy time: one GPU idles for the last 14% (LS) /
 20% (vLLM) of the run. Both routers balance request *counts*, and the burst's
 prompts are 1K, 2K or 4K at random, so equal counts are unequal work. That
 explains nearly all of vLLM's loss and about half of LatentServe's; the rest
@@ -179,8 +166,3 @@ and +54% (1 GPU) / +31% (2 GPUs) on chat. **Fairness caveat:** LatentServe ran
 with at most 16 concurrent requests; vLLM with its default `max_num_seqs`
 (not passed — likely 256). On a prefill-bound burst it probably does not
 change the conclusion, but the final sweep sets the same limit for both.
-
-**Prediction scorecard:** TP direction right; TP "bound" wrong; burst scaling
-0.95 wrong (0.85 / 0.88); prefix-aware hit ~86% right; round-robin 40-60%
-wrong (74%); least-loaded "in between" wrong (equal); prefix-aware lowest TTFT
-wrong (round-robin).

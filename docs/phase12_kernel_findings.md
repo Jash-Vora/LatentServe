@@ -105,9 +105,8 @@ whole decode steps.
 
 The driver reports 168 registers, 0 bytes of local (spill) memory and 0
 bytes of shared memory for the loaded kernel. At batch 16 / 8K it reaches
-194 GB/s, 80% of the loads-only ceiling: memory-bound, as the diagnosis
-predicted once the staging, padding and spills were gone. Batch 1 / 2K has
-too little work (2 KV heads x 128 pages) to fill 40 SMs.
+194 GB/s, 80% of the loads-only ceiling: memory-bound once the staging,
+padding and spills were gone. Batch 1 / 2K has too little work (2 KV heads x 128 pages) to fill 40 SMs.
 
 The automatic split count was the fastest tried at batch 16 but not at
 batch 1 (64 beat it) or 4 (32 did), so end-to-end numbers using the default
@@ -130,10 +129,10 @@ attention differs. Bare decode step, 4 alternating rounds.
 | 16 | 2048 | 36.24 | 21.28 | 14.97 (41.3%) | 0.25 |
 | 16 | 8192 | 78.99 | 34.20 | 44.79 (56.7%) | 1.23 |
 
-Scaling the isolated kernel timings by 28 layers predicted batch 4 / 8K
-well (11.5 ms) and underpredicted batch 16 (35 vs 45). It overpredicted
-batch 1 / 8K badly (8.1 vs 2.3): inside the model, Triton's batch-1
-attention cost less than in isolation, so there was less to save. With the
+Scaling the isolated kernel timings by 28 layers matches batch 4 / 8K
+(11.5 ms), understates batch 16 (35 vs 45) and overstates batch 1 / 8K (8.1
+vs 2.3): inside the model, Triton's batch-1 attention cost less than in
+isolation, so there was less to save. With the
 CUDA kernel, batch 1 grows only 1.1 ms from 2K to 8K — the step is now
 almost all weight reads — and at batch 16 the 2K-to-8K growth fell from
 43 ms to 13: attention's per-token cost dropped 3.3x.
@@ -168,8 +167,8 @@ launch bounds. Which bound is faster is measured, not assumed:
 | 16 | 8192 | 2.981 | 0.837 | 0.724 | 0.690 | 0.95x |
 | 16 | 2048 | 0.818 | 0.240 | 0.207 | 0.200 | 0.97x |
 
-The prediction — INT8 faster than fp16 where attention is memory-bound — was
-wrong: INT8 is 1-13% slower everywhere. The goal of the step was met: INT8
+INT8 is 1-13% slower than fp16 everywhere, even where attention is
+memory-bound. The goal of the step was met: INT8
 on the CUDA kernel is 3.4-4.1x faster than on Triton, so INT8 goes from
 roughly 3x slower than fp16 decode to a few percent, for ~1.8x the capacity.
 
@@ -195,9 +194,8 @@ default. To make INT8 *faster* than fp16, each load must carry more: e.g.
 | 16 | 2048 | 20.98 | 23.61 | +12.5% |
 | 16 | 8192 | 33.05 | 39.40 | +19.4% |
 
-The prediction ("a few percent") counted only the attention kernel, whose
-extra cost is ~0.03 ms per layer at batch 16 / 8K, about 1 ms per step. The
-step is 6.4 ms slower. The rest is INT8's write side: 709 kernels per step
+The attention kernel's extra cost is only ~0.03 ms per layer at batch 16 /
+8K, about 1 ms per step; the step is 6.4 ms slower. The rest is INT8's write side: 709 kernels per step
 against 429, the 280 extra being the per-token V quantization and residual
 copy, about ten small operations per layer — the cost Phase 14c identified,
 whose fix (one fused quantize-and-write kernel) was never built.

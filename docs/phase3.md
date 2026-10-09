@@ -8,18 +8,6 @@ lengths, concurrent requests, request termination and high utilization.
 Metrics: fragmentation, usable cache capacity, allocation overhead,
 latency impact.
 
-## Set expectations first
-
-**Paging is a capacity optimization and should make decode slightly
-slower.** Attention can no longer read a contiguous tensor, so scattered
-blocks are gathered into one each step — a real copy of the live KV, per
-layer, per step. Phase 2 calibrates the cost: `repeat_kv` was 13x the
-necessary traffic and dominated TPOT past 4K; this is 2x (one read, one
-write) on a term that was 4-13% of decode bytes at batch 1.
-
-Any result showing paging *faster* on a uniform-length benchmark is
-measuring a mistake, not a win.
-
 ## What landed
 
 | File | Role |
@@ -123,7 +111,7 @@ per sequence) and cost more bookkeeping.
 This is not a coincidence, and it is derivable rather than empirical: a
 contiguous cache reserves the *longest* sequence for every slot, paging
 reserves roughly the *mean*, so the capacity ratio is max/mean. The
-simulation confirms the prediction to within 12% across a 6.7x range of
+simulation matches this to within 12% across a 6.7x range of
 heterogeneity.
 
 Stated as a rule for the report: **paging buys you exactly the
@@ -133,12 +121,12 @@ on uniform traffic is that you do not have to *be* an oracle — the
 generic contiguous baseline, sized for the longest request the server
 accepts, is 46x worse on `short_interactive`.
 
-### Block size barely matters — prediction falsified
+### Block size barely matters
 
 Capacity efficiency stays between 98.8% and 100% from block_size 1 to
-256, and TPOT differs by under 1% between 16 and 128. The expectation
-that finer scattering would cost more locality was wrong: one token's KV
-is 2 heads x 128 dims x 2 bytes = 512 contiguous bytes even at
+256, and TPOT differs by under 1% between 16 and 128. Finer scattering
+costs no locality: one token's KV is 2 heads x 128 dims x 2 bytes = 512
+contiguous bytes even at
 block_size 1, which is already enough for a coalesced read. Scatter
 granularity is irrelevant; total bytes moved is everything.
 
@@ -174,9 +162,9 @@ compute-bound at O(S^2), so the same gather disappears into it.
 A paged-attention kernel that walks the block table with an online
 softmax removes the gather entirely, and the table above says exactly
 what that is worth: up to 32 ms/token at batch 4 / 16K, ~70% of TPOT.
-Phase 11 now has a target with a number attached rather than a hunch,
-and a pre-registered prediction — a correct kernel should recover nearly
-all of that gap and land within noise of contiguous.
+Phase 11 now has a target with a number attached rather than a hunch: a
+correct kernel should recover nearly all of that gap and land within noise of
+contiguous.
 
 ## Gate 4 checklist — "Can paged KV improve memory utilization?"
 

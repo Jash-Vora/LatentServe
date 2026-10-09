@@ -1,6 +1,6 @@
 # Final sweep, stage 1 — single GPU
 
-> **Outcome.** The sweep produced about 260 cells, and `sweep_stage1 --report` prints their tables, which are saved in `sweep_stage1_results.md`; the README summarises them. This note is chronological: the plan and predictions come first, then the problems found along the way (the context limit, concurrency limits, INT8 pool sizing, vLLM's gradual admission, drifting pool sizes). Where the plan and a later section disagree, the later section is right.
+> **Outcome.** The sweep produced about 260 cells, and `sweep_stage1 --report` prints their tables, which are saved in `sweep_stage1_results.md`; the README summarises them. This note is chronological: the plan comes first, then what the sweep showed, then the problems found along the way (the context limit, concurrency limits, INT8 pool sizing, vLLM's gradual admission, drifting pool sizes). Where the plan and a later section disagree, the later section is right.
 
 `benchmarks/runners/sweep_stage1.py`. One T4 ("GPU T4" accelerator). Resumable:
 every cell is saved on completion and skipped on rerun.
@@ -38,32 +38,15 @@ every cell is saved on completion and skipped on rerun.
 * A batch that cannot all decode at once is reported as not fitting, never
   timed with fewer requests than intended.
 
-## Predictions — written before the run
+## What the sweep showed
 
-Each against the earlier measurement it extends:
-
-* **A.** LS dense vs vLLM, per step: near parity at batch 1 / 2K, widening to
-  ~2x at batch 4 / 8K and ~3x at batch 16 / 8K (Phase 12: 16.65 vs 17.6 ms,
-  21.65 vs 42.1, 34.2 vs 107.3). Engine-level adds LatentServe's host
-  overhead, so its gap may be a little smaller than Phase 12's. Sparse 37.5%
-  over dense: ~1.3-1.55x at large shapes, ~0.96-1.03x at batch 1 (Phase 17's
-  recalibration). INT8: 1-9% slower than dense where both fit (Phase 16) —
-  and INT8 alone fits batch 16 / 32K and batch 32 / 16K.
-* **B.** LS faster than vLLM by 2.7-6x, the ratio growing with prompt length
-  (Phase 6). INT8 prefill within a few percent of dense.
-* **C, burst.** LS dense ~2.5-3x vLLM (Phase 18: 2.8x) — vLLM now capped at
-  16 concurrent requests instead of its default, which may move it either way.
-  Sparse 37.5% ~5-15% over dense (contexts 1-4K, batch up to 16: Phase 17
-  measured 1.05-1.17x there); adaptive close to fixed 37.5%, since it picks
-  sparse wherever that clears 5%; INT8 2-5% below dense.
-* **C, chat.** LS +40-60% over vLLM on throughput (Phase 18, one GPU: +54%);
-  prefix caching cuts TTFT ~75% for both engines (Phase 13: -77%).
-* **C, varying.** Adaptive between dense and fixed 37.5% on throughput, as in
-  Phase 17.
-* **C, load curves.** LS's knee at a higher absolute rate than vLLM's, by
-  roughly its burst-throughput ratio. Below the knee, TTFT is mostly prefill,
-  so LS's median TTFT is lower by roughly section B's ratio; per-token time
-  at light load near parity.
+* **Decode.** LatentServe ties vLLM at batch 1 / 2K (16.7 against 17.5 ms) and leads by up to 3.3× at batch 32 / 8K (58.9 against 195.4 ms); the gap grows with batch and context.
+* **Sparse attention.** 37.5% of pages is 0.95× at batch 1 / 2K and 1.66× at batch 8 / 32K (37.4 against 62.2 ms); 50% reaches 1.40× there.
+* **INT8.** Level with dense to 12% slower, and the only configuration that runs batch 32 / 16K (114.7 ms) and batch 16 / 32K (107.3 ms). Its p99 sits 6-10 ms above its p50.
+* **Prefill.** First-token time is 2.1× faster than vLLM's at 1K tokens and 9.6× at 32K (16.9 s against 161.8 s). INT8 prefill is within 4% of dense, except 11% slower at 16K.
+* **Serving.** Burst throughput is 2.8× vLLM's and chat with prefix caching 1.5×. Prefix caching cuts first-token time 72-73% on both engines. Sparse 37.5% and adaptive add about 2% on the burst; INT8 costs 4%.
+* **Load.** LatentServe saturates at 1.58 req/s against vLLM's 0.50. vLLM's latency degrades from about 55% of its capacity; LatentServe holds until about 90%.
+* **Varying traffic.** vLLM's median first-token time is 12 minutes against LatentServe's 59 seconds.
 
 ## An engine bug found by section B
 

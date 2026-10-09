@@ -77,7 +77,7 @@ value of running this phase before Phase 11 rather than after.
 
 Two other gaps are expected and should be attributed rather than
 lamented: CUDA graphs (LatentServe runs eager Python per layer, and
-Phase 2's P1 found decode at 24-32% of peak bandwidth, i.e. overhead-
+Phase 2 found decode at 24-32% of peak bandwidth, i.e. overhead-
 bound) and chunked prefill (Phase 4's stall behaviour).
 
 ## One asymmetry that cannot be controlled away

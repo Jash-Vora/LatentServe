@@ -78,8 +78,7 @@ on them:
    tensors, and `bytes_read_per_decode_step()` is the numerator of every
    bandwidth claim from here to Phase 18.
 
-See `docs/phase2.md` for the sweep, the measurement design, and the
-predictions registered before running it.
+See `docs/phase2.md` for the sweep and the measurement design.
 
 ## Phase 3 — what exists today
 

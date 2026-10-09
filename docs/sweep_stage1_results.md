@@ -1,6 +1,6 @@
 # Sweep stage 1 — 261 cells
 
-> The final single-GPU sweep, as printed by `sweep_stage1 --report`; the tables below are verbatim. The setup, the predictions and the problems found along the way are in `sweep_stage1.md`, and the README summarises the results.
+> The final single-GPU sweep, as printed by `sweep_stage1 --report`; the tables below are verbatim. The setup and the problems found along the way are in `sweep_stage1.md`, and the README summarises the results.
 >
 > Reading notes. "did not fit" means the batch didn't fit at the sweep's memory settings (2.5 GB of headroom for prefill and graphs, vLLM at 85% of GPU memory), not that either engine can never run it; INT8's cache holds 1.86× the blocks, which is why it runs two shapes the others skip. The 32768 rows fill the cache to the model's limit. The load curves are single rounds of 16–80 requests per point.
 

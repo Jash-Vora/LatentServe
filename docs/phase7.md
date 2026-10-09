@@ -238,7 +238,7 @@ question is not "is low-rank lossy" but "is low-rank at 2.0x better than
 INT8 at 2.0x". If not, a latent representation needs a justification
 other than memory saving.
 
-Three INT8 granularities are swept, and 7.1's spectra predict which
+Three INT8 granularities are swept, and 7.1's spectra suggest which
 should win: K has effective rank 5.6 (a few channels carrying enormous
 magnitude, so a shared per-tensor scale starves the rest) and wants
 **per-channel**; V's energy is spread evenly across 72 effective

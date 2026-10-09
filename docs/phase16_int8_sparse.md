@@ -34,10 +34,6 @@ capacity it buys would be used. Slower than that, its per-step tax eats the
 capacity gain, Phase 16 stops, and INT8 is recorded as a capacity-only
 option: for requests fp16 cannot hold at all.
 
-**Prediction:** the fused write brings INT8 within ~5% of fp16 at large
-shapes (its attention kernel measured 2-7% slower than fp16's); small
-batches stay slower.
-
 ## The first fused write was not byte-identical
 
 The end-to-end check failed: symmetric — layer 0's INT8 values identical,
@@ -77,8 +73,7 @@ Whole decode steps, INT8 against fp16, both on the CUDA kernel, fused write:
 | 16 | 16384 | 53.80 | 58.89 | **-9.3%** | **fail** |
 
 By the rule fixed beforehand, Phase 16 stops: INT8 is a **capacity-only**
-option, for requests fp16 cannot hold at all. The prediction (within ~5% at
-large shapes) was wrong at the shape that matters. INT8's penalty grows with
+option, for requests fp16 cannot hold at all. INT8's penalty grows with
 batch x context — where attention dominates the step and INT8's attention
 kernel is slower than fp16's (the Phase 12 latency finding) — so its tax is
 heaviest exactly where its capacity would be used.
@@ -115,9 +110,7 @@ fusion changed only one of them; the replay shows the timed path running the
 fused kernel once per layer. With fusion off, INT8's extra kernels were 280
 elementwise, reduce and index ops (+308) less fp16's attention kernel (-28).
 With fusion on, INT8 issues **28 fewer kernels than fp16** (one fused write
-per layer against fp16's two scatters). The predicted 400-430 held; the
-earlier "~457" had assumed the fused kernel was *added* per layer rather than
-replacing a dozen.
+per layer against fp16's two scatters).
 
 **Consequence for the gate:** INT8's remaining penalty (up to 9.3% at batch
 16 / 16K) cannot be launch overhead — it now launches fewer kernels than

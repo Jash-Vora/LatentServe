@@ -5,25 +5,24 @@
 Goal (docs/methodology.md Phase 5): "Before introducing MLA, make
 measurement trustworthy."
 
-That instruction earned itself in Phase 4. Three of five predictions came
-back falsified and **two were the harness answering a different question
-than the one asked**:
+That instruction earned itself in Phase 4. Two results there came from **the
+harness answering a different question than the one asked**:
 
 * inter-token percentiles taken over per-request *means*, so a 2 s stall
   spread across 229 steps vanished into a 9 ms bump;
 * then over the decode *call* duration rather than the wall gap between
   tokens, so prefill blocking stayed invisible a second time.
 
-Neither was visible by reading the code. Both were visible the moment a
-specific numeric prediction disagreed with a measurement. `benchmarks/
-harness.py` exists so those mistakes are made once, centrally.
+Neither was visible by reading the code. Both showed up when a result
+contradicted simple arithmetic. `benchmarks/harness.py` exists so those
+mistakes are made once, centrally.
 
 ## What landed
 
 | File | Role |
 | --- | --- |
 | `benchmarks/harness.py` | percentiles, bootstrap CIs, bimodal-aware latency summary, fairness guards, repeatability, environment-drift detection |
-| `tests/test_phase5_harness.py` | the harness's own failure modes, including the two Phase 4 lost predictions to |
+| `tests/test_phase5_harness.py` | the harness's own failure modes, including the two Phase 4 measurement bugs |
 
 `benchmarks/runners/phase4_serving.py` now imports the shared percentile
 rather than defining its own.

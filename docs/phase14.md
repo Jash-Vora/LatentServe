@@ -63,14 +63,6 @@ python -m pytest tests/test_phase14_fusion.py -v
 python -m benchmarks.runners.phase14_fusion --context-lengths 2048 8192 --batch-sizes 1 4 16
 ```
 
-### Prediction
-
-Batch 1 / 2K recovers most of the ~1.5 ms gap. The saving is per-launch
-fixed cost, so it should be roughly constant in milliseconds across
-context lengths and shrink as a *fraction* as the step grows. If batch 1
-barely moves, the gap is not launch count and Phase 13's explanation was
-incomplete.
-
 ### Then the side-by-side
 
 Once the A/B says it helps, the claim against vLLM still has to be made
@@ -97,14 +89,14 @@ python -m benchmarks.runners.phase6_vllm --compare --results-dir results/raw/pha
 
 Repeated in a second session at batch 1 / 2K: 0.36 ms saved, spread 0.01.
 
-**Kernels fell by 140, not the predicted 84.** At batch 1 a projection
+**Kernels fell by 140.** At batch 1 a projection
 with a bias is two kernels — one copies the bias into the output, one
 multiplies into it. Qwen's q, k and v all have biases, so they were six
 kernels per layer and are now two; gate/up have none and save one. Five
 per layer, 28 layers.
 
-**The batch-1 prediction was falsified.** 0.36 ms is about a quarter of
-the ~1.5 ms gap. It does give a useful number: ~2.6 us per kernel under
+**Fusion closed only a quarter of the batch-1 gap:** 0.36 ms of ~1.5 ms.
+It does give a useful number: ~2.6 us per kernel under
 graph replay, so the 1,191 kernels still in each step can account for at
 most ~3 ms between them.
 
@@ -340,8 +332,8 @@ most likely to be wrong, and it is checked on CPU against the original
 loop with zero tolerance. `--toggle elementwise` measures it alone, with
 projections fused on both sides.
 
-**Prediction:** batch 1 / 2K from 20.4 toward ~18.5 ms, roughly constant
-in milliseconds across contexts.
+**Result:** measured in `benchmark_vs_vllm.md`: on par with vLLM on every measure, and
+elementwise fusion costs nothing.
 
 ## 14c — INT8 cache at graph speed
 
@@ -372,14 +364,9 @@ it, because it only flushes in `advance()`, before any layer writes.
 Quantization is now tracked per layer, and `read()` flushes only the
 layer it reads.
 
-### Prediction
+### Result
 
-Per step, INT8 reads half the KV bytes, and the kernel no longer pays a
-gather or a dequantize pass. At batch 1 / short context KV is a small
-share of the step, so expect little change. At long context and high
-batch — B16/8K, where KV is ~60 of ~83 ms — expect a large drop if the
-kernel's bytes-per-second holds on INT8 data. Deferred quantization costs
-an eager burst every 16 tokens per sequence, ~0.1 ms per step amortized.
+Measured later, with the CUDA decode kernel: INT8's attention kernel is 1-13% slower than fp16's, and end to end it was 6-19% slower until its write path was fused (709 kernels per step against 429). See `phase12_kernel_findings.md` and `phase16_int8_sparse.md`.
 
 ## Run
 

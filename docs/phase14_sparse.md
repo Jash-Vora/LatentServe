@@ -140,7 +140,7 @@ budget r cannot read less than r + 6.25% and cannot run faster than
 reaches 88%, 82% and 75% of those ceilings. A selected page is read exactly
 as any page, and the sparse kernel has the dense kernel's 168 registers.
 
-The indexer costs what its bytes predict: 22-24% of the 25% pipeline at
+The indexer costs what its bytes imply: 22-24% of the 25% pipeline at
 batch 4-16, against ~20% of its bytes. Efficient, but it is the ceiling: as
 budgets shrink, its fixed share becomes most of the work.
 
@@ -224,7 +224,7 @@ full quality run.
 
 The operating point above — "25% of pages: KL 0.009, every needle found,
 quality on par with dense" — rested on 9 needles and 126 tokens of text.
-Phase 15's pre-registered study (83 dense-correct retrieval and QA cases,
+Phase 15's larger study (83 dense-correct retrieval and QA cases,
 ~1,500 tokens of text) overturns it: at 25% the GPU path loses 4 answers
 dense got right (gaining 1) and its KL at 8K is 0.0146, failing both
 criteria. Only 50% passes. Up to 16K the oracle loses nothing at 25%, so

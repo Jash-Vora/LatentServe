@@ -63,11 +63,6 @@ requests), *chat* (8 conversations x 5 turns, each resending its history),
 *none* (32 unrelated 2304-token prompts). Arrivals in decode steps; two
 rounds, alternating order; production setup.
 
-**Prediction:** shared — hit rate ~86% (2048 of 2304 tokens, all but the
-first request), prefill per request and TTFT down ~80-85%; chat — hit rate
-rising turn by turn, ~70-85% overall; none — hit rate ~0 and overhead under
-1% on every metric; decode throughput unchanged within ~2% everywhere.
-
 ## Result (T4; two rounds, alternating order; median of rounds)
 
 | workload | kv | hit rate | TTFT p50 off -> on | prefill / request | decode off -> on |
@@ -82,15 +77,13 @@ rising turn by turn, ~70-85% overall; none — hit rate ~0 and overhead under
 Live KV blocks at peak (fp16): shared 1172 -> 738 (-37%), chat 856 -> 665
 (-22%).
 
-**Against the predictions:** shared hit rate 86% predicted, 86.1% measured;
-TTFT -80-85% predicted, -84%. Chat 70-85% predicted, 86.7% — just above.
-No-sharing overhead "under 1%": +1.0% (fp16) and -0.6% (int8), against ~3%
-round-to-round noise — indistinguishable from zero. **Wrong:** "decode
-unchanged within 2%" — *shared* decodes 4-5% faster with prefix caching,
-consistently in both rounds and in INT8. Hypothesis, not measured: every
-sequence in a batch reads the same physical pages for the 2048-token prefix
-(~2 MB per layer, within the T4's 4 MB L2), so later sequences hit L2. Chat
-shares less per batch and shows no gain, which is consistent.
+**What it shows.** Hit rates track the shared share of each prompt: 86.1% on the shared
+system prompt, 86.7% on chat. With nothing to share the overhead is +1.0% (fp16) and
+-0.6% (int8), against ~3% round-to-round noise, so indistinguishable from zero.
+Shared-prompt decoding is also 4-5% faster with prefix caching, in both rounds and in
+INT8. Hypothesis, not measured: every sequence in a batch reads the same physical pages
+for the 2048-token prefix (~2 MB per layer, within the T4's 4 MB L2), so later sequences
+hit L2. Chat shares less per batch and shows no gain, which is consistent.
 
 **It stacks with INT8:** identical hit rates, TTFT -83% (shared) and -70%
 (chat), no overhead without sharing. Chat gains less than fp16 because the

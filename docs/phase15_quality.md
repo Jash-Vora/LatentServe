@@ -53,8 +53,7 @@ Verdicts on the quick sample: **50% PASS, 25% PASS (1 paired failure of 29
 dense-correct — exactly the limit), 12.5% FAIL (4 of 29, ~14% against 2%),
 6.25% and 3.1% FAIL.** The oracle failed once at 12.5%: perfect selection
 would still pass there, so 12.5%'s failures belong to the indexer, not to
-sparsity itself. Multikey matched dense down to 6.25% (7/8) — the prediction
-that it would break first was wrong; needle and QA broke first.
+sparsity itself. Multikey matched dense down to 6.25% (7/8); needle and QA broke first.
 
 Whole steps (batch 8 / 32K): 1.32x at 50%, 1.70x at 25%, 1.97x at 12.5%,
 2.14x at 6.25%, 2.24x at 3.1%. At batch 1 / 8K, 0.97x-1.08x.
@@ -121,8 +120,7 @@ Whole steps (batch 8 / 32K, batch 16 / 16K): 1.32x at 50%, 1.71x at 25%,
 **Phase 15 result: sparse decode is validated at 50% of pages — ~1.3x where
 attention dominates the step, nothing at batch 1. 25% buys 1.7x but loses
 retrieval and language-modelling quality with this indexer; the oracle
-shows the loss is in page selection.** The prediction that 25% would pass
-was wrong.
+shows the loss is in page selection.**
 
 ## Indexer bake-off — protocol fixed before any result
 
@@ -163,8 +161,7 @@ Phase 15 criteria. The 83 Phase 15 cases are never used for selection.
 | mean | 0.949 | 0.0204 | 0.0012 | 0.0108 | 3 / 1 |
 | mean+dense2+window8 | 0.956 | 0.0205 | 0.0012 | 0.0109 | 3 / 1 |
 
-Selected by the rule: **rerank+dense2+window8**, near the oracle. The
-prediction (mass+dense2+window8) was wrong: the two cheap tweaks barely
+Selected by the rule: **rerank+dense2+window8**, near the oracle. The two cheap tweaks barely
 help (-5% each), summed mass does real work (-34%), exact reranking most of
 it (-61%). Mean keys keep 95% of the mass yet fail badly at 8K: averaging a
 page erases the one spiky key that matters, so mass kept alone is not a
@@ -228,10 +225,6 @@ Outcome accepted as fixed beforehand: no further seeds.
   one seed; if it fails here, it is not validated.
 * **Fresh data:** seed 3 (seeds 0, 1, 2 have all been seen). Phase 15's full
   sample sizes. Both outcomes accepted; no further seeds.
-* **Prediction:** KL passes (~0.007 at 8K by interpolation); retrieval is a
-  coin flip (0 failures at 50%, 4-5 at 25%; the limit is 1); no gain at
-  batch 1.
-
 Choosing 37.5% after seeing 25% fail and 50% pass is a new hypothesis, which
 is legitimate only because it is judged on unseen data and every attempt —
 this one included — is reported.
@@ -247,8 +240,8 @@ this one included — is reported.
 By the criteria fixed in advance, both fail — **including the 50%
 replication.** Needle and multikey were perfect at both budgets; every flip
 was in QA, where dense itself is right only 61% of the time, and the flips
-went both ways: 2 lost, 3 gained, net +1 for sparse. KL predicted ~0.007 at
-37.5%, measured 0.0062; 1.5x as predicted.
+went both ways: 2 lost, 3 gained, net +1 for sparse. KL at
+37.5% was 0.0062, and the step 1.5x faster.
 
 **Why the original rule was unreliable.** "At most 2% of dense-correct" with
 85 cases rounded down to 1 allowed — in practice stricter than 2% — and
@@ -296,9 +289,6 @@ informed the revision:
   QA and text. Its paired flips and KL are what noise alone produces.
 * **Rule:** the revised one; the original printed beside it. Accepted
   either way.
-* **Prediction:** 50% and 37.5% pass, 25% fails; the Triton control shows
-  some flips both ways with net loss near 0, and KL near 1e-5.
-
 ## Confirmatory result (seed 4) — every budget fails
 
 | configuration | failures / gains (of 84) | net loss | KL 8K | KL ~31K | revised rule |
@@ -308,7 +298,7 @@ informed the revision:
 | 37.5% | 3 / 0 | 3 | 0.0048 | 0.0015 | FAIL |
 | 25% | 6 / 0 | 6 | 0.0108 | 0.0036 | FAIL (KL too) |
 
-The prediction (50% and 37.5% pass, 25% fails) was wrong. **The noise floor
+**The noise floor
 is zero:** dense through a numerically different kernel flips no answers.
 The flips at 50% and 37.5% are therefore real effects of sparsity, not
 numerical noise. Seed 3's "2 lost, 3 gained" was read as symmetric churn

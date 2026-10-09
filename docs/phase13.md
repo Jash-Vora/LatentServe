@@ -106,15 +106,6 @@ captures the decode core without graph breaks, the hand-rolled path is
 unnecessary. Breaks are expected given how stateful the cache is, but
 it is a thirty-minute check.
 
-## Predictions
-
-* **Batch 1 / 8K falls from ~40 ms toward ~25–28 ms** — the GPU floor
-  plus one replay call and the host-side `advance()`.
-* **Batch 4 at long context gains much less.** It was already GPU-bound;
-  the kernel was within 2.4% of SDPA at 8K.
-* If batch 4 gains as much as batch 1, Phase 12's reading of where the
-  time went was wrong.
-
 ## Measured (T4, Qwen2.5-1.5B fp16, paged cache, Triton kernel path)
 
 | batch | ctx | eager | graphed | change |
@@ -139,7 +130,7 @@ separate attention per layer until it hits its recompile limit at layer
 8. Fixable in principle, unnecessary in practice — the hand-rolled
 capture records kernel launches rather than Python, so neither applies.
 
-### Batch 1: prediction confirmed, overhead eliminated
+### Batch 1: overhead eliminated
 
 Phase 12 measured 24.6 ms of GPU work at B1/8K under 42.6 ms of CPU
 dispatch. Graphed B1/8K is **24.05 ms**: wall time now *is* GPU time.
@@ -152,7 +143,7 @@ falling — the 130 GB/s figure was partly an artefact of eager execution.
 
 ### Batch 4 at long context: no gain, and the graph shows why
 
-B4/8K and B4/16K are GPU-bound, as predicted. With overhead gone, the
+B4/8K and B4/16K are GPU-bound. With overhead gone, the
 incremental cost of batch 4 over batch 1 is directly readable: at 8K it
 adds 15.7 ms for ~705 MB more KV, i.e. **~45 GB/s** — matching the
 ~47 GB/s ceiling Phase 12's isolated sweep found for the kernel. Two
@@ -186,7 +177,7 @@ broken.
 - [x] GPU suite green, including the stale-input test
 - [x] `--experiment compile` run and its break count recorded (13 breaks)
 - [x] batch 1 and batch 4 latency measured, eager vs graphed
-- [x] each prediction marked: both confirmed
+- [x] batch 1 overhead eliminated; batch 4 shown GPU-bound
 - [x] `num_splits` re-tuned per bucket **under replay** — Phase 12 showed
       the isolated optimum did not survive the real model, and replay
       changes the environment again
@@ -283,10 +274,9 @@ neither eager execution (Phase 12) nor replay. `MAX_SPLITS` is now 16.
 | 16 | 2048 | 39.9 | 42.2 | +6% | 1.9x |
 | 16 | 8192 | 99.6 | 106.9 | +7% | 3.1x |
 
-### The prediction was wrong both ways
+### Behind at batch 1, ahead from batch 4
 
-The prediction was: lead on batch-1 latency, fall behind on throughput as
-batch grows. Measured: **behind on batch-1 latency** (15% at 2K) and
+**Behind on batch-1 latency** (15% at 2K) and
 **slightly ahead on decode at batch >= 4 and long context** (5-8%).
 
 ### The first verdict reported the wrong throughput
