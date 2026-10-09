@@ -1,8 +1,8 @@
 # LatentServe
 
-An LLM inference engine built from scratch to learn how serving works. It runs Qwen2.5-1.5B-Instruct on NVIDIA T4s, and everything was benchmarked against vLLM on the same hardware.
+LatentServe is an LLM inference engine I built from scratch to learn how serving works. It runs Qwen2.5-1.5B-Instruct on NVIDIA T4 GPUs, and I benchmarked it against vLLM on the same hardware.
 
-On one T4 it decodes 1.05–3.3× faster than vLLM, prefills up to 9.6× faster, and gives the same outputs.
+On one T4 it decodes 1.05–3.3× faster than vLLM and prefills up to 9.6× faster. Its output distribution stays within about 1.7×10⁻⁵ KL of an fp32 reference.
 
 ## Against vLLM
 
@@ -17,7 +17,9 @@ On one T4 it decodes 1.05–3.3× faster than vLLM, prefills up to 9.6× faster,
 | Multi-turn chat, prefix caching on | 629 tok/s | 415 tok/s | 1.5× |
 | Saturation, open-loop requests | 1.58 req/s | 0.50 req/s | 3.2× |
 
-Both engines got the same prompts, concurrency limits and seeds, and vLLM was in its fastest setup on this GPU. Most of the gap is attention. A T4 can't run FlashAttention-2, so vLLM falls back to a Triton kernel. At batch 1 with a short context a step is mostly reading weights, so the two tie. Add batch size or context and the gap opens up.
+Both engines received the same prompts, concurrency limits and seeds.
+
+Most of the gap is probably attention. A T4 cannot run FlashAttention-2, so vLLM falls back to a Triton kernel, and the gap grows with batch size and context, which is consistent with that explanation. I did not profile vLLM's kernel, so this is my best explanation rather than a measurement. At batch 1 with a short context, a step is dominated by reading the weights, and the two engines tie.
 
 ![Decode speedup over vLLM by batch size and context](docs/figures/decode_speedup.png)
 
@@ -33,41 +35,39 @@ Both engines got the same prompts, concurrency limits and seeds, and vLLM was in
 | Burst throughput, two replicas | 472 tok/s (1.71×) | 173 tok/s (1.76×) |
 | Chat throughput, round-robin routing | 702 tok/s | 485 tok/s |
 | Chat throughput, least-loaded routing | 759 tok/s (+8%) | 582 tok/s (+20%) |
-| Per-token time at batch 1, model split across both GPUs | not built | 9.7 ms against 16.8 ms on one (1.73×) |
+| Per-token time at batch 1, model split across both GPUs | not built | 9.7 ms vs 16.8 ms on one (1.73×) |
 
-Two replicas means one engine per GPU behind a router. The other way to use two GPUs is to split a single model across them (tensor parallelism), which only vLLM does here. Replicas scaled to 85% of ideal for LatentServe and 88% for vLLM. One GPU sits idle at the end of a run because the router balances request counts, not work.
+These figures come from a separate set of runs, so the one-GPU numbers differ slightly from the table above.
+
+Two replicas means one engine per GPU behind a router. The alternative is to split a single model across both GPUs (tensor parallelism), which only vLLM supports here. Replicas scaled to 85% of ideal for LatentServe and 88% for vLLM. One GPU is idle at the end of each run because the router balances request counts rather than work.
 
 ## What worked
 
-- The decode kernel did most of the work. The first version, written in Triton, only reached 69 GB/s on a card that can do about 320, because its math was running on the slow scalar path. The CUDA rewrite reaches 194 GB/s and is 2.8× faster, which took decode at batch 16 / 8K from 79 ms to 34 ms.
-- CUDA graphs removed the launch overhead. A batch-1 step went from about 40 ms to 20–28 ms.
-- Prefix caching cut first-token time by 72–84% on shared prompts and chat. With nothing to share it costs about 1%.
-- Choosing dense or sparse attention for each step (the adaptive policy) came within 2% of always-sparse speed, at about half the expected answer loss.
+- **The decode kernel.** The first version, written in Triton, reached only 69 GB/s on a card capable of about 320, because its math ran on the slow scalar path. The CUDA rewrite reaches 194 GB/s and is 2.8× faster, which reduced the decode step at batch 16 / 8K from 79 ms to 34 ms.
+- **CUDA graphs.** A batch-1 step dropped from about 40 ms to 20–28 ms.
+- **Prefix caching.** First-token time fell 72–84% on shared prompts and chat, at a cost of about 1% when nothing is shared.
+- **An adaptive sparsity policy.** Choosing dense or sparse attention for each step came within 2% of always-sparse speed, at about half the expected answer loss.
 
 ## What didn't
 
-- Sparse attention below 50% of pages. At 50% it's 1.40× faster at batch 8 / 32K and loses about 0.4% of answers. At 37.5% it's 1.66× and 1.2%. At 25% it loses 5.5% and fails the quality check. A perfect page picker loses nothing at 25%, so the trouble is choosing pages, not sparsity itself. A learned indexer would probably fix that, but it wasn't tried.
-- The INT8 KV cache. It holds 1.86× as many blocks but is never faster: level with dense at best, up to 12% slower at worst. Doubling the batch with INT8 buys 10–16% more throughput than fp16 dense, while sparse attention buys 62–66%.
-- The MLA latent cache, dropped after Phase 7. A latent that keeps value error at 10% only compresses about 1.6×, and INT8 gets 2× for free.
+- **Sparse attention below 50% of pages.** At 50% it is 1.40× faster at batch 8 / 32K and loses about 0.4% of answers. At 37.5% it is 1.66× faster and loses 1.2%. At 25% it loses 5.5% and fails the quality check. A perfect page selector loses nothing at 25% (tested up to 16K tokens), so the problem is choosing pages, not sparsity itself. A learned indexer would probably help; I have not tried one.
+- **INT8 KV cache.** It holds 1.86× as many blocks but is never faster: level with dense at best, up to 12% slower at worst. Doubling the batch with INT8 gives 10–16% more throughput than fp16 dense, whereas sparse attention gives 62–66%.
+- **MLA latent cache.** I dropped it after Phase 7. A latent that keeps value error at 10% compresses only about 1.6×, while INT8 gives 2× with no reconstruction work.
 
 ![Decode throughput: INT8 capacity vs sparse attention](docs/figures/capacity_vs_sparsity.png)
 
 ## Lessons
 
-- Small test models hid a prefill bug for four phases (NaNs, and prefill twice as slow). A guard now refuses to time a model whose outputs aren't finite.
-- Running at real scale found engine bugs the tests never hit. Admission ignored generated tokens, a sparse budget decayed inside graph buckets, and one-token requests crashed the engine.
+- Small test models hid a prefill bug for three phases (NaNs, and prefill twice as slow). The benchmark now refuses to time a model whose outputs are not finite.
+- Running at real scale exposed bugs the tests never reached: admission ignored generated tokens, a sparse budget decayed inside graph buckets, and one-token requests crashed the engine.
 
 ## To do
 
-- [ ] Rerun the vLLM comparison on an A10 or L4. Part of the gap is the T4 (no FlashAttention-2), and how much isn't known.
-- [ ] Try a larger model. The 1.5B one can't do multi-hop retrieval even with full attention, so sparse attention's effect on that is untested.
-- [ ] Train a learned page indexer so sparse attention can go below 50%.
-- [ ] Add tensor parallelism to LatentServe. vLLM's gets 1.7× lower per-token latency on two T4s.
-- [ ] Route replicas by outstanding tokens instead of request counts.
-- [ ] Repeat the load curves. Each point is a single run of 16–80 requests, so individual points are noisy.
-- [ ] Benchmark with real prompts and varied output lengths. Everything here uses random tokens and fixed lengths.
-- [ ] Measure sparse attention's accuracy cost on more questions. The figures come from about 85 per seed, so they're good to roughly ±1 point.
-- [ ] Support sampling beyond greedy decoding, and put an API server in front.
+- Rerun the comparison on an A10 or L4. Part of the gap is the T4, and how much is not yet known.
+- Try a larger model. The 1.5B model cannot do multi-hop retrieval even with full attention, so sparse attention's effect on it is untested.
+- Train a learned page indexer so sparse attention can go below 50%.
+- Add tensor parallelism. vLLM's version gives 1.7× lower per-token latency on two T4s.
+- Test with real prompts and varied output lengths. Everything here uses random tokens and fixed lengths, and the load curves are single runs, so individual points are noisy.
 
 ## Using it
 
@@ -90,7 +90,7 @@ engine.add_request(ServedRequest(request_id=0, prompt_ids=token_ids, max_new_tok
 finished = engine.run()
 ```
 
-Dense fp16 is the default. Opt-in: `kv_dtype="int8"` on the engine, `model.set_sparse(0.5)` before building it, or `policy=SparsePolicy.from_json(table, tier="relaxed")` from `runtime.policy`.
+Dense fp16 is the default. The opt-in features are `kv_dtype="int8"` on the engine, `model.set_sparse(0.5)` before building it, and `policy=SparsePolicy.from_json(table, tier="relaxed")` from `runtime.policy`. Decoding is greedy only, and there is no API server.
 
 ## Run it
 
@@ -116,4 +116,4 @@ benchmarks/   harness, one runner per phase, and the figure script
 docs/         one note per phase, each opening with its outcome
 ```
 
-The final sweep's tables are in `docs/sweep_stage1_results.md`; the original plan is `docs/methodology.md`.
+The final sweep's tables are in `docs/sweep_stage1_results.md`. The plan I started from, including the hypotheses and the failure modes I expected, is in `docs/methodology.md`.
