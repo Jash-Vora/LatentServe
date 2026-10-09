@@ -134,7 +134,7 @@ The final sweep (`sweep_stage1_results.md`) ran INT8 end to end in the real engi
 
 | Context | fp16 dense | fp16 sparse 37.5% | INT8 dense, twice the batch |
 | --- | ---: | ---: | ---: |
-| 16K | 253 tok/s (batch 16) | 409 tok/s (batch 16) | 279 tok/s (batch 32) |
+| 16K | 253 tok/s (batch 16) | 408 tok/s (batch 16) | 279 tok/s (batch 32) |
 | 32K | 129 tok/s (batch 8) | 214 tok/s (batch 8) | 149 tok/s (batch 16) |
 
 Doubling the batch with INT8 buys 10–16% over fp16 dense, while fp16 sparse buys 62–66%. The combination this phase was meant to test was never built, so whether INT8 with sparse beats sparse alone is still untested; any gain would have to come from that combination, not from the capacity.

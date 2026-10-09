@@ -1,8 +1,8 @@
 # LatentServe
 
-A from-scratch LLM inference engine for Qwen2.5-1.5B-Instruct on NVIDIA T4s, built to learn how serving works and measured against vLLM on the same hardware.
+An LLM inference engine built from scratch to learn how serving works. It runs Qwen2.5-1.5B-Instruct on NVIDIA T4s, and everything was benchmarked against vLLM on the same hardware.
 
-On one T4 it decodes 1.05–3.3× faster than vLLM, prefills up to 9.6× faster, and matches its outputs.
+On one T4 it decodes 1.05–3.3× faster than vLLM, prefills up to 9.6× faster, and gives the same outputs.
 
 ## Against vLLM
 
@@ -17,36 +17,57 @@ On one T4 it decodes 1.05–3.3× faster than vLLM, prefills up to 9.6× faster,
 | Multi-turn chat, prefix caching on | 629 tok/s | 415 tok/s | 1.5× |
 | Saturation, open-loop requests | 1.58 req/s | 0.50 req/s | 3.2× |
 
-Same prompts, limits and seeds; vLLM in its best configuration for this GPU. The gap comes from attention: a T4 can't run FlashAttention-2, so vLLM falls back to Triton. At batch 1 the step is mostly weight reads, so the two tie.
+Both engines got the same prompts, concurrency limits and seeds, and vLLM was in its fastest setup on this GPU. Most of the gap is attention. A T4 can't run FlashAttention-2, so vLLM falls back to a Triton kernel. At batch 1 with a short context a step is mostly reading weights, so the two tie. Add batch size or context and the gap opens up.
+
+![Decode speedup over vLLM by batch size and context](docs/figures/decode_speedup.png)
+
+![First-token time by prompt length](docs/figures/prefill_ttft.png)
+
+![Latency under load](docs/figures/latency_vs_load.png)
+
+## Two GPUs
+
+| Two T4s | LatentServe | vLLM |
+| --- | ---: | ---: |
+| Burst throughput, one GPU | 276 tok/s | 99 tok/s |
+| Burst throughput, two replicas | 472 tok/s (1.71×) | 173 tok/s (1.76×) |
+| Chat throughput, round-robin routing | 702 tok/s | 485 tok/s |
+| Chat throughput, least-loaded routing | 759 tok/s (+8%) | 582 tok/s (+20%) |
+| Per-token time at batch 1, model split across both GPUs | not built | 9.7 ms against 16.8 ms on one (1.73×) |
+
+Two replicas means one engine per GPU behind a router. The other way to use two GPUs is to split a single model across them (tensor parallelism), which only vLLM does here. Replicas scaled to 85% of ideal for LatentServe and 88% for vLLM. One GPU sits idle at the end of a run because the router balances request counts, not work.
 
 ## What worked
 
-- **Decode kernel.** A hand-written CUDA kernel replaced a Triton one that was arithmetic-bound: 2.8× faster, and decode at batch 16 / 8K went from 79 ms to 34 ms.
-- **CUDA graphs.** Removed launch overhead: batch-1 steps fell from about 40 ms to 20–28 ms.
-- **Prefix caching.** First-token time down 72–84% on shared prompts and chat, about 1% overhead when nothing is shared.
-- **Adaptive sparsity.** Choosing dense or sparse per step came within 2% of fixed sparse speed at about half the expected answer loss.
-- **Two GPUs.** Replicas raised throughput 1.7–1.8×. Splitting vLLM's model across both T4s cut batch-1 latency 1.7×.
+- The decode kernel did most of the work. The first version, written in Triton, only reached 69 GB/s on a card that can do about 320, because its math was running on the slow scalar path. The CUDA rewrite reaches 194 GB/s and is 2.8× faster, which took decode at batch 16 / 8K from 79 ms to 34 ms.
+- CUDA graphs removed the launch overhead. A batch-1 step went from about 40 ms to 20–28 ms.
+- Prefix caching cut first-token time by 72–84% on shared prompts and chat. With nothing to share it costs about 1%.
+- Choosing dense or sparse attention for each step (the adaptive policy) came within 2% of always-sparse speed, at about half the expected answer loss.
 
 ## What didn't
 
-- **Sparse attention below 50% of pages.** 50% was 1.40× faster at batch 8 / 32K and lost about 0.4% of answers; 37.5% was 1.66× and 1.2%; 25% lost 5.5% and failed. A perfect page chooser loses nothing at 25%, so page selection is the limit. A learned indexer would likely fix it; it was out of scope.
-- **INT8 KV cache.** Holds 1.86× the blocks, but is never faster: level with dense to 12% slower. Doubling the batch with INT8 buys 10–16% over fp16 dense, while sparse attention buys 62–66%.
-- **MLA latent cache.** Closed after Phase 7: a latent at 10% value error compresses only about 1.6×, while INT8 gives 2× for free.
+- Sparse attention below 50% of pages. At 50% it's 1.40× faster at batch 8 / 32K and loses about 0.4% of answers. At 37.5% it's 1.66× and 1.2%. At 25% it loses 5.5% and fails the quality check. A perfect page picker loses nothing at 25%, so the trouble is choosing pages, not sparsity itself. A learned indexer would probably fix that, but it wasn't tried.
+- The INT8 KV cache. It holds 1.86× as many blocks but is never faster: level with dense at best, up to 12% slower at worst. Doubling the batch with INT8 buys 10–16% more throughput than fp16 dense, while sparse attention buys 62–66%.
+- The MLA latent cache, dropped after Phase 7. A latent that keeps value error at 10% only compresses about 1.6×, and INT8 gets 2× for free.
 
-## Caveats
-
-- The gap is partly the T4. A newer GPU, where vLLM gets FlashAttention, wasn't tested.
-- LatentServe is specialised: one model, greedy decoding, no API server.
-- One model, random-token prompts, fixed output lengths. Sparse quality costs are about ±1 point; load curves are single runs.
+![Decode throughput: INT8 capacity vs sparse attention](docs/figures/capacity_vs_sparsity.png)
 
 ## Lessons
 
-- Tiny test models hid a prefill bug for four phases (NaNs, 2× slower). A guard now refuses to time non-finite outputs.
-- Real-scale runs found engine bugs: admission ignoring generated tokens, a sparse budget decaying inside graph buckets, a crash on one-token requests.
+- Small test models hid a prefill bug for four phases (NaNs, and prefill twice as slow). A guard now refuses to time a model whose outputs aren't finite.
+- Running at real scale found engine bugs the tests never hit. Admission ignored generated tokens, a sparse budget decayed inside graph buckets, and one-token requests crashed the engine.
 
-## Next
+## To do
 
-Rerun on an A10 or L4. Train a learned page indexer. Try a larger model. Build tensor parallelism into LatentServe. Route replicas by tokens, not request counts.
+- [ ] Rerun the vLLM comparison on an A10 or L4. Part of the gap is the T4 (no FlashAttention-2), and how much isn't known.
+- [ ] Try a larger model. The 1.5B one can't do multi-hop retrieval even with full attention, so sparse attention's effect on that is untested.
+- [ ] Train a learned page indexer so sparse attention can go below 50%.
+- [ ] Add tensor parallelism to LatentServe. vLLM's gets 1.7× lower per-token latency on two T4s.
+- [ ] Route replicas by outstanding tokens instead of request counts.
+- [ ] Repeat the load curves. Each point is a single run of 16–80 requests, so individual points are noisy.
+- [ ] Benchmark with real prompts and varied output lengths. Everything here uses random tokens and fixed lengths.
+- [ ] Measure sparse attention's accuracy cost on more questions. The figures come from about 85 per seed, so they're good to roughly ±1 point.
+- [ ] Support sampling beyond greedy decoding, and put an API server in front.
 
 ## Using it
 
@@ -79,6 +100,7 @@ export PYTHONPATH=$(pwd)
 python -m benchmarks.runners.check_env
 python -m pytest tests/ -q                          # GPU tests skip on CPU
 python -m benchmarks.runners.sweep_stage1           # the full vLLM comparison; --report for tables
+python -m benchmarks.make_figures                   # redraw docs/figures from the saved tables
 ```
 
 Other experiments are in `benchmarks/runners/`, one per phase (`phase13_prefix`, `phase15_quality`, `phase17_*`, `phase18_*`). The T4 is compute capability 7.5, so everything runs fp16.
@@ -90,7 +112,7 @@ model/        Qwen wrapper, decoder loop, GQA and sparse attention
 cache/        paged KV cache, block allocator, INT8 and prefix caches
 kernels/      Triton and CUDA decode kernels (CUDA via NVRTC and CuPy)
 runtime/      engine, schedulers, CUDA-graph decoder, sparsity policy, router
-benchmarks/   harness and one runner per phase
+benchmarks/   harness, one runner per phase, and the figure script
 docs/         one note per phase, each opening with its outcome
 ```
 

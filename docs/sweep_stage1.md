@@ -48,6 +48,8 @@ every cell is saved on completion and skipped on rerun.
 * **Load.** LatentServe saturates at 1.58 req/s against vLLM's 0.50. vLLM's latency degrades from about 55% of its capacity; LatentServe holds until about 90%.
 * **Varying traffic.** vLLM's median first-token time is 12 minutes against LatentServe's 59 seconds.
 
+![Decode step against context at batch 8: dense, 50% and 37.5% sparse](figures/sparse_vs_context.png)
+
 ## An engine bug found by section B
 
 Section B asks for exactly one output token per request, so a request is

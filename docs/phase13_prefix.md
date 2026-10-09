@@ -2,6 +2,8 @@
 
 > **Outcome.** Time to first token fell 84% on a shared 2,048-token system prompt and 77% on multi-turn chat (hit rate 86–87%), live KV blocks fell 37% and 22%, and the overhead without sharing was about 1%, within noise. It works unchanged with the INT8 cache. Shared-prompt decoding was also 4–5% faster; the L2-cache explanation for that is a hypothesis.
 
+![First-token time with prefix caching off and on](figures/prefix_caching.png)
+
 > Shared prefixes should not be recomputed. Measure cache hit rate, TTFT,
 > VRAM, throughput, cache overhead; then investigate whether prefix caching
 > stacks with the memory-efficient KV cache. (methodology §20)
