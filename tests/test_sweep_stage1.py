@@ -275,3 +275,29 @@ def test_int8_gets_about_1_86x_the_blocks_of_fp16_on_the_real_model():
                            shape=SimpleNamespace(num_key_value_heads=2, head_dim=128))
     ratio = bytes_per_block(qwen, "fp16") / bytes_per_block(qwen, "int8")
     assert ratio == pytest.approx(17408 / 9344)
+
+
+def test_skips_caused_by_the_sweep_are_reported_as_not_measured():
+    for cfg, reason, want in [
+        ("ls-dense", "needs 16384 blocks, pool has 64", True),             # memory left over: artifact
+        ("ls-dense", "needs 16384 blocks, pool has 15675", False),         # a real limit
+        ("ls-int8", "needs 16384 blocks, pool has 1598", True),
+        ("ls-int8", "needs 40000 blocks, pool has 29100", False),
+        ("ls-dense", "the batch could not all decode at once", True),      # the first version's message
+        ("vllm", "needs 65536 KV blocks, the engine has 20340", False),
+        ("vllm", "the batch could not all decode at once (memory)", False),
+    ]:
+        assert sw.unreliable_skip(cfg, reason) is want, (cfg, reason)
+
+
+def test_the_report_says_not_measured_instead_of_did_not_fit(tmp_path):
+    run = sw.Runner(_args(tmp_path))
+    run.save(sw.cell_id("A", "b8-c32768", "ls-int8", 0),
+             {"result": {"fits": False, "reason": "needs 16384 blocks, pool has 1598"},
+              "config": "ls-int8", "backend": "latentserve"})
+    run.save(sw.cell_id("A", "b16-c32768", "ls-dense", 0),
+             {"result": {"fits": False, "reason": "needs 32768 blocks, pool has 15675"},
+              "config": "ls-dense", "backend": "latentserve"})
+    text = sw.report(tmp_path)
+    assert "not measured*" in text and "did not fit" in text
+    assert "pool has 1598 (artifact)" in text and "pool has 15675" in text

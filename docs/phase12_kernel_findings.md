@@ -1,5 +1,7 @@
 # Phase 12, resumed — what limits the decode kernel
 
+> **Outcome.** The first Triton decode kernel was arithmetic-bound, not memory-bound: it compiled its matrix multiplies to scalar fp32 math (no tensor-core instructions) at 12% occupancy, and ran at 69 GB/s against 243 GB/s for a loads-only version. A hand-written CUDA-core kernel reached 194 GB/s and was 2.8× faster (1.93 ms to 0.69 ms); the whole decode step at batch 16 / 8K went from 79.0 ms to 34.2 ms.
+
 Nsight Compute is refused in this container (`ERR_NVGPUCTRPERM`), so the
 kernel was taken apart instead: compiler resource counts, ablation kernels,
 and a census of the compiled machine code (`benchmarks/runners/phase12_diag.py`).

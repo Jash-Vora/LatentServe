@@ -6,11 +6,7 @@ reference for phases, gates, the benchmark matrix, fairness rules for
 the vLLM comparison, and ablations — update it as phases land, don't
 let it drift into a stale snapshot.
 
-**Status:** Phase 0 (environment + experimental infrastructure) and
-Phase 1 (Qwen reference + correctness baseline) are implemented — see
-`model/qwen.py`, `benchmarks/runners/phase1_reference.py`,
-`tests/test_phase1_correctness.py`, and `configs/phase1_reference.yaml`.
-Phase 2 (GQA + KV cache) is next.
+**Status:** Phases 0–18 are implemented, except the MLA-inspired track (Phases 8–10), which was closed after Phase 7, and a learned sparse indexer, which needs training and was out of scope. The README has each phase's outcome and the headline numbers, and `docs/phase*.md` hold the measurements. This document is the original plan and has not been rewritten to match what happened, so where it disagrees with a phase note, the phase note is right.
 
 Key things every experiment must respect (see Section 28, "Fairness
 Rules for vLLM", and Section 12, "Phase 5 — Benchmark Harness"):

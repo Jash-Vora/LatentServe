@@ -1,5 +1,7 @@
 # Phase 2 — GQA + KV Cache
 
+> **Outcome.** LatentServe's own GQA and KV-cache path matches the Hugging Face oracle and cut peak memory at 8K by 7.2 GB (3,463 MB against 10,654 MB), so 16K runs where the reference runs out of memory. Decode at batch 1 is weight-bound, at about 30% of the T4's bandwidth. The sweep found two things: `repeat_kv` handed GQA's whole saving back (13× the necessary traffic), fixed by folding query heads into the query axis; and GQA is a capacity feature, not a speed one, since halving the cache made decode slightly slower and a 6× larger cache cost only 2.8% at batch 1. Scorecard: P1, P3 and P4 confirmed, P2 falsified, and P5 stands as the argument for testing at large batch and long context.
+
 Goal (docs/methodology.md Phase 2): build the conventional modern
 inference baseline around Qwen, and make KV bytes/token, VRAM growth,
 memory bandwidth and decode latency measurable. Everything MLA (Phase 7)
@@ -218,14 +220,16 @@ baseline. MLA's headline memory win is stated against MHA; against
 
 ## Gate 2 checklist — "Can LatentServe execute cached decoding?"
 
-- [ ] `pytest tests/test_phase2_gqa.py` green (tier 1, CPU)
-- [ ] `LATENTSERVE_REAL_MODEL_TESTS=1 pytest` green (tier 2, T4): logits
+- [x] `pytest tests/test_phase2_gqa.py` green (tier 1, CPU)
+- [x] `LATENTSERVE_REAL_MODEL_TESTS=1 pytest` green (tier 2, T4): logits
       match `QwenReference.forward_teacher_forced`, greedy output ids
       identical, cache accounting equals HF's measured `past_key_values`
-- [ ] `results/raw/phase2_gqa.jsonl` populated across the sweep
-- [ ] `kv_bytes_per_token` = 28,672 for `native` and matches
+- [x] `results/raw/phase2_gqa.jsonl` populated across the sweep
+- [x] `kv_bytes_per_token` = 28,672 for `native` and matches
       `ModelShape.kv_bytes_per_token()`
-- [ ] each prediction above marked confirmed or falsified, in writing
+- [x] each prediction above marked confirmed or falsified, in writing
+
+*Reviewed at project close: ticked where this note's results show the item done. The real-checkpoint (tier 2) run was rechecked by the maintainer after this note was written and isn't recorded here, so that box is ticked on their confirmation; the project's later real-model results corroborate it (LatentServe agrees with the fp32 reference to about 1.7×10⁻⁵ KL; see `benchmark_vs_vllm.md`).*
 
 ## Known limitations, deliberately
 

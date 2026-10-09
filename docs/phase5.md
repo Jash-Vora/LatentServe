@@ -1,5 +1,7 @@
 # Phase 5 — Benchmark Harness
 
+> **Outcome.** The shared measurement harness: nearest-rank percentiles, bootstrap confidence intervals, a stall rate for bimodal latency, and comparisons that raise when two rows differ on a control. Repeating Phase 4's scheduler sweep reproduced first-token times within 1.2%, which sets the noise floor for the rest of the project. No new measurements.
+
 Goal (docs/methodology.md Phase 5): "Before introducing MLA, make
 measurement trustworthy."
 

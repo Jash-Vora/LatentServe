@@ -411,6 +411,26 @@ def _cells(results: Path) -> list:
     return out
 
 
+def unreliable_skip(cfg: str, reason: str) -> bool:
+    """Was this skip an artifact of the sweep, not a capacity limit?
+
+    A LatentServe pool was sized from whatever GPU memory happened to be free
+    when its engine was built, so earlier cells could shrink it (pools of 64 to
+    1,600 blocks were seen against ~15,000 for fp16 and ~29,000 for INT8). And
+    skips written by the first version of the sweep carry the old message.
+    Those cells were not measured; calling them "did not fit" would claim a
+    hardware limit that was never established."""
+    import re
+
+    reason = reason or ""
+    if reason == "the batch could not all decode at once":          # the first version's wording
+        return True
+    m = re.search(r"pool has (\d+)", reason)
+    if m:
+        return int(m.group(1)) < (26000 if cfg == "ls-int8" else 14000)
+    return False
+
+
 def _med(xs):
     xs = [x for x in xs if x is not None and not (isinstance(x, float) and math.isnan(x))]
     return statistics.median(xs) if xs else float("nan")
@@ -439,12 +459,28 @@ def report(results: Path) -> str:
                     elif ok:
                         row.append(f"{_med(r['pct']['p50'] for r in ok):.2f} / "
                                    f"{_med(r['pct']['p99'] for r in ok):.2f}")
+                    elif rs and any(unreliable_skip(k, r.get("reason")) for r in rs):
+                        row.append("not measured*")
                     else:
                         row.append("did not fit" if rs else "-")
                 if any(x != "-" for x in row):
                     lines.append(f"| {b} | {ctx} | " + " | ".join(row) + " |")
         lines += ["", "The 32768 rows fill the cache to the model's limit: the prompt is "
                   "32,768 minus the tokens decoded on top (each cell records it).", ""]
+        skipped = [c for c in a if not c["result"].get("fits")]
+        if skipped:
+            flagged = [c for c in skipped if unreliable_skip(c["cfg"], c["result"].get("reason"))]
+            if flagged:
+                lines += ["\\* **not measured**: skipped because of the sweep's own bugs, not a "
+                          "hardware limit — a LatentServe pool sized from whatever memory was "
+                          "free when its engine was built (earlier cells shrank it), or a skip "
+                          "recorded by the first version. These cells show no result either way.", ""]
+            lines += ["Skipped cells and their recorded reasons:", ""]
+            for c in sorted(skipped, key=lambda c: (c["cfg"], c["what"])):
+                tag = " (artifact)" if c in flagged else ""
+                lines.append(f"- {c['what']} {c['cfg']} r{c['rnd']}: "
+                             f"{c['result'].get('reason', 'did not fit')}{tag}")
+            lines.append("")
 
     bcells = [c for c in cells if c["sec"] == "B"]
     if bcells:

@@ -1,5 +1,7 @@
 # Phase 4 — Serving Runtime
 
+> **Outcome.** Continuous batching served ragged requests with outputs identical to generating them alone (Gate 3). It bought only 0–3% throughput over static batching, not the predicted ~1.5×, because the paged gather makes a bigger batch costlier per step. Scheduler overhead is negligible (5–10 µs per call, about 0.2% of wall time). Under open-loop arrivals, shortest-job-first cut median first-token time 3.3× but worsened p99 2.3×, and `fair` (shortest-job-first with aging) beat every policy on p99 and throughput. Three predictions first read as falsified; two of those were the harness measuring the wrong thing, which led to Phase 5. The re-measured inter-token p99s are quoted in `phase5.md`.
+
 Goal (docs/methodology.md Phase 4): turn the inference backend into a
 minimal serving engine — request lifecycle, continuous batching, and a
 scheduler — with scheduler overhead measured explicitly.
@@ -253,18 +255,20 @@ aggregate alone would hide it.
 
 ## Gate 3 checklist
 
-- [ ] `pytest tests/test_phase4_serving.py` green (all tiers, CPU)
-- [ ] continuous vs. static run at batch 1, 4, 8 with occupancy recorded
-- [ ] all four schedulers compared at fixed concurrency
-- [ ] scheduler overhead reported as microseconds per call *and* as a
+- [x] `pytest tests/test_phase4_serving.py` green (all tiers, CPU)
+- [x] continuous vs. static run at batch 1, 4, 8 with occupancy recorded
+- [x] all four schedulers compared at fixed concurrency
+- [x] scheduler overhead reported as microseconds per call *and* as a
       fraction of step time
-- [ ] TTFT reported split into queue and prefill — they are different
+- [x] TTFT reported split into queue and prefill — they are different
       quantities from Phases 1-3's TTFT and respond to different fixes
 - [ ] every prediction above marked confirmed or falsified, in writing
 
+*Reviewed at project close: ticked where this note's results show the item done. Left open: P5 was never marked, and P2's re-measured numbers appear in `phase5.md`, not here.*
+
 ## Deliberately deferred
 
-* **Chunked mixed batching** (prefill and decode in one step) — Phase 17.
+* **Chunked mixed batching** (prefill and decode in one step). Not built: Phase 17 became the adaptive runtime. Prefill is chunked at 4,096 tokens, but runs in its own pass before the step's decode.
 * **Preemption and swapping.** The engine raises a clear `deadlock`
   error if the shortest waiting request cannot fit an empty pool, and
   admits nothing it cannot seat. Evicting a running sequence to admit a

@@ -1,5 +1,7 @@
 # Phase 15 — sparse attention quality study
 
+> **Outcome.** No sparse budget passed a confirmatory test. Pooled over the seeds run, net answers lost were about 0.4% at 50% of pages, 1.2% at 37.5% and 5.5% at 25% (where the KL criterion also failed on every seed), all in question answering. The oracle shows that page selection, not sparsity, is the limit. This note is chronological: earlier verdicts were revised by later runs, and the conclusion is near the end.
+
 > How sparse can attention become before useful information is lost?
 > (methodology §22)
 

@@ -1,5 +1,7 @@
 # Phase 18 — multi-GPU (two T4s)
 
+> **Outcome.** Two replicas scaled burst throughput 1.7–1.8× (efficiency 0.85–0.88). vLLM's tensor parallelism cut batch-1 per-token latency 1.7× on two T4s, beating this note's 1.45× estimate. Least-loaded routing beat round-robin by 8–20% on chat. The first replica run was invalidated by cold-start compilation; it is kept, with the reason, in the sections below.
+
 ## Experiment A — replicated serving (`phase18_replicas`)
 
 A router in front of one engine per GPU, each in its own worker process

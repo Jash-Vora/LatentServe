@@ -1,5 +1,7 @@
 # Phase 16 — INT8 with sparse decode
 
+> **Outcome.** The fused INT8 write cut INT8's end-to-end penalty from 6–19% to 1–9% and issues fewer kernels per step than fp16 (401 against 429), but INT8 still failed its gate at batch 16 / 16K (9.3% slower than fp16), so the INT8 + sparse kernel was not built. INT8 is a capacity option: the final sweep shows it running batch 32 at 16K and batch 16 at 32K, which fp16 cannot.
+
 The plan's Phase 16 combined the memory-efficient technique (MLA, closed in
 Phase 7, replaced by INT8) with sparse attention. What it can buy on a T4 is
 capacity, not per-step speed: fp16 cannot hold 16 x 32K or 32 x 16K; INT8
@@ -126,3 +128,24 @@ firmer, not weaker.
 (The census's first version listed differing kernels only over the INT8
 run's own names, so fp16's attention kernel — absent from INT8 runs — never
 showed its -28; fixed to use the union.)
+
+## What the final sweep added
+
+The final sweep (`sweep_stage1_results.md`) ran INT8 end to end in the real engine, with its pool sized for INT8's real bytes per block. Four things came out of it.
+
+**INT8 runs shapes fp16 can't.** Batch 32 at 16K takes 114.7 ms per step and batch 16 at 32K takes 107.3 ms. Neither fp16 LatentServe nor vLLM fits either shape at the sweep's memory settings.
+
+**Where both fit, INT8 is level to 12% slower.** It is within 1% of dense at four shapes (batch 4 / 2K, batch 8 / 32K, batch 16 / 8K and batch 16 / 16K) and slower elsewhere, by up to 12.1% at batch 32 / 8K (66.1 against 58.9 ms) and 9.6% at batch 1 / 32K. On the burst workload it was 4.3% slower (245 against 256 tok/s). Its tail is worse by one step in sixteen: INT8's p99 sits 5.7–9.9 ms above its p50 at every shape, while dense's sits under 2 ms.
+
+**Capacity alone doesn't beat sparsity.** Decode throughput, from the step times (batch divided by step time, prefill excluded):
+
+| Context | fp16 dense | fp16 sparse 37.5% | INT8 dense, twice the batch |
+| --- | ---: | ---: | ---: |
+| 16K | 253 tok/s (batch 16) | 409 tok/s (batch 16) | 279 tok/s (batch 32) |
+| 32K | 129 tok/s (batch 8) | 214 tok/s (batch 8) | 149 tok/s (batch 16) |
+
+Doubling the batch with INT8 buys 10–16% over fp16 dense, while fp16 sparse buys 62–66%. The combination this phase was meant to test was never built, so whether INT8 with sparse beats sparse alone is still untested; any gain would have to come from that combination, not from the capacity.
+
+**One real-traffic gain, from a single round.** On the varying workload INT8 matched dense (32.6 against 31.7 tok/s) and cut p99 first-token time 11% (92 against 104 s), plausibly because its larger pool admits more long requests at once, at the price of a worse tail per-token time (p99 655 against 459 ms).
+
+**The gate's number and the sweep's disagree at batch 16 / 16K, and the cause wasn't found.** The gate measured INT8 9.3% slower than fp16 (58.89 against 53.80 ms, graphs only). The sweep has them level (62.70 against 63.27 ms, whole engine). Dense's step is 18% longer in the sweep than in the gate, while INT8's is 6.5% longer, so most of the difference is in dense's step, not INT8's. The two harnesses differ (the sweep runs the full engine, with its scheduler and admission; the gate only the captured step). The gate's verdict used the graph-only number and stands as recorded.

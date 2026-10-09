@@ -1,5 +1,7 @@
 # Phase 17 — adaptive runtime
 
+> **Outcome.** On varying traffic, the adaptive policies came within 2% of fixed sparse attention's throughput at about half its expected answer loss, so by the definition fixed in advance both tiers outperform. Their speed gain over dense is small (1.08–1.12×) because much of real traffic runs where sparsity buys nothing. The note also records a first workload that tested nothing, and why.
+
 > Can an adaptive policy outperform a fixed backend? (methodology Q14)
 
 ## The idea

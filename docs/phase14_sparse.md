@@ -1,5 +1,7 @@
 # Phase 14 — sparse decode attention
 
+> **Partly superseded.** The speedups here stand. The claim that 25% of pages is "on par with dense" does not: Phase 15's larger study overturned it. See the Correction at the end of this note and `phase15_quality.md`.
+
 The plan's Phase 14 (methodology §21): an indexer scores relevance, the top
 pages are kept, retention ratios from 100% down to 3.125%, the indexer's own
 cost counted, a real GPU sparse kernel — and the central question: *does the

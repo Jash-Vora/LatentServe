@@ -1,13 +1,8 @@
 # Architecture
 
-TODO (fill in as each phase lands):
-- System diagram: model -> cache -> kernels -> runtime -> serving (see docs/methodology.md, Section 34).
-- Package layout and how each top-level dir maps to a phase.
-- Data flow for a single request: ARRIVED -> QUEUED -> PREFILL -> DECODING -> FINISHED.
+The system is a stack of layers around one fixed model. `model/` runs Qwen2.5-1.5B-Instruct's decoder loop with LatentServe's own attention and rotary code. `cache/` stores keys and values in reference-counted blocks (fp16 or INT8) and shares full blocks between requests. `kernels/` holds the decode kernels: Triton and CUDA, dense, sparse and INT8. `runtime/` schedules requests, runs prefill and decode (eagerly or as captured CUDA graphs), chooses sparsity per step, and routes requests across GPUs.
 
-Full architecture documentation is deferred until Phase 4 (serving
-runtime) exists — no point documenting an architecture that's still
-mostly directory stubs. In the meantime:
+A request moves through ARRIVED, QUEUED, PREFILL, DECODING and FINISHED. The README's repository map has the current layout; the sections below were written phase by phase and describe each layer as it was built.
 
 ## Phase 1 — what exists today
 

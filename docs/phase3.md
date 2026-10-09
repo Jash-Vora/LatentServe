@@ -1,5 +1,7 @@
 # Phase 3 — Paged KV Cache
 
+> **Outcome.** Paging's capacity gain equals the workload's max/mean sequence length: 6.6× over an oracle-sized contiguous cache on the mixed workload, and about 1× on uniform traffic. Block size barely matters (98.8–100% capacity efficiency from 1 to 256 tokens, under 1% TPOT difference), so 16 was chosen, which later became the granularity of prefix sharing in Phase 13. Paging's decode cost is exactly the cost of its gather, 10–70% from batch 1 / 4K to batch 4 / 16K, which the paged-attention kernel later removed.
+
 Goal (docs/methodology.md Phase 3): a PagedAttention-style memory
 manager, compared against the contiguous cache under variable sequence
 lengths, concurrent requests, request termination and high utilization.
@@ -178,15 +180,17 @@ all of that gap and land within noise of contiguous.
 
 ## Gate 4 checklist — "Can paged KV improve memory utilization?"
 
-- [ ] `pytest tests/test_phase3_paged.py` green, including
+- [x] `pytest tests/test_phase3_paged.py` green, including
       `test_paged_matches_contiguous_logits` at block_size 1, 4 and 16
-- [ ] capacity simulation run across all three workloads and the full
+- [x] capacity simulation run across all three workloads and the full
       block-size sweep
-- [ ] paging's advantage stated against the **oracle** baseline, not
+- [x] paging's advantage stated against the **oracle** baseline, not
       only the generic one
-- [ ] measured paging latency cost recorded at batch 1 and batch 4
-- [ ] a block size chosen, with the fragmentation/overhead numbers that
+- [x] measured paging latency cost recorded at batch 1 and batch 4
+- [x] a block size chosen, with the fragmentation/overhead numbers that
       justify it
+
+*Reviewed at project close: every item is shown by the measurements above.*
 
 ## Deliberately deferred
 

@@ -1,5 +1,7 @@
 # Phase 7 — KV Representation & Latent Compression Study
 
+> **Outcome.** The compression an MLA-style latent cache could offer was real but small, and the track was closed in favour of INT8. The 2.24× smaller cache that an energy threshold suggested was an illusion: V carries 3–5× K's reconstruction error at every rank, so a cache at 10% value error compresses only about 1.6×, and separate K and V latents don't help (about 1.49×). INT8 gives exactly 2× with no reconstruction compute. Pre-RoPE keys are far more compressible than post-RoPE (83 against 157 dimensions for 99% of the energy), and calibration data barely matters. The go/no-go for the later stages wasn't written down at the time; these numbers are its basis.
+
 Reframed from the methodology doc's "MLA-Inspired Latent KV Attention".
 The question is not "does MLA help" but:
 
@@ -315,12 +317,13 @@ halves.
 
 ## Gate 7 checklist
 
-- [ ] `pytest tests/test_phase7_spectra.py` green
-- [ ] spectra run on real text at >= 8K tokens, and on random ids as the
+- [x] `pytest tests/test_phase7_spectra.py` green
+- [x] spectra run on real text at >= 8K tokens, and on random ids as the
       control, with the gap reported
 - [ ] per-layer compressibility map produced (the 7.3 budget)
-- [ ] pre- vs post-RoPE K gap quantified
+- [x] pre- vs post-RoPE K gap quantified
 - [ ] online-scaling check run: block-local K scale vs 7.2's global
       number, at the paged cache's own block size (16) at minimum
-- [ ] break-even stated explicitly against the 512-number GQA baseline
-- [ ] go/no-go on 7.2-7.4 recorded in writing, with the number behind it
+- [x] break-even stated explicitly against the 512-number GQA baseline
+- [x] go/no-go on 7.2-7.4 recorded in writing, with the number behind it
+*Reviewed at project close: ticked where this note's results show the item done; the go/no-go is the outcome note at the top, added at project close. Left open: the per-layer compressibility map and the online-scaling check's result aren't recorded here.*

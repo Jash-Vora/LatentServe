@@ -1,5 +1,7 @@
 # Phase 13 — CUDA Graph Decode
 
+> **Outcome.** CUDA graphs removed the CPU-dispatch bottleneck. At batch 1 the step fell from about 40 ms to 20–28 ms (29–49% less), because the GPU had been idle 39% of the time waiting for about 900 Python-launched kernels. Batch 4 at long context gained nothing, since it is bound by the attention kernel, not launches. A GPU-only bug, where a CPU model was "captured" and replayed frozen outputs, was found and fixed. Against vLLM with graphs on both sides, decode was within 8% except at batch 1 with short context, and prefill was 1.9–3.3× faster. These numbers predate the CUDA-core decode kernel and the prefill routing fix, so they understate LatentServe; the final sweep supersedes them.
+
 ## Why this phase exists
 
 Phase 12's profiler, batch 1 / ctx 8192, per decode step:
@@ -185,13 +187,15 @@ broken.
 - [x] `--experiment compile` run and its break count recorded (13 breaks)
 - [x] batch 1 and batch 4 latency measured, eager vs graphed
 - [x] each prediction marked: both confirmed
-- [ ] `num_splits` re-tuned per bucket **under replay** — Phase 12 showed
+- [x] `num_splits` re-tuned per bucket **under replay** — Phase 12 showed
       the isolated optimum did not survive the real model, and replay
       changes the environment again
 - [x] graphs wired into `ServingEngine` (`use_cuda_graphs=True`), with
       `warmup_graphs()` to move capture cost to start-up
 - [x] side-by-side vLLM comparison with both systems on CUDA graphs
 - [x] `num_splits` re-tuned under replay: capped at 16
+
+*Reviewed at project close: the first `num_splits` item duplicates the last one, which was already ticked: done, capped at 16.*
 
 ## Serving integration
 

@@ -1,5 +1,7 @@
 # Phase 14 — Closing the batch-1 gap, then INT8 at graph speed
 
+> **Outcome.** Closing the batch-1 gap to vLLM took several small steps. Projection fusion saved 0.36 ms per step at batch 1 (a quarter of the ~1.5 ms gap) and up to 1.55 ms at batch 16 / 2K, and the serving loop cost only 0.2–0.4 ms per token, so overlapping host work wasn't justified. At this point vLLM still led batch 1 / 2K by 12% (20.4 against 18.0 ms). Elementwise fusion and the graph-capturable INT8 cache were also built here; their measurements are in `benchmark_vs_vllm.md` (on par on every measure after fusion) and `phase16_int8_sparse.md`. This note is chronological, with a correction partway through.
+
 ## Where Phase 13 left things
 
 Against vLLM, same host, same stack, both on CUDA graphs (host `a886…`):
@@ -386,9 +388,3 @@ pytest tests/test_phase14_elementwise.py tests/test_phase14_int8_graph.py -v
 python -m benchmarks.runners.phase14_fusion --toggle elementwise --context-lengths 2048 8192 --batch-sizes 1 4 16
 python -m benchmarks.runners.phase14_fusion --toggle int8 --context-lengths 2048 8192 --batch-sizes 1 4 16
 ```
-
-Not started. Needs three things the INT8 cache does not have: block
-finalisation moved into host-side `advance()` (it currently runs on a
-host-side condition inside the forward), a persistent fp16 residual
-buffer, and a kernel that reads finished blocks as INT8 and the partial
-block as fp16 and merges the two.

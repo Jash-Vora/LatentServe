@@ -1,5 +1,7 @@
 # Phase 6 — vLLM Baseline
 
+> **Outcome.** An early comparison, partly superseded. It found vLLM's decode faster (26.0 against 34.5 ms per step at 2K) and its prefill collapsing at long context (744 against 5,238 tok/s at 8K), because a T4 can't run FlashAttention-2 and vLLM falls back to Triton attention. The decode deficit was LatentServe's own paged gather, worth about 17 ms per step at 8K; the paged-attention kernel (Phases 11–12) closed it, and the final sweep shows LatentServe decoding 1.05–3.3× faster than vLLM. The prefill finding stands, and widens at longer prompts.
+
 Goal (docs/methodology.md Phase 6), and the rule that governs the whole
 phase:
 
@@ -180,11 +182,13 @@ The honest headline is **not** "LatentServe beats vLLM". It is:
 
 ## Gate 6 checklist — "can we fairly benchmark against vLLM?"
 
-- [ ] `pytest tests/test_phase5_harness.py` green
-- [ ] both systems run from the same prompt token ids and output lengths
+- [x] `pytest tests/test_phase5_harness.py` green
+- [x] both systems run from the same prompt token ids and output lengths
 - [ ] `--compare` produces no `SKIPPED — UnfairComparison` lines
-- [ ] vLLM version, chunked-prefill and prefix-caching settings recorded
+- [x] vLLM version, chunked-prefill and prefix-caching settings recorded
       in every vLLM row
-- [ ] each gap attributed to a mechanism (gather, CUDA graphs, chunked
+- [x] each gap attributed to a mechanism (gather, CUDA graphs, chunked
       prefill), not just reported
-- [ ] p99 ITL explicitly excluded from the comparison
+- [x] p99 ITL explicitly excluded from the comparison
+
+*Reviewed at project close: ticked where this note or the runner shows the item done. Left open: that `--compare` produced no SKIPPED lines isn't recorded here.*
